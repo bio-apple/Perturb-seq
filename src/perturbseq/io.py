@@ -134,8 +134,13 @@ def split_gene_and_crispr(adata: AnnData) -> tuple[AnnData, AnnData]:
     return rna, crispr
 
 
+def validate_sample_inputs(input_dir: Path, sample_id: str) -> dict[str, Path]:
+    """Stage-1 validation: required DRAGEN MEX + guide reference + assignments exist."""
+    return resolve_sample_files(input_dir, sample_id)
+
+
 def load_dragen_sample(input_dir: Path, sample_id: str) -> tuple[AnnData, AnnData, pd.DataFrame, pd.DataFrame]:
-    files = resolve_sample_files(input_dir, sample_id)
+    files = validate_sample_inputs(input_dir, sample_id)
     combined = load_filtered_mex(files["matrix"], files["barcodes"], files["features"])
     rna, crispr = split_gene_and_crispr(combined)
     rna.obs["sample_id"] = sample_id

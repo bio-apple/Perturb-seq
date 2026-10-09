@@ -1,0 +1,38 @@
+# Central defaults for the tertiary Perturb-seq pipeline.
+# CLI flags override these when provided. Paths may be set here or via CLI.
+
+sample_id: sample1
+# input_dir: data/demo
+# output_dir: results/demo
+
+singlet_only: true
+n_mads: 5.0
+min_cells: 3
+n_top_genes: 2000
+n_pcs: 30
+leiden_resolution: 0.5
+control: NT
+replicate_col: null
+
+skip_mixscape: false
+skip_cell_annotation: false
+skip_distance: false
+skip_de: false
+
+n_perms: 200
+min_cells_per_pert: 10
+mixscape_max_targets: 40
+force_mixscape: false
+de_top_n: 10
+perturbation_type: KO
+random_state: 0
+
+control_patterns:
+  - "^nt$"
+  - "^ntc$"
+  - "^nt_"
+  - "^negctrl"
+  - "^neg_ctrl"
+  - "non[-_ ]?targeting"
+  - "^control$"
+  - "^ctrl$"

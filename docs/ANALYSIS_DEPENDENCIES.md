@@ -1,0 +1,58 @@
+# Analysis step dependencies
+
+This document separates **descriptive** structure discovery from steps that **filter cells** or change **inference scope**. Global HVG / PCA / neighbors / Leiden / UMAP are **not** perturbation-effect evidence by default.
+
+Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape/E-distance), `statistics.py` (DE), `composition.py` (filter composition audit), orchestrated by `pipeline.py`. See also `docs/structure.md`.
+
+## Matrix layers
+
+| Slot | Contents | Typical use |
+| --- | --- | --- |
+| `layers['counts']` | Raw UMI counts (post QC/singlet gene filter) | Pseudobulk DE (PyDESeq2); never discarded |
+| `adata.X` | `normalize_total` + `log1p` | Wilcoxon exploratory DE; HVG/PCA input |
+| `layers['X_pert']` | Mixscape perturbation signature (if run) | Mixscape classification; optional post-Mixscape PCA |
+| `obsm['X_pca']` | Low-dimensional embedding | E-distance / clustering input; **not** a count matrix |
+| `obsm['X_umap']` | 2D layout for plots | **Visualization only** |
+
+## Dependency table
+
+| Stage | Kind | Input matrix / labels | Output | Changes inference scope? | Caveats |
+| --- | --- | --- | --- | --- | --- |
+| Load + guide annotate | descriptive | DRAGEN MEX + assignments | `guide_id`, `gene_target`, `perturbation` | No | Composition already reflects DRAGEN calling |
+| QC (MAD + min cells/gene) | filtering | raw `X` | filtered AnnData + QC log | **Yes** — drops cells/genes | Alters sample composition by library size / MT / sparsity |
+| Singlet filter | filtering | `num_features` | singlet cells | **Yes** — drops 0/≥2 guide cells | Can deplete rare guides or doublets carrying real biology |
+| Normalize / log1p | transform | `layers['counts']` → `X` | log-norm expression | No (representation) | Downstream on `X` is not count-scale |
+| HVG / PCA / neighbors | descriptive | log-norm `X` (HVG) | `X_pca`, graph | No for perturbation claims | Global structure; confounded by cell cycle, ambient, guide load |
+| UMAP | descriptive (viz) | neighbor graph | `X_umap` | No | **Do not** treat separation as KO evidence |
+| Leiden | descriptive | neighbor graph | `obs['leiden']` | No | Cluster labels ≠ perturbation classes |
+| Cell annotation | descriptive | log-norm scores / markers | phase, cell_state, … | No (unless you later filter on them) | Cell-line “states”, not tissue taxonomy |
+| Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size |
+| Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object | **Yes** | Changes composition vs pre-Mixscape path |
+| E-distance / E-test | inferential (effect size) | `X_pca` (source tagged in report) | `edistance.csv`, `etest.csv` | Uses current cell set | Embedding choice (log-norm PCA vs `X_pert` PCA) changes ranks |
+| DE (Wilcoxon) | exploratory / inferential* | log-norm `X` | `de_*.csv` | Uses `de_group` definition | Cell-level p-values ≠ replicate inference |
+| DE (PyDESeq2) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | Uses `de_group` + replicates | Requires `replicate_col` with ≥2 levels |
+| Perturbation clustering | descriptive | mean `X_pca` per gene_target | `perturbation_clusters.csv` | Uses current cell set | Pathway-like grouping, not proof of mechanism |
+
+\*Wilcoxon is exploratory when there is no biological replicate column.
+
+## Pre- vs post-Mixscape paths
+
+When Mixscape **runs successfully**:
+
+| Path | Cells | Embedding for E-distance | Tables |
+| --- | --- | --- | --- |
+| `pre_mixscape` | All cells after QC/singlet (includes NP) | `X_pca` from log-norm HVG | `tables/pre_mixscape/` |
+| `post_mixscape` | `mixscape_class_global` ∈ {control, KO} | `X_pca` recomputed from `layers['X_pert']` | `tables/post_mixscape/` and primary `tables/edistance.csv` |
+
+DE contrasts use Mixscape labels (`mixscape_class`) when Mixscape succeeds — **downstream DE depends on that classification**.
+
+When Mixscape is **skipped** or fails, `report.json` records the reason; E-distance/DE use `gene_target` on the post-QC object; no KO/NP filter is applied.
+
+## Composition sensitivity
+
+Each filter (QC, singlet, Mixscape KO-only, optional state/guide filters) can change counts of cells per `gene_target` / guide / state. The pipeline writes `tables/composition_audit.csv` with snapshots at each stage. If a strong E-distance or DE hit disappears after a filter, treat the conclusion as **preprocessing-sensitive**.
+
+## Report language
+
+- UMAP / Leiden: visualization or descriptive structure only.
+- Perturbation claims: prefer E-distance / E-test and (when replicates exist) pseudobulk DE, with matrix provenance from `report.json` → `matrix_provenance`.

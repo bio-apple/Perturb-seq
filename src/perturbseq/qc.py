@@ -69,3 +69,17 @@ def filter_cells(
     log["n_genes_after_qc"] = int(filtered.n_vars)
     log["n_cells_removed_qc"] = log["n_cells_start"] - log["n_cells_after_qc"]
     return filtered, log
+
+
+def sample_qc_summary(adata: AnnData, sample_col: str = "sample_id") -> dict:
+    """Per-sample cell/UMI summaries for sample-level QC reporting."""
+    if sample_col not in adata.obs:
+        return {"n_samples": 1, "n_cells": int(adata.n_obs)}
+    rows = []
+    for sample, sub in adata.obs.groupby(adata.obs[sample_col].astype(str), sort=True):
+        row = {"sample_id": sample, "n_cells": int(len(sub))}
+        for col in ("n_counts", "n_genes", "pct_counts_mt"):
+            if col in sub.columns:
+                row[f"median_{col}"] = float(sub[col].astype(float).median())
+        rows.append(row)
+    return {"n_samples": len(rows), "samples": rows}

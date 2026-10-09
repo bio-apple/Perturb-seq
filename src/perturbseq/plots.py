@@ -41,25 +41,43 @@ def plot_guide_composition(adata: AnnData, out_dir: Path) -> None:
     _save(fig, out_dir / "guide_composition.png")
 
 
-def plot_umap(adata: AnnData, out_dir: Path, color: list[str] | None = None) -> None:
+def plot_umap(adata: AnnData, out_dir: Path, color: list[str] | None = None, filename: str = "umap.png") -> None:
     keys = [key for key in (color or ["leiden", "gene_target", "perturbation"]) if key in adata.obs]
     if "X_umap" not in adata.obsm or not keys:
         return
     sc.pl.umap(adata, color=keys, show=False, wspace=0.4)
     fig = plt.gcf()
-    _save(fig, out_dir / "umap.png")
+    fig.suptitle("UMAP (visualization only; not perturbation-effect evidence)", fontsize=10, y=1.02)
+    _save(fig, out_dir / filename)
 
 
-def plot_edistance(edistances: pd.DataFrame, out_dir: Path) -> None:
+def plot_cell_annotation(adata: AnnData, out_dir: Path) -> None:
+    keys = [k for k in ("leiden", "phase", "cell_state", "cluster_annotation") if k in adata.obs]
+    if keys:
+        plot_umap(adata, out_dir, color=keys, filename="umap_cell_annotation.png")
+    if "phase" in adata.obs and "cell_state" in adata.obs:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
+        adata.obs["phase"].astype(str).value_counts().plot(kind="bar", ax=axes[0], color="#4C72B0")
+        axes[0].set_title("cell cycle phase")
+        adata.obs["cell_state"].astype(str).value_counts().plot(kind="bar", ax=axes[1], color="#DD8452")
+        axes[1].set_title("cell state")
+        fig.tight_layout()
+        _save(fig, out_dir / "cell_annotation_counts.png")
+
+
+def plot_edistance(edistances: pd.DataFrame, out_dir: Path, filename: str = "edistance.png") -> None:
     if edistances.empty:
         return
     fig, ax = plt.subplots(figsize=(8, 6))
     top = edistances["edistance"].head(30).iloc[::-1]
     top.plot(kind="barh", ax=ax, color="#4C72B0")
     ax.set_xlabel("E-distance to NT")
-    ax.set_title("Perturbation effect size")
+    source = ""
+    if "pca_source" in edistances.columns and len(edistances):
+        source = f" on X_pca ({edistances['pca_source'].iloc[0]})"
+    ax.set_title(f"E-distance effect size{source}")
     fig.tight_layout()
-    _save(fig, out_dir / "edistance.png")
+    _save(fig, out_dir / filename)
 
 
 def plot_volcano(table: pd.DataFrame, out_dir: Path, name: str) -> None:
@@ -79,3 +97,39 @@ def plot_volcano(table: pd.DataFrame, out_dir: Path, name: str) -> None:
     ax.set_ylabel("-log10(padj)")
     ax.set_title(name)
     _save(fig, out_dir / f"volcano_{name}.png")
+
+
+def plot_guide_qc(guide_df: pd.DataFrame, consistency_df: pd.DataFrame, out_dir: Path) -> None:
+    """Guide-level QC: cells/UMI vs target effect, and per-gene guide consistency."""
+    if guide_df is None or guide_df.empty:
+        return
+    non_ctrl = guide_df.loc[~guide_df["is_control"]].copy() if "is_control" in guide_df.columns else guide_df
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+    if not non_ctrl.empty and "n_cells" in non_ctrl.columns:
+        axes[0].hist(non_ctrl["n_cells"], bins=40, color="#4C72B0")
+        axes[0].set_title("cells per guide")
+        axes[0].set_xlabel("n_cells")
+    if (
+        not non_ctrl.empty
+        and "median_guide_umi" in non_ctrl.columns
+        and "target_expr_log2fc_vs_control" in non_ctrl.columns
+    ):
+        axes[1].scatter(
+            non_ctrl["median_guide_umi"],
+            non_ctrl["target_expr_log2fc_vs_control"],
+            s=10,
+            alpha=0.5,
+            c="#DD8452",
+        )
+        axes[1].axhline(0, color="grey", lw=0.8)
+        axes[1].set_xlabel("median guide UMI")
+        axes[1].set_ylabel("target log2FC vs control")
+        axes[1].set_title("assignment vs target effect")
+    if consistency_df is not None and not consistency_df.empty and "guides_consistent" in consistency_df.columns:
+        counts = consistency_df["guides_consistent"].map({True: "consistent", False: "inconsistent"}).fillna("unknown")
+        counts.value_counts().reindex(["consistent", "inconsistent", "unknown"]).fillna(0).plot(
+            kind="bar", ax=axes[2], color="#55A868"
+        )
+        axes[2].set_title("guide consistency per gene")
+    fig.tight_layout()
+    _save(fig, out_dir / "guide_qc.png")
