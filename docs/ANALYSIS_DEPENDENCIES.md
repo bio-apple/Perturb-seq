@@ -28,7 +28,7 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | Cell annotation | descriptive | log-norm scores / markers | phase, cell_state, … | No (unless you later filter on them) | Cell-line “states”, not tissue taxonomy |
 | Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size |
 | Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object | **Yes** | Changes composition vs pre-Mixscape path |
-| E-distance / E-test | inferential (effect size) | `X_pca` (source tagged in report) | `edistance.csv`, `etest.csv` | Uses current cell set | Embedding choice (log-norm PCA vs `X_pert` PCA) changes ranks |
+| E-distance / E-test | inferential (effect size) | `X_pca` (source tagged in report) | `edistance.csv`, `etest.csv`, `distances.csv`, optional `distance_mmd.csv` | Uses current cell set | Embedding choice changes ranks; `low_power` when `n_cells < etest_power_min_cells`; secondary metrics may skip (`missing_jax` / `failed`) |
 | DE (Wilcoxon) | exploratory / inferential* | log-norm `X` | `de_*.csv` | Uses `de_group` definition | Cell-level p-values ≠ replicate inference |
 | DE (PyDESeq2) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | Uses `de_group` + replicates | Requires `replicate_col` with ≥2 levels |
 | Perturbation clustering | descriptive | mean `X_pca` per gene_target | `perturbation_clusters.csv` | Uses current cell set | Pathway-like grouping, not proof of mechanism |
@@ -46,7 +46,30 @@ When Mixscape **runs successfully**:
 
 DE contrasts use Mixscape labels (`mixscape_class`) when Mixscape succeeds — **downstream DE depends on that classification**.
 
-When Mixscape is **skipped** or fails, `report.json` records the reason; E-distance/DE use `gene_target` on the post-QC object; no KO/NP filter is applied.
+When Mixscape is **skipped** or fails, `report.json` records an explicit status object (never a missing key or bare `null`):
+
+```json
+"mixscape": {
+  "skipped": true,
+  "reason": "user_skip|too_many_targets|subset_no_targets|missing_pertpy|failed",
+  "detail": "...",
+  "n_targets": 785,
+  "mixscape_max_targets": 40,
+  "mixscape_mode": "auto",
+  "estimate": {
+    "note": "Heuristic cost ∝ O(n_cells × n_targets); not a wall-clock benchmark. ...",
+    "n_cells": 50000,
+    "n_targets": 785,
+    "approx_work_units": 39250000,
+    "approx_relative_to_threshold": 19.62,
+    "approx_memory_hint_gb": 15.7
+  }
+}
+"edistance": {"skipped": true, "reason": "user_skip|missing_pertpy|failed", "detail": "..."}
+"de": {"skipped": false, "reason": null, "n_contrasts": 3, "scope": "gene_target (...)", ...}
+```
+
+Success shape: `{"skipped": false, "reason": null, ...rich fields...}`. Subset success may include `"subset": true` and `"selected_targets": [...]`. E-distance/DE then use `gene_target` on the post-QC object when Mixscape was skipped; no KO/NP filter is applied.
 
 ## Composition sensitivity
 
@@ -55,4 +78,4 @@ Each filter (QC, singlet, Mixscape KO-only, optional state/guide filters) can ch
 ## Report language
 
 - UMAP / Leiden: visualization or descriptive structure only.
-- Perturbation claims: prefer E-distance / E-test and (when replicates exist) pseudobulk DE, with matrix provenance from `report.json` → `matrix_provenance`.
+- Perturbation claims: prefer E-distance / E-test and (when replicates exist) pseudobulk DE, with matrix provenance from `report.json` → `matrix_provenance` (always includes `pca_source`, `n_hvg`, `n_pcs`). Prefer `significant_adj_reported` over raw `significant_adj` when `low_power` is set.

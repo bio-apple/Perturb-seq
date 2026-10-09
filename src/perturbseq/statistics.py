@@ -2,27 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 import pandas as pd
-from anndata import AnnData
 import scanpy as sc
+from anndata import AnnData
 
-
-def _require_pertpy():
-    try:
-        import pertpy as pt
-    except ImportError as exc:
-        raise ImportError(
-            "pertpy is required for Mixscape/E-distance/PyDESeq2. "
-            "Install with: pip install 'pertpy[de]>=1.3'"
-        ) from exc
-    return pt
+from perturbseq._deps import require_pertpy
+from perturbseq.parallel import parallel_map
 
 
 def check_experimental_design(
     adata: AnnData,
     replicate_col: str | None = None,
     groupby: str = "gene_target",
-) -> dict:
+) -> dict[str, Any]:
     """Summarize whether DE can use replicate-aware pseudobulk inference."""
     n_groups = int(adata.obs[groupby].astype(str).nunique()) if groupby in adata.obs else 0
     n_reps = 1
@@ -70,7 +65,7 @@ def run_deseq2_or_wilcoxon(
     subset = counts[mask].copy()
     n_reps = subset.obs[replicate_col].nunique() if replicate_col and replicate_col in subset.obs else 1
     if replicate_col and n_reps >= 2:
-        pt = _require_pertpy()
+        pt = require_pertpy()
         if "counts" in subset.layers:
             subset.X = subset.layers["counts"]
         pseudobulk = pt.tl.PseudobulkSpace().compute(
@@ -89,8 +84,64 @@ def run_deseq2_or_wilcoxon(
     return exploratory_wilcoxon(subset, groupby=groupby, group=group, reference=reference)
 
 
+def _de_one_contrast(
+    args: tuple[AnnData, str, str, str | None, str],
+) -> tuple[str, pd.DataFrame | None, str | None]:
+    """Worker: one group vs reference on a pre-subset AnnData (picklable top-level)."""
+    subset, group, reference, replicate_col, groupby = args
+    try:
+        table = run_deseq2_or_wilcoxon(
+            subset,
+            group=group,
+            reference=reference,
+            replicate_col=replicate_col,
+            groupby=groupby,
+        )
+        if table is None or table.empty:
+            return str(group), None, None
+        return str(group), table, None
+    except Exception as exc:  # noqa: BLE001
+        return str(group), None, str(exc)
+
+
+def run_de_contrasts(
+    counts: AnnData,
+    groups: Sequence[str],
+    *,
+    reference: str = "NT",
+    replicate_col: str | None = None,
+    groupby: str = "de_group",
+    min_cells: int = 10,
+    n_jobs: int = 1,
+) -> tuple[list[tuple[str, pd.DataFrame]], dict[str, str]]:
+    """Run DE for each group vs reference; parallelizes the outer loop when n_jobs != 1.
+
+    Each worker receives a copy of cells in {group, reference} only. CSV/plots stay
+    on the caller so AnnData is never mutated across processes.
+    """
+    tasks: list[tuple[AnnData, str, str, str | None, str]] = []
+    labels = counts.obs[groupby].astype(str)
+    for group in groups:
+        g = str(group)
+        if int((labels == g).sum()) < min_cells:
+            continue
+        mask = labels.isin([g, str(reference)])
+        tasks.append((counts[mask].copy(), g, str(reference), replicate_col, groupby))
+
+    results = parallel_map(_de_one_contrast, tasks, n_jobs=n_jobs)
+    tables: list[tuple[str, pd.DataFrame]] = []
+    errors: dict[str, str] = {}
+    for group, table, err in results:
+        if err:
+            errors[group] = err
+        elif table is not None:
+            tables.append((group, table))
+    return tables, errors
+
+
 __all__ = [
     "check_experimental_design",
     "exploratory_wilcoxon",
+    "run_de_contrasts",
     "run_deseq2_or_wilcoxon",
 ]

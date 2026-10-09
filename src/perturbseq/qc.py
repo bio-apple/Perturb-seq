@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from anndata import AnnData
+from numpy.typing import NDArray
 from scipy import sparse
 
 
-def _to_dense_1d(matrix) -> np.ndarray:
+def _to_dense_1d(matrix: Any) -> NDArray[np.floating]:
     if sparse.issparse(matrix):
         return np.asarray(matrix.sum(axis=1)).ravel()
     return np.asarray(matrix).sum(axis=1).ravel()
 
 
 def add_qc_metrics(adata: AnnData, mt_prefixes: tuple[str, ...] = ("MT-", "mt-")) -> AnnData:
+    """Add ``n_counts``, ``n_genes``, ``pct_counts_mt`` to ``adata.obs`` (in place)."""
     names = pd.Index(adata.var_names.astype(str))
     ids = pd.Index(adata.var["gene_ids"].astype(str)) if "gene_ids" in adata.var else names
     mt_mask = np.zeros(adata.n_vars, dtype=bool)
@@ -71,7 +75,7 @@ def filter_cells(
     return filtered, log
 
 
-def sample_qc_summary(adata: AnnData, sample_col: str = "sample_id") -> dict:
+def sample_qc_summary(adata: AnnData, sample_col: str = "sample_id") -> dict[str, Any]:
     """Per-sample cell/UMI summaries for sample-level QC reporting."""
     if sample_col not in adata.obs:
         return {"n_samples": 1, "n_cells": int(adata.n_obs)}

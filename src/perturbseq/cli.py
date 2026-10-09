@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from anndata import read_h5ad
 
 from perturbseq.cell_annotation import annotate_cells, annotation_summary, write_annotation_tables
 from perturbseq.demo import write_demo_dragen
-from perturbseq.guide_qc import run_guide_qc, write_guide_qc_tables
+from perturbseq.guide_qc import GUIDE_MERGE_MODES, run_guide_qc, write_guide_qc_tables
 from perturbseq.io import write_h5ad
-from perturbseq.pipeline import PipelineConfig, pipeline_config_from_mapping, run_pipeline
+from perturbseq.pipeline import (
+    PipelineConfig,
+    dry_run_plan,
+    pipeline_config_from_mapping,
+    run_pipeline,
+)
 from perturbseq.plots import plot_cell_annotation, plot_guide_qc
 from perturbseq.report import write_analysis_report
-from perturbseq.repro import deep_merge, default_config_path, load_yaml_config
+from perturbseq.repro import (
+    deep_merge,
+    default_config_path,
+    load_yaml_config,
+    write_config_template,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,10 +51,50 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--keep-multiplets", action="store_true")
     run.add_argument("--n-mads", type=float, default=None)
     run.add_argument("--n-perms", type=int, default=None)
+    run.add_argument(
+        "--min-cells-per-pert",
+        type=int,
+        default=None,
+        help="Min cells per perturbation for distance / DE grouping",
+    )
+    run.add_argument(
+        "--etest-power-min-cells",
+        type=int,
+        default=None,
+        help="Below this n_cells, mark E-test as low_power (default 50; Peidli ~200 more stable)",
+    )
+    run.add_argument(
+        "--secondary-distance-metrics",
+        default=None,
+        help="Comma-separated secondary metrics after E-distance (e.g. mmd,wasserstein)",
+    )
     run.add_argument("--skip-mixscape", action="store_true")
     run.add_argument("--force-mixscape", action="store_true")
     run.add_argument("--mixscape-max-targets", type=int, default=None)
+    run.add_argument(
+        "--mixscape-mode",
+        default=None,
+        choices=["auto", "skip", "force", "subset"],
+        help="auto (default: skip if n_targets>max), skip, force (all targets), or subset",
+    )
+    run.add_argument(
+        "--mixscape-targets",
+        default=None,
+        help="Comma-separated gene targets for subset Mixscape (implies mixscape_mode=subset)",
+    )
+    run.add_argument(
+        "--mixscape-top-n",
+        type=int,
+        default=None,
+        help="Run Mixscape on top-N E-distance genes (+ control); implies subset mode",
+    )
     run.add_argument("--de-top-n", type=int, default=None)
+    run.add_argument(
+        "--n-jobs",
+        type=int,
+        default=None,
+        help="Parallel workers for per-group DE / E-test (default 1; -1 = all CPUs)",
+    )
     run.add_argument("--skip-cell-annotation", action="store_true")
     run.add_argument("--skip-distance", action="store_true")
     run.add_argument("--skip-de", action="store_true")
@@ -59,6 +110,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip stages that already succeeded with unchanged inputs/params",
     )
     run.add_argument("--random-state", type=int, default=None, help="Random seed for PCA/neighbors/UMAP/etc.")
+    run.add_argument(
+        "--guide-merge",
+        default=None,
+        choices=list(GUIDE_MERGE_MODES),
+        help="Multi-guide weighted summary: none (default, flag only) | equal | umi | confidence | umi_confidence",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and print planned stages + resolved params (no analysis)",
+    )
+
+    config_cmd = sub.add_parser("config", help="Config helpers (generate a commented YAML template)")
+    config_cmd.add_argument(
+        "action",
+        nargs="?",
+        choices=["generate"],
+        default=None,
+        help="Optional action; 'generate' is the same as --generate",
+    )
+    config_cmd.add_argument(
+        "--generate",
+        action="store_true",
+        help="Write a fully commented YAML template (default.yaml + PipelineConfig fields)",
+    )
+    config_cmd.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("configs/pipeline.template.yaml"),
+        help="Output path for --generate (default: configs/pipeline.template.yaml)",
+    )
 
     annotate = sub.add_parser("annotate", help="Add cell annotation to an existing tertiary h5ad")
     annotate.add_argument("--h5ad", type=Path, required=True)
@@ -86,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     guide_qc.add_argument("--min-cells", type=int, default=10)
     guide_qc.add_argument("--min-median-umi", type=float, default=5.0)
     guide_qc.add_argument("--min-detection-rate", type=float, default=0.5)
+    guide_qc.add_argument(
+        "--guide-merge",
+        default="none",
+        choices=list(GUIDE_MERGE_MODES),
+        help="Weighted gene-level guide summary (default none = flag inconsistency only)",
+    )
     return parser
 
 
@@ -106,14 +195,34 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["n_mads"] = args.n_mads
     if args.n_perms is not None:
         data["n_perms"] = args.n_perms
+    if getattr(args, "min_cells_per_pert", None) is not None:
+        data["min_cells_per_pert"] = args.min_cells_per_pert
+    if getattr(args, "etest_power_min_cells", None) is not None:
+        data["etest_power_min_cells"] = args.etest_power_min_cells
+    if getattr(args, "secondary_distance_metrics", None) is not None:
+        data["secondary_distance_metrics"] = tuple(
+            p.strip() for p in args.secondary_distance_metrics.split(",") if p.strip()
+        )
     if args.mixscape_max_targets is not None:
         data["mixscape_max_targets"] = args.mixscape_max_targets
+    if getattr(args, "mixscape_mode", None) is not None:
+        data["mixscape_mode"] = args.mixscape_mode
+    if getattr(args, "mixscape_targets", None) is not None:
+        data["mixscape_targets"] = tuple(
+            t.strip() for t in args.mixscape_targets.split(",") if t.strip()
+        )
+    if getattr(args, "mixscape_top_n", None) is not None:
+        data["mixscape_top_n"] = args.mixscape_top_n
     if args.de_top_n is not None:
         data["de_top_n"] = args.de_top_n
+    if getattr(args, "n_jobs", None) is not None:
+        data["n_jobs"] = args.n_jobs
     if args.perturbation_type is not None:
         data["perturbation_type"] = args.perturbation_type
     if args.random_state is not None:
         data["random_state"] = args.random_state
+    if getattr(args, "guide_merge", None) is not None:
+        data["guide_merge"] = args.guide_merge
     if args.control_patterns is not None:
         data["control_patterns"] = tuple(
             p.strip() for p in args.control_patterns.split(",") if p.strip()
@@ -143,6 +252,27 @@ def build_run_config(args: argparse.Namespace) -> tuple[PipelineConfig, Path | N
         base = load_yaml_config(config_path)
     merged = deep_merge(base, _cli_overrides(args))
     return pipeline_config_from_mapping(merged), config_path
+
+
+def _print_dry_run(config: PipelineConfig, config_path: Path | None) -> int:
+    plan = dry_run_plan(config)
+    print("Dry-run OK — inputs validated (no analysis run).", flush=True)
+    if config_path is not None:
+        print(f"Config: {config_path}", flush=True)
+    print(f"Sample: {plan['sample_id']}", flush=True)
+    print(f"Input:  {plan['input_dir']}", flush=True)
+    print(f"Output: {plan['output_dir']}", flush=True)
+    print("\nInput files:", flush=True)
+    for key, path in plan["input_files"].items():
+        print(f"  {key}: {path}", flush=True)
+    print("\nPlanned stages:", flush=True)
+    for entry in plan["stages"]:
+        notes = f"  ({', '.join(entry['notes'])})" if entry["notes"] else ""
+        print(f"  {entry['stage']:28s} {entry['action']}{notes}", flush=True)
+    print("\nResolved parameters:", flush=True)
+    for key, value in sorted(plan["params"].items()):
+        print(f"  {key}: {value}", flush=True)
+    return 0
 
 
 def _run_annotate(h5ad: Path, output_dir: Path, inplace: bool) -> int:
@@ -175,6 +305,7 @@ def _run_guide_qc(
     min_cells: int,
     min_median_umi: float,
     min_detection_rate: float,
+    guide_merge: str = "none",
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     figures = output_dir / "figures"
@@ -183,13 +314,14 @@ def _run_guide_qc(
     tables.mkdir(exist_ok=True)
     print(f"Loading {h5ad}", flush=True)
     adata = read_h5ad(h5ad)
-    print(f"Guide QC on {adata.n_obs} cells", flush=True)
+    print(f"Guide QC on {adata.n_obs} cells (guide_merge={guide_merge})", flush=True)
     guide_df, consistency_df, warnings_df, summary = run_guide_qc(
         adata,
         control=control,
         min_cells=min_cells,
         min_median_umi=min_median_umi,
         min_detection_rate=min_detection_rate,
+        guide_merge=guide_merge,
     )
     write_guide_qc_tables(guide_df, consistency_df, warnings_df, tables)
     plot_guide_qc(guide_df, consistency_df, figures)
@@ -208,6 +340,8 @@ def _run_guide_qc(
     print(f"Wrote {tables / 'guide_qc.csv'}", flush=True)
     print(f"Wrote {tables / 'gene_guide_consistency.csv'}", flush=True)
     print(f"Wrote {tables / 'qc_warnings.csv'}", flush=True)
+    if (tables / "gene_guide_weighted.csv").exists():
+        print(f"Wrote {tables / 'gene_guide_weighted.csv'}", flush=True)
     print(
         f"warnings={summary.get('n_warnings')} "
         f"inconsistent_genes={summary.get('n_genes_inconsistent_guides')}",
@@ -223,6 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         path = write_demo_dragen(args.output_dir)
         print(f"Wrote demo DRAGEN files to {path}")
         return 0
+    if args.command == "config":
+        if args.generate or args.action == "generate":
+            path = write_config_template(args.output)
+            print(f"Wrote commented YAML template to {path}")
+            return 0
+        parser.error("config: pass --generate (or 'generate') to write a template")
     if args.command == "annotate":
         return _run_annotate(args.h5ad, args.output_dir, args.inplace)
     if args.command == "guide-qc":
@@ -233,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             args.min_cells,
             args.min_median_umi,
             args.min_detection_rate,
+            args.guide_merge,
         )
     if args.command == "report":
         report = write_analysis_report(
@@ -245,17 +386,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {args.output_dir / 'report.html'} ({n} perturbations)")
         print(f"Updated {args.output_dir / 'report.json'} → perturbations")
         return 0
-    config, config_path = build_run_config(args)
-    report = run_pipeline(config, resume=args.resume, config_path=config_path)
+    try:
+        config, config_path = build_run_config(args)
+        if args.dry_run:
+            return _print_dry_run(config, config_path)
+        report = run_pipeline(config, resume=args.resume, config_path=config_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     print(f"Finished. Report: {config.output_dir / 'report.json'}")
     print(f"HTML report: {config.output_dir / 'report.html'}")
     print(f"Manifest: {config.output_dir / 'run_manifest.json'}")
     print(f"Run log: {config.output_dir / 'run.log'}")
     print(f"Cells after singlet filter: {report.get('n_after_singlet')}")
-    if "cell_annotation" in report:
-        print(f"Cell annotation: {report['cell_annotation'].get('cell_state')}")
-    if "mixscape_global" in report:
+    cell_ann = report.get("cell_annotation")
+    if isinstance(cell_ann, dict):
+        if cell_ann.get("skipped"):
+            print(f"Cell annotation: skipped ({cell_ann.get('reason')})")
+        elif cell_ann.get("cell_state") is not None:
+            print(f"Cell annotation: {cell_ann.get('cell_state')}")
+    mix = report.get("mixscape")
+    if isinstance(mix, dict):
+        if mix.get("skipped"):
+            print(f"Mixscape: skipped ({mix.get('reason')})")
+        elif "mixscape_global" in report:
+            print(f"Mixscape: {report['mixscape_global']}")
+        elif mix.get("global_counts"):
+            print(f"Mixscape: {mix['global_counts']}")
+    elif "mixscape_global" in report:
         print(f"Mixscape: {report['mixscape_global']}")
+    edist = report.get("edistance")
+    if isinstance(edist, dict) and edist.get("skipped"):
+        print(f"E-distance: skipped ({edist.get('reason')})")
     if "guide_qc" in report:
         gq = report["guide_qc"]
         print(
@@ -265,8 +427,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if "perturbation_summary" in report:
         print(f"Perturbations summarized: {report['perturbation_summary'].get('n_perturbations')}")
-    if "de_note" in report:
-        print(report["de_note"])
+    de = report.get("de") if isinstance(report.get("de"), dict) else {}
+    de_note = de.get("detail") or report.get("de_note")
+    if de_note:
+        print(de_note)
+    elif de.get("skipped"):
+        print(f"DE: skipped ({de.get('reason')})")
     return 0
 
 

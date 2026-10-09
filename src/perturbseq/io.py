@@ -22,7 +22,14 @@ def resolve_sample_files(input_dir: Path, sample_id: str) -> dict[str, Path]:
     files = {key: input_dir / name.format(sample=sample_id) for key, name in SAMPLE_FILES.items()}
     missing = [str(path) for path in files.values() if not path.exists()]
     if missing:
-        raise FileNotFoundError("Missing DRAGEN files:\n" + "\n".join(missing))
+        raise FileNotFoundError(
+            "Missing DRAGEN files:\n"
+            + "\n".join(missing)
+            + f"\n\nCheck --input-dir ({input_dir}) and --sample-id ({sample_id!r}).\n"
+            "Suggested commands:\n"
+            f"  python -m perturbseq write-demo --output-dir {input_dir}\n"
+            "  python -m perturbseq run --input-dir <dir> --output-dir <out> --sample-id <id> --dry-run"
+        )
     return files
 
 
@@ -78,8 +85,13 @@ def read_guide_assignments(path: Path) -> pd.DataFrame:
     missing = required.difference(assignments.columns)
     if missing:
         raise ValueError(
-            f"{path} is missing columns {sorted(missing)}; "
-            "expected DRAGEN positive_cell_guide_assignments.csv"
+            f"Guide assignment column mismatch in {path}: missing {sorted(missing)}. "
+            f"Found columns: {list(assignments.columns)}. "
+            "Expected DRAGEN positive_cell_guide_assignments.csv with: "
+            "cell_barcode, num_features, feature_call, num_transcripts.\n"
+            "Suggested commands:\n"
+            f'  python -c "import pandas as pd; print(list(pd.read_csv({str(path)!r}, nrows=0).columns))"\n'
+            "  python -m perturbseq write-demo --output-dir data/demo  # reference schema"
         )
     assignments["cell_barcode"] = assignments["cell_barcode"].astype(str)
     assignments["num_features"] = pd.to_numeric(assignments["num_features"], errors="coerce").fillna(0).astype(int)

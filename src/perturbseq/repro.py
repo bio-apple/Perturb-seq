@@ -8,9 +8,10 @@ import logging
 import os
 import platform
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
 
@@ -134,6 +135,104 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 def default_config_path() -> Path:
     # src/perturbseq/repro.py → repo root / configs/default.yaml
     return Path(__file__).resolve().parents[2] / "configs" / "default.yaml"
+
+
+# Comments for PipelineConfig fields. Keep in sync with pipeline.PipelineConfig
+# and configs/default.yaml.
+_CONFIG_FIELD_COMMENTS: dict[str, str] = {
+    "input_dir": "Required path to DRAGEN sample directory (or pass --input-dir)",
+    "output_dir": "Required results directory (or pass --output-dir)",
+    "sample_id": "Sample prefix used in DRAGEN filenames",
+    "singlet_only": "Keep only cells with num_features == 1; CLI --keep-multiplets sets false",
+    "n_mads": "MAD multiplier for cell QC outlier filter",
+    "min_cells": "Drop genes expressed in fewer than this many cells",
+    "n_top_genes": "Highly variable gene count for PCA/neighbors",
+    "n_pcs": "Number of PCA components",
+    "leiden_resolution": "Leiden clustering resolution (descriptive)",
+    "control": "Control / NT label in gene_target / perturbation",
+    "replicate_col": "Optional obs column for biological replicates (null = none)",
+    "skip_mixscape": "Skip Mixscape classification",
+    "skip_cell_annotation": "Skip cell-cycle / cell-state annotation",
+    "skip_distance": "Skip E-distance / E-test",
+    "skip_de": "Skip differential expression contrasts",
+    "n_perms": "E-test permutations",
+    "min_cells_per_pert": "Min cells per perturbation for distance / DE grouping",
+    "etest_power_min_cells": "Below this n_cells, mark E-test as low_power (default 50)",
+    "secondary_distance_metrics": "Secondary metrics after E-distance (e.g. mmd, wasserstein)",
+    "mixscape_max_targets": "Skip Mixscape when unique targets exceed this (unless force)",
+    "force_mixscape": "Run Mixscape even above mixscape_max_targets",
+    "mixscape_mode": "auto | skip | force | subset (CLI --skip/--force still work)",
+    "mixscape_targets": "Target list when mixscape_mode=subset",
+    "mixscape_top_n": "Optional top-N targets for Mixscape subset mode",
+    "de_top_n": "Top DE genes retained per contrast in summaries",
+    "n_jobs": "Parallel workers for per-group DE / E-test (1 = sequential; -1 = all CPUs)",
+    "perturbation_type": "Mixscape label suffix, e.g. KO / KD / perturbation",
+    "random_state": "Seed for PCA / neighbors / UMAP / etc.",
+    "control_patterns": "Regexes matched against guide/target names to label NT/control",
+    "guide_merge": "Multi-guide summary: none | equal | umi | confidence | umi_confidence",
+}
+
+
+def _yaml_block(key: str, value: Any) -> str:
+    if isinstance(value, tuple):
+        value = list(value)
+    return yaml.dump({key: value}, default_flow_style=False, sort_keys=False).rstrip()
+
+
+def generate_config_template() -> str:
+    """Fully commented YAML template from default.yaml + PipelineConfig fields."""
+    from dataclasses import MISSING, fields
+
+    from perturbseq.pipeline import PipelineConfig
+
+    loaded: dict[str, Any] = {}
+    defaults_path = default_config_path()
+    if defaults_path.is_file():
+        loaded = load_yaml_config(defaults_path)
+
+    lines = [
+        "# Fully commented template for the tertiary Perturb-seq pipeline.",
+        "# Generate: python -m perturbseq config --generate",
+        "#           python -m perturbseq config generate -o my.yaml",
+        "# Precedence: CLI flags override YAML. See docs/CLI_YAML.md.",
+        "#",
+        "# Required: set input_dir and output_dir here and/or via CLI.",
+        "",
+    ]
+
+    field_order = [f.name for f in fields(PipelineConfig) if f.name != "extra"]
+    # Prefer paths first for readability.
+    ordered = [k for k in ("input_dir", "output_dir") if k in field_order]
+    ordered += [k for k in field_order if k not in ordered]
+
+    for key in ordered:
+        lines.append(f"# {_CONFIG_FIELD_COMMENTS.get(key, key)}")
+        if key in loaded:
+            lines.append(_yaml_block(key, loaded[key]))
+        elif key == "input_dir":
+            lines.append("# input_dir: data/demo")
+        elif key == "output_dir":
+            lines.append("# output_dir: results/demo")
+        else:
+            field_obj = next(f for f in fields(PipelineConfig) if f.name == key)
+            if field_obj.default is not MISSING:
+                val = field_obj.default
+            elif field_obj.default_factory is not MISSING:  # type: ignore[comparison-overlap]
+                val = field_obj.default_factory()
+            else:
+                val = None
+            lines.append(_yaml_block(key, val))
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_config_template(path: Path | str) -> Path:
+    """Write generate_config_template() to ``path``; return the path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(generate_config_template(), encoding="utf-8")
+    return path
 
 
 class RunTracker:

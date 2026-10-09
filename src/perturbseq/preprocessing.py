@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from scipy import sparse
-from anndata import AnnData
 import scanpy as sc
+from anndata import AnnData
+from scipy import sparse
 
 
 def preprocess_rna(

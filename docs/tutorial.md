@@ -2,6 +2,14 @@
 
 End-to-end walkthrough for new users. Structure follows [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/): motivation → steps → inspection → caveats.
 
+**Interactive notebook (recommended):** [tutorial.ipynb](tutorial.ipynb) — synthetic demo runs offline; optional Papalexi 2021 cell needs network + pertpy.
+
+```bash
+# from repo root, after install
+jupyter notebook docs/tutorial.ipynb
+# or: jupyter lab docs/tutorial.ipynb
+```
+
 Related: [CLI ↔ YAML](CLI_YAML.md) · [Statistical caveats](STATISTICAL_CAVEATS.md) · [Step dependencies](ANALYSIS_DEPENDENCIES.md)
 
 ## Motivation
@@ -58,6 +66,8 @@ python -m perturbseq run \
 | `random_state: 0` | YAML | Stable PCA / neighbors / UMAP |
 | Mixscape on | (omit `--skip-mixscape`) | Demo has few targets (&lt; `mixscape_max_targets`) so Mixscape runs |
 | `n_perms: 200` | YAML | E-test permutations; raise for publication runs |
+| `etest_power_min_cells: 50` | YAML / `--etest-power-min-cells` | Below → `low_power`; Peidli ~50–100 safer, ~200 more stable |
+| `secondary_distance_metrics` | YAML / CLI | Default `mmd,wasserstein`; skip gracefully if JAX missing |
 
 Faster smoke test (skip Mixscape + distance):
 
@@ -97,10 +107,10 @@ results/demo/
 
 1. **`run_manifest.json` / `run.log`** — Did every stage succeed? Check versions and checksums.
 2. **`tables/composition_audit.csv`** — How many cells remain after QC / singlet / Mixscape filters.
-3. **`tables/edistance.csv`** (and `pre_mixscape/` / `post_mixscape/` if Mixscape ran) — Effect sizes vs NT.
-4. **`tables/etest.csv`** — Permutation p-values / padj for distances.
+3. **`tables/edistance.csv`** / **`distances.csv`** (and `pre_mixscape/` / `post_mixscape/` if Mixscape ran) — Effect sizes vs NT (+ secondary metrics if available).
+4. **`tables/etest.csv`** — Permutation p-values / padj; check `low_power` and `significant_adj_reported`.
 5. **`tables/de_*.csv`** — Without replicates, expect exploratory Wilcoxon (see caveats).
-6. **`tables/guide_qc.csv`**, **`gene_guide_consistency.csv`**, **`qc_warnings.csv`** — Guide-level QC.
+6. **`tables/guide_qc.csv`**, **`gene_guide_consistency.csv`**, **`qc_warnings.csv`** — Guide-level QC. Optional **`gene_guide_weighted.csv`** when `guide_merge` ≠ `none`.
 7. **`figures/`** — QC violin/scatter, UMAP (viz only), volcano, E-distance plots.
 8. **`sample1.tertiary.h5ad`** — `obs`: `guide_id`, `gene_target`, `perturbation`, `mixscape_class*`; `layers['counts']` raw; `X` log-norm.
 
@@ -125,7 +135,7 @@ Or rebuild HTML/JSON from an existing results directory without re-running analy
 python -m perturbseq report --output-dir results/demo
 ```
 
-`report.html` is organized around questions per perturbation (cell counts, effect size, consistency, top genes, warnings). Prefer CSV / h5ad / `report.json` for downstream scripting.
+`report.html` is organized around questions per perturbation (cell counts, effect size, consistency, top genes, warnings). Each card also surfaces guide `interpretation` / `qc_warnings` (and optional weighted summary when `guide_merge` ≠ `none`). Prefer CSV / h5ad / `report.json` for downstream scripting. Skipped optional steps appear as objects like `"mixscape": {"skipped": true, "reason": "user_skip", ...}` — not missing keys or bare `null`.
 
 ## Step 5 — Optional follow-ons
 
@@ -143,11 +153,30 @@ python -m perturbseq guide-qc \
   --control NT
 ```
 
-## Caveats (demo and beyond)
+## Optional — public dataset (Papalexi 2021)
 
-- **Cells ≠ biological replicates.** Demo has no `replicate_col` → Wilcoxon DE is exploratory.
-- **UMAP / Leiden** describe structure; they are not perturbation evidence.
-- **Mixscape NP** ≠ proven biological null; see [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md).
-- Demo NegCtrl / targeting modules are synthetic — do not over-interpret gene names.
+Needs **network** (first download) and `pertpy`. Not DRAGEN MEX — useful for comparing with Mixscape literature. Full interactive cell: [tutorial.ipynb](tutorial.ipynb).
+
+```python
+# optional
+import pertpy as pt
+mdata = pt.data.papalexi_2021()
+print(mdata)
+```
+
+## 常见坑 / Common pitfalls
+
+Full text + literature: **[STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md)**.
+
+| Pitfall | Why | What to do |
+| --- | --- | --- |
+| **Multi-guide inconsistency** | Same gene, different guides → discordant directions (assignment, UMI, incomplete edit, off-target, cytotoxicity) | Inspect `gene_guide_consistency.csv` / `qc_warnings.csv`; do **not** pool inconsistent guides into one “gene KO” claim |
+| **Mixscape labels many NP** | Targeting barcode but transcriptome still resembles NT; pool-dependent; **not** proof the guide failed | Read composition audit; NP ≠ proven biological null |
+| **No FDR claims without replicates** | Cells ≠ biological replicates; no `replicate_col` → exploratory Wilcoxon only | Hypothesis ranking only; ≥2 true replicates → pseudobulk + PyDESeq2 |
+| **UMAP / Leiden as effect** | Global structure ≠ perturbation evidence | Prefer E-distance / E-test (+ replicate-aware DE) |
+| **Filtering changes composition** | MAD QC, singlet, Mixscape KO+NT drop cells | Compare `tables/composition_audit.csv` |
+| **Inherited guide assignment** | Tertiary pipeline does not re-call guides by default | Assignment quality bounds everything downstream |
+
+Demo NegCtrl / targeting modules are synthetic — do not over-interpret gene names.
 
 When ready for real data, point `--input-dir` at a DRAGEN sample folder and keep the same inspection order. Map all flags in [CLI_YAML.md](CLI_YAML.md).

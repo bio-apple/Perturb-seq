@@ -1,9 +1,37 @@
-# Lightweight formatting hooks. Not required for CI; run locally with:
-#   pip install pre-commit && pre-commit install
+# Local hooks (not required for CI; CI runs ruff check + pytest separately):
+#   pip install -e ".[dev]"
+#   pre-commit install
+#   pre-commit run --all-files   # optional; ruff-format may rewrite many files
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=2000]
+      - id: check-merge-conflict
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.10
     hooks:
+      # Auto-fix lint issues on commit; aligns with [tool.ruff] in pyproject.toml
       - id: ruff
-        args: [--fix]
+        args: [--fix, --exit-non-zero-on-fix]
+      # Format only staged files (avoids forcing a one-shot whole-repo reformat)
       - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - pandas-stubs>=2.1
+          - types-PyYAML>=6.0
+        args: [--config-file=pyproject.toml]
+        pass_filenames: false
+        # Same pragmatic scope as README typing section
+        entry: mypy src/perturbseq/qc.py src/perturbseq/perturbation.py src/perturbseq/statistics.py src/perturbseq/_deps.py

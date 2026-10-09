@@ -13,8 +13,10 @@ import pandas as pd
 from anndata import AnnData
 
 from perturbseq.guide_qc import (
+    GUIDE_MERGE_MODES,
     compute_gene_guide_consistency,
     compute_guide_metrics,
+    compute_weighted_guide_summary,
     run_guide_qc,
     summarize_guide_qc,
     write_guide_qc_tables,
@@ -165,10 +167,12 @@ def filter_singlets(adata: AnnData, singlet_only: bool = True) -> AnnData:
 
 __all__ = [
     "DEFAULT_CONTROL_PATTERNS",
+    "GUIDE_MERGE_MODES",
     "annotate_guides",
     "build_feature_target_map",
     "compute_gene_guide_consistency",
     "compute_guide_metrics",
+    "compute_weighted_guide_summary",
     "filter_singlets",
     "parse_gene_target",
     "run_guide_qc",

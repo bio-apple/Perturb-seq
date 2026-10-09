@@ -21,9 +21,24 @@ skip_de: false
 
 n_perms: 200
 min_cells_per_pert: 10
+# E-test power: below this n_cells → low_power=true; significant_adj_reported suppressed.
+# Peidli et al.: ≥50–100 safer; ~200 more stable. Raise for publication screens.
+etest_power_min_cells: 50
+# Secondary distances for sensitivity (same group filter as E-distance). wasserstein needs JAX.
+secondary_distance_metrics:
+  - mmd
+  - wasserstein
 mixscape_max_targets: 40
 force_mixscape: false
+# auto | skip | force | subset — auto skips when n_targets > mixscape_max_targets
+mixscape_mode: auto
+# Optional subset Mixscape (comma list in CLI; YAML list or empty):
+mixscape_targets: []
+# Optional: top-N by pre-Mixscape E-distance (subset mode); null = off unless mode=subset
+mixscape_top_n: null
 de_top_n: 10
+# Per-group DE / E-test workers: 1 = sequential (reproducible default), -1 = all CPUs
+n_jobs: 1
 perturbation_type: KO
 random_state: 0
 
@@ -36,3 +51,7 @@ control_patterns:
   - "non[-_ ]?targeting"
   - "^control$"
   - "^ctrl$"
+
+# Multi-guide gene summary: none (default, flag only) | equal | umi | confidence | umi_confidence
+# Weighted modes keep per-guide rows + inconsistency flags; they do not silently overwrite.
+guide_merge: none

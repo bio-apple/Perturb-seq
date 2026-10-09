@@ -3,24 +3,103 @@
 from __future__ import annotations
 
 import warnings
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from anndata import AnnData
 import scanpy as sc
+from anndata import AnnData
 
+from perturbseq._deps import require_pertpy
 from perturbseq.guide_qc import compute_gene_guide_consistency, run_guide_qc
+from perturbseq.parallel import parallel_map, resolve_n_jobs
+
+# Secondary metrics tried after E-distance. Wasserstein needs OTT-JAX; skip if absent.
+DEFAULT_SECONDARY_DISTANCE_METRICS: tuple[str, ...] = ("mmd", "wasserstein")
+# Peidli et al.: E-test is underpowered at small n; ~50–100 safer, ~200 more stable.
+DEFAULT_ETEST_POWER_MIN_CELLS = 50
 
 
-def _require_pertpy():
-    try:
-        import pertpy as pt
-    except ImportError as exc:
-        raise ImportError(
-            "pertpy is required for Mixscape/E-distance/PyDESeq2. "
-            "Install with: pip install 'pertpy[de]>=1.3'"
-        ) from exc
-    return pt
+def estimate_mixscape_cost(
+    n_cells: int,
+    n_targets: int,
+    mixscape_max_targets: int,
+) -> dict[str, Any]:
+    """Rough O(n_cells × n_targets) cost hint for auto-skip transparency (not a benchmark)."""
+    n_cells = int(max(0, n_cells))
+    n_targets = int(max(0, n_targets))
+    max_t = int(max(1, mixscape_max_targets))
+    work = n_cells * n_targets
+    work_at_max = n_cells * max_t
+    # Heuristic: ~50 float features × 8 bytes × cells × targets, floored at 0.5 GB.
+    approx_memory_gb = max(0.5, round(work * 50 * 8 / 1e9, 2))
+    return {
+        "note": (
+            "Heuristic cost ∝ O(n_cells × n_targets); not a wall-clock benchmark. "
+            "Genome-scale Mixscape is typically memory- and time-heavy versus the "
+            f"default threshold (mixscape_max_targets={max_t})."
+        ),
+        "n_cells": n_cells,
+        "n_targets": n_targets,
+        "mixscape_max_targets": max_t,
+        "approx_work_units": int(work),
+        "approx_work_units_at_threshold": int(work_at_max),
+        "approx_relative_to_threshold": round(n_targets / max_t, 2),
+        "approx_memory_hint_gb": approx_memory_gb,
+    }
+
+
+def filter_cells_for_mixscape_targets(
+    adata: AnnData,
+    control: str,
+    targets: list[str] | tuple[str, ...],
+    *,
+    gene_col: str = "gene_target",
+) -> AnnData:
+    """Keep control + selected gene targets only (subset Mixscape path)."""
+    wanted = {str(control), *[str(t) for t in targets]}
+    labels = adata.obs[gene_col].astype(str)
+    keep = labels.isin(wanted)
+    if not bool(keep.any()):
+        raise ValueError(
+            f"No cells for Mixscape subset: control={control!r}, targets={list(targets)[:10]}"
+        )
+    return adata[keep].copy()
+
+
+def select_mixscape_targets_from_edistance(
+    edistances: pd.DataFrame,
+    *,
+    top_n: int,
+    control: str,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Pick top-N gene targets by E-distance rank (cheap pre-Mixscape ranking)."""
+    if edistances is None or edistances.empty or top_n <= 0:
+        return []
+    skip = {str(control), "unassigned", ""} | {str(x) for x in (exclude or set())}
+    ranked: list[str] = []
+    for name in edistances.index.astype(str):
+        if name in skip:
+            continue
+        ranked.append(name)
+        if len(ranked) >= int(top_n):
+            break
+    return ranked
+
+
+def merge_mixscape_annotations(full: AnnData, subset: AnnData) -> list[str]:
+    """Copy mixscape_* obs columns from a subset run onto the full object."""
+    copied: list[str] = []
+    for col in subset.obs.columns:
+        if not str(col).startswith("mixscape"):
+            continue
+        if col not in full.obs.columns:
+            full.obs[col] = pd.Series(pd.NA, index=full.obs_names, dtype=object)
+        full.obs[col] = full.obs[col].astype(object)
+        full.obs.loc[subset.obs_names, col] = subset.obs[col].astype(object).to_numpy()
+        copied.append(str(col))
+    return copied
 
 
 def run_mixscape(
@@ -30,7 +109,8 @@ def run_mixscape(
     n_neighbors: int = 20,
     perturbation_type: str = "KO",
 ) -> AnnData:
-    pt = _require_pertpy()
+    """Run pertpy Mixscape (signature → KO/NP). Requires ``pertpy``."""
+    pt = require_pertpy()
     if control not in set(adata.obs["perturbation"].astype(str)) and control not in set(
         adata.obs["gene_target"].astype(str)
     ):
@@ -66,6 +146,199 @@ def run_mixscape(
     return adata
 
 
+def _etest_one_group(
+    args: tuple[np.ndarray, np.ndarray, str, str, int],
+) -> pd.DataFrame:
+    """Worker: DistanceTest for one group vs contrast on a PCA embedding slice."""
+    embedding, labels, group, contrast, n_perms = args
+    pt = require_pertpy()
+    from anndata import AnnData as _AnnData
+
+    obs = pd.DataFrame({"_group": labels})
+    ad = _AnnData(obs=obs)
+    ad.obsm["X_pca"] = np.asarray(embedding)
+    etest = pt.tl.DistanceTest("edistance", n_perms=n_perms, obsm_key="X_pca")
+    return etest(ad, groupby="_group", contrast=contrast, show_progressbar=False)
+
+
+def _reapply_etest_padj(table: pd.DataFrame, method: str = "holm-sidak") -> pd.DataFrame:
+    """Recompute multiple-testing correction across concatenated per-group tests."""
+    out = table.copy()
+    pcol = None
+    for cand in ("pvalue", "p_value", "pval"):
+        if cand in out.columns:
+            pcol = cand
+            break
+    if pcol is None:
+        return out
+    try:
+        from statsmodels.stats.multitest import multipletests
+    except ImportError:
+        return out
+    pvals = pd.to_numeric(out[pcol], errors="coerce").to_numpy()
+    ok = np.isfinite(pvals)
+    padj = np.full(len(pvals), np.nan, dtype=float)
+    if ok.any():
+        _, adj, _, _ = multipletests(pvals[ok], method=method)
+        padj[ok] = adj
+    for col in ("pvalue_adj", "padj", "p_adj"):
+        if col in out.columns:
+            out[col] = padj
+            break
+    else:
+        out["pvalue_adj"] = padj
+    return out
+
+
+def annotate_etest_power(
+    etest: pd.DataFrame,
+    n_cells: pd.Series | dict[str, Any],
+    power_min_cells: int = DEFAULT_ETEST_POWER_MIN_CELLS,
+) -> pd.DataFrame:
+    """Tag E-test rows with sample-size power flags.
+
+    ``significant_adj`` remains the raw adjusted call. ``significant_adj_reported``
+    is True only when significant *and* not ``low_power`` (n_cells < threshold).
+    """
+    out = etest.copy()
+    if isinstance(n_cells, dict):
+        cell_map = pd.Series(n_cells, dtype=float)
+    else:
+        cell_map = pd.to_numeric(n_cells, errors="coerce")
+    out["n_cells"] = cell_map.reindex(out.index).to_numpy()
+    n = pd.to_numeric(out["n_cells"], errors="coerce")
+    out["low_power"] = (n < int(power_min_cells)) | ~np.isfinite(n)
+    if "significant_adj" not in out.columns:
+        padj = None
+        for col in ("pvalue_adj", "padj", "p_adj"):
+            if col in out.columns:
+                padj = pd.to_numeric(out[col], errors="coerce")
+                break
+        if padj is not None:
+            out["significant_adj"] = padj < 0.05
+        else:
+            out["significant_adj"] = False
+    sig = out["significant_adj"].fillna(False).astype(bool)
+    out["significant_adj_reported"] = sig & ~out["low_power"].astype(bool)
+    return out
+
+
+def _onesided_distance_frame(
+    adata: AnnData,
+    metric: str,
+    *,
+    groupby: str,
+    contrast: str,
+    min_cells: int,
+    n_jobs: int,
+    pca_source: str,
+) -> pd.DataFrame:
+    """Compute onesided distances for one pertpy metric on the same group filter as E-distance."""
+    pt = require_pertpy()
+    if "X_pca" not in adata.obsm:
+        sc.pp.pca(adata)
+    counts = adata.obs[groupby].astype(str).value_counts()
+    keep_groups = set(counts[counts >= min_cells].index)
+    keep_groups.add(contrast)
+    subset = adata[adata.obs[groupby].astype(str).isin(keep_groups)].copy()
+    distance = pt.tl.Distance(metric, obsm_key="X_pca")
+    onesided_kwargs: dict[str, Any] = {
+        "groupby": groupby,
+        "selected_group": contrast,
+        "show_progressbar": False,
+    }
+    resolved = resolve_n_jobs(n_jobs)
+    onesided_kwargs["n_jobs"] = resolved
+    try:
+        series = distance.onesided_distances(subset, **onesided_kwargs)
+    except TypeError:
+        onesided_kwargs.pop("n_jobs", None)
+        series = distance.onesided_distances(subset, **onesided_kwargs)
+    frame = (
+        series.drop(contrast, errors="ignore")
+        .sort_values(ascending=False)
+        .rename(metric)
+        .to_frame()
+    )
+    frame["n_cells"] = counts.reindex(frame.index)
+    frame["embedding"] = "X_pca"
+    frame["pca_source"] = pca_source
+    frame["metric"] = metric
+    return frame
+
+
+def run_secondary_distances(
+    adata: AnnData,
+    *,
+    groupby: str = "gene_target",
+    contrast: str = "NT",
+    min_cells: int = 10,
+    metrics: tuple[str, ...] | list[str] = DEFAULT_SECONDARY_DISTANCE_METRICS,
+    pca_source: str = "log1p_hvg",
+    n_jobs: int = 1,
+) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
+    """Compute secondary distance metrics (MMD, Wasserstein, …) with graceful skips.
+
+    Returns ``(tables_by_metric, statuses)`` where each status mirrors
+    ``skipped`` + ``reason`` (+ optional ``detail``).
+    """
+    tables: dict[str, pd.DataFrame] = {}
+    statuses: list[dict[str, Any]] = []
+    for metric in metrics:
+        metric = str(metric).strip()
+        if not metric or metric == "edistance":
+            continue
+        try:
+            tables[metric] = _onesided_distance_frame(
+                adata,
+                metric,
+                groupby=groupby,
+                contrast=contrast,
+                min_cells=min_cells,
+                n_jobs=n_jobs,
+                pca_source=pca_source,
+            )
+            statuses.append({"metric": metric, "skipped": False, "reason": None})
+        except ImportError as exc:
+            reason = "missing_jax" if metric == "wasserstein" else "missing_dependency"
+            detail = str(exc) or f"{metric} requires an optional dependency that is not installed"
+            if metric == "wasserstein" and "jax" not in detail.lower() and "ott" not in detail.lower():
+                # Still likely OTT-JAX for wasserstein.
+                reason = "missing_jax"
+            statuses.append(
+                {"metric": metric, "skipped": True, "reason": reason, "detail": detail}
+            )
+            warnings.warn(f"Secondary distance '{metric}' skipped: {detail}", stacklevel=2)
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)
+            reason = "missing_jax" if (
+                metric == "wasserstein"
+                and any(tok in detail.lower() for tok in ("jax", "ott", "module"))
+            ) else "failed"
+            statuses.append(
+                {"metric": metric, "skipped": True, "reason": reason, "detail": detail}
+            )
+            warnings.warn(f"Secondary distance '{metric}' skipped: {detail}", stacklevel=2)
+    return tables, statuses
+
+
+def combine_distance_tables(
+    edistances: pd.DataFrame,
+    secondary: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Wide table: edistance + secondary metric columns (+ shared n_cells / provenance)."""
+    out = edistances.copy()
+    if "edistance" not in out.columns and out.shape[1] >= 1:
+        # Defensive: already named.
+        pass
+    secondary = secondary or {}
+    for metric, frame in secondary.items():
+        if frame is None or frame.empty or metric not in frame.columns:
+            continue
+        out[metric] = frame[metric].reindex(out.index)
+    return out
+
+
 def run_edistance(
     adata: AnnData,
     groupby: str = "gene_target",
@@ -77,26 +350,37 @@ def run_edistance(
     max_control_cells: int = 1000,
     random_state: int = 0,
     pca_source: str = "log1p_hvg",
+    n_jobs: int = 1,
+    power_min_cells: int = DEFAULT_ETEST_POWER_MIN_CELLS,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """E-distance on ``obsm['X_pca']``. ``pca_source`` is recorded for report provenance only."""
-    pt = _require_pertpy()
-    if "X_pca" not in adata.obsm:
-        sc.pp.pca(adata)
+    """E-distance on ``obsm['X_pca']``. ``pca_source`` is recorded for report provenance only.
+
+    When ``n_jobs != 1``, E-test runs one DistanceTest per group in parallel and
+    re-applies holm-sidak across groups. ``n_jobs=1`` keeps a single joint
+    DistanceTest call (original behavior). pertpy DistanceTest has no internal
+    n_jobs hook; only the outer group loop is parallelized here.
+
+    E-test rows are annotated with ``n_cells``, ``low_power``, and
+    ``significant_adj_reported`` (significance only trusted when not low-power).
+    """
+    edistances = _onesided_distance_frame(
+        adata,
+        "edistance",
+        groupby=groupby,
+        contrast=contrast,
+        min_cells=min_cells,
+        n_jobs=n_jobs,
+        pca_source=pca_source,
+    )
+    # Drop helper column used by secondary metrics; keep edistance-focused schema.
+    if "metric" in edistances.columns:
+        edistances = edistances.drop(columns=["metric"])
+    pt = require_pertpy()
     counts = adata.obs[groupby].astype(str).value_counts()
     keep_groups = set(counts[counts >= min_cells].index)
     keep_groups.add(contrast)
     subset = adata[adata.obs[groupby].astype(str).isin(keep_groups)].copy()
-    distance = pt.tl.Distance("edistance", obsm_key="X_pca")
-    edistances = (
-        distance.onesided_distances(subset, groupby=groupby, selected_group=contrast, show_progressbar=False)
-        .drop(contrast, errors="ignore")
-        .sort_values(ascending=False)
-        .rename("edistance")
-        .to_frame()
-    )
-    edistances["n_cells"] = counts.reindex(edistances.index)
-    edistances["embedding"] = "X_pca"
-    edistances["pca_source"] = pca_source
+    resolved = resolve_n_jobs(n_jobs)
     etest_results = None
     try:
         rng = np.random.default_rng(random_state)
@@ -108,22 +392,55 @@ def run_edistance(
         control_names = subset.obs_names[subset.obs[groupby].astype(str) == contrast].to_numpy()
         if len(control_names) > max_control_cells:
             control_names = rng.choice(control_names, size=max_control_cells, replace=False)
-        tested_names = subset.obs_names[subset.obs[groupby].astype(str).isin(tested)].to_numpy()
-        etest_cells = np.concatenate([tested_names, control_names])
-        etest = pt.tl.DistanceTest("edistance", n_perms=n_perms, obsm_key="X_pca")
-        etest_results = etest(
-            subset[etest_cells].copy(),
-            groupby=groupby,
-            contrast=contrast,
-            show_progressbar=False,
-        )
+        labels_all = subset.obs[groupby].astype(str)
+        embedding = np.asarray(subset.obsm["X_pca"])
+        name_to_idx = {n: i for i, n in enumerate(subset.obs_names)}
+        ctrl_idx = np.array([name_to_idx[n] for n in control_names], dtype=int)
+
+        if resolved == 1:
+            tested_names = subset.obs_names[labels_all.isin(tested)].to_numpy()
+            etest_cells = np.concatenate([tested_names, control_names])
+            etest = pt.tl.DistanceTest("edistance", n_perms=n_perms, obsm_key="X_pca")
+            etest_results = etest(
+                subset[etest_cells].copy(),
+                groupby=groupby,
+                contrast=contrast,
+                show_progressbar=False,
+            )
+        else:
+            tasks = []
+            for group in tested:
+                g_idx = np.array(
+                    [name_to_idx[n] for n in subset.obs_names[labels_all == group]],
+                    dtype=int,
+                )
+                if g_idx.size == 0:
+                    continue
+                idx = np.concatenate([g_idx, ctrl_idx])
+                emb = embedding[idx]
+                labs = np.concatenate(
+                    [np.full(g_idx.size, str(group)), np.full(ctrl_idx.size, str(contrast))]
+                )
+                tasks.append((emb, labs, str(group), str(contrast), int(n_perms)))
+            pieces = parallel_map(_etest_one_group, tasks, n_jobs=n_jobs)
+            if pieces:
+                etest_results = _reapply_etest_padj(pd.concat(pieces, axis=0))
+                # Preserve deterministic row order matching `tested`.
+                order = [g for g in tested if g in etest_results.index]
+                etest_results = etest_results.reindex(order)
     except Exception as exc:  # noqa: BLE001
         warnings.warn(f"E-test skipped: {exc}", stacklevel=2)
+    if etest_results is not None:
+        etest_results = annotate_etest_power(
+            etest_results,
+            edistances["n_cells"] if "n_cells" in edistances.columns else counts,
+            power_min_cells=power_min_cells,
+        )
     return edistances, etest_results
 
 
 def cluster_perturbations(adata: AnnData, groupby: str = "gene_target", n_neighbors: int = 5) -> pd.DataFrame:
-    pt = _require_pertpy()
+    pt = require_pertpy()
     if "X_pca" not in adata.obsm:
         sc.pp.pca(adata)
     profiles = pt.tl.PseudobulkSpace().compute(adata, target_col=groupby, embedding_key="X_pca", mode="mean")
@@ -139,9 +456,18 @@ def cluster_perturbations(adata: AnnData, groupby: str = "gene_target", n_neighb
 
 
 __all__ = [
+    "DEFAULT_ETEST_POWER_MIN_CELLS",
+    "DEFAULT_SECONDARY_DISTANCE_METRICS",
+    "annotate_etest_power",
     "cluster_perturbations",
+    "combine_distance_tables",
     "compute_gene_guide_consistency",
+    "estimate_mixscape_cost",
+    "filter_cells_for_mixscape_targets",
+    "merge_mixscape_annotations",
     "run_edistance",
     "run_guide_qc",
     "run_mixscape",
+    "run_secondary_distances",
+    "select_mixscape_targets_from_edistance",
 ]

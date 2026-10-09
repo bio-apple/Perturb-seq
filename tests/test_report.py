@@ -7,10 +7,13 @@ import json
 import pandas as pd
 
 from perturbseq.report import (
+    CORE_STATISTICAL_CAVEATS,
     build_perturbation_summaries,
+    build_summary_table,
     load_result_tables,
     summarize_perturbation,
     write_analysis_report,
+    write_summary_tables,
 )
 
 
@@ -20,6 +23,8 @@ def _write_fake_results(tmp_path):
     tables.mkdir()
     figures.mkdir()
     (figures / "volcano_GENEA.png").write_bytes(b"fake")
+    (figures / "umap.png").write_bytes(b"fake")
+    (figures / "edistance.png").write_bytes(b"fake")
 
     pd.DataFrame(
         {
@@ -60,8 +65,55 @@ def _write_fake_results(tmp_path):
             "majority_direction": ["down", "up"],
             "median_target_log2fc": [-1.0, 0.5],
             "directions": ["g1:down|g2:down|g3:down", "g1:up|g2:none"],
+            "guide_merge": ["umi", "umi"],
+            "weighted_target_log2fc": [-1.1, 0.2],
+            "weighted_direction": ["down", "none"],
+            "weighted_direction_vote": ["down", "up"],
+            "weight_sum": [100.0, 50.0],
+            "n_guides_weighted": [3, 2],
+            "guide_weights": ["g1:40|g2:30|g3:30", "g1:40|g2:10"],
         }
     ).to_csv(tables / "gene_guide_consistency.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "guide_id": ["GENEA|design_1", "GENEA|design_2", "GENEB|design_1"],
+            "gene_target": ["GENEA", "GENEA", "GENEB"],
+            "is_control": [False, False, False],
+            "interpretation": [
+                "target_knockdown_detected",
+                "target_knockdown_detected",
+                "inconsistent_guides",
+            ],
+            "assignment_confidence": ["high", "high", "medium"],
+            "target_effect_direction": ["down", "down", "up"],
+            "n_cells": [20, 18, 15],
+            "target_expr_log2fc_vs_control": [-1.2, -0.9, 0.8],
+        }
+    ).to_csv(tables / "guide_qc.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "level": ["gene", "guide"],
+            "entity": ["GENEB", "GENEB|design_1"],
+            "gene_target": ["GENEB", "GENEB"],
+            "warning": ["inconsistent_guides", "low_guide_umi"],
+            "detail": ["g1:up|g2:none", "median_guide_umi=2.00 < 5.0"],
+        }
+    ).to_csv(tables / "qc_warnings.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "gene_target": ["GENEA", "GENEB"],
+            "guide_merge": ["umi", "umi"],
+            "weighted_target_log2fc": [-1.1, 0.2],
+            "weighted_direction": ["down", "none"],
+            "weighted_direction_vote": ["down", "up"],
+            "weight_sum": [100.0, 50.0],
+            "n_guides_weighted": [3, 2],
+            "guide_weights": ["g1:40|g2:30|g3:30", "g1:40|g2:10"],
+        }
+    ).to_csv(tables / "gene_guide_weighted.csv", index=False)
 
     pd.DataFrame(
         {
@@ -74,9 +126,20 @@ def _write_fake_results(tmp_path):
 
     report = {
         "sample_id": "fake",
-        "config": {"control": "NT", "replicate_col": None, "min_cells_per_pert": 10},
+        "config": {
+            "control": "NT",
+            "replicate_col": None,
+            "min_cells_per_pert": 10,
+            "etest_power_min_cells": 50,
+        },
+        "de": {
+            "skipped": False,
+            "reason": None,
+            "detail": "Single-sample run: exploratory Wilcoxon.",
+        },
+        "mixscape": {"skipped": True, "reason": "user_skip", "detail": "skipped for test"},
+        "edistance": {"skipped": False, "reason": None},
         "de_note": "Single-sample run: exploratory Wilcoxon.",
-        "mixscape_skipped": "skipped for test",
         "gene_target_counts": {"GENEA": 40, "GENEB": 25, "GENEC": 12, "NT": 100},
     }
     (tmp_path / "report.json").write_text(json.dumps(report))
@@ -96,6 +159,9 @@ def test_summarize_perturbation_five_questions(tmp_path):
     assert s["effect_vs_control"]["effect_size"] == 3.0
     assert s["effect_vs_control"]["pvalue_adj"] == 0.02
     assert s["effect_vs_control"]["significant_adj"] is True
+    # n_cells=40 < etest_power_min_cells=50 → low_power suppresses reported significance
+    assert s["effect_vs_control"]["low_power"] is True
+    assert s["effect_vs_control"]["significant_adj_reported"] is False
     assert s["effect_vs_control"]["confidence_interval"] == "N/A"
 
     assert isinstance(s["consistency"]["across_guides"], dict)
@@ -109,6 +175,8 @@ def test_summarize_perturbation_five_questions(tmp_path):
     assert any("Wilcoxon" in w or "exploratory" in w for w in s["warnings"])
     assert any("Pathway" in lim for lim in s["limitations"])
     assert s["figures"]["volcano"] == "figures/volcano_GENEA.png"
+    assert s["figures"]["umap"] == "figures/umap.png"
+    assert s["figures"]["edistance"] == "figures/edistance.png"
 
 
 def test_build_summaries_sorted_and_na_fields(tmp_path):
@@ -138,3 +206,56 @@ def test_write_analysis_report_html_json(tmp_path):
     # CLI-style rebuild should be idempotent
     report2 = write_analysis_report(out)
     assert report2["perturbation_summary"]["n_with_de"] == 1
+
+
+def test_summary_table_csv_and_md(tmp_path):
+    out = _write_fake_results(tmp_path)
+    tables = load_result_tables(out)
+    summaries = build_perturbation_summaries(tables, control="NT")
+    df = build_summary_table(summaries)
+    assert "GENEA" in set(df["perturbation"])
+    assert "edistance" in df.columns
+    assert "top_gene" in df.columns
+    csv_path, md_path = write_summary_tables(out, summaries)
+    assert csv_path.exists() and md_path.exists()
+    loaded = pd.read_csv(csv_path)
+    assert len(loaded) == len(summaries)
+    md = md_path.read_text()
+    assert "GENEA" in md
+    assert "| perturbation |" in md or "perturbation" in md
+
+
+def test_html_contains_caveats_checklist_and_download_links(tmp_path):
+    out = _write_fake_results(tmp_path)
+    write_analysis_report(out, control="NT")
+    html = (out / "report.html").read_text()
+    assert 'id="statistical-caveats"' in html
+    assert "<details" in html and "checklist" in html
+    assert any(c[:40] in html for c in CORE_STATISTICAL_CAVEATS)
+    assert 'href="summary_table.csv"' in html
+    assert 'href="summary_table.md"' in html
+    assert (out / "summary_table.csv").exists()
+    assert (out / "summary_table.md").exists()
+    assert "figures/volcano_GENEA.png" in html
+    assert "figures/umap.png" in html
+    assert "figures/edistance.png" in html
+    assert "QC warnings" in html
+
+
+def test_html_maps_qc_warnings_and_interpretations(tmp_path):
+    out = _write_fake_results(tmp_path)
+    report = write_analysis_report(out, control="NT")
+    geneb = report["perturbations"]["GENEB"]
+    assert geneb["guide_qc"]["status"] == "guides_inconsistent"
+    assert any(w["warning"] == "inconsistent_guides" for w in geneb["guide_qc"]["warnings"])
+    assert any(i["interpretation"] == "inconsistent_guides" for i in geneb["guide_qc"]["interpretations"])
+    assert isinstance(geneb["guide_qc"]["weighted_summary"], dict)
+    assert geneb["guide_qc"]["weighted_summary"]["weighted_direction_vote"] == "up"
+
+    html = (out / "report.html").read_text()
+    assert "inconsistent_guides" in html
+    assert "low_guide_umi" in html
+    assert "Guide interpretations" in html
+    assert "QC warnings" in html
+    assert "Weighted guide summary" in html
+    assert "target_knockdown_detected" in html  # GENEA interpretation on card

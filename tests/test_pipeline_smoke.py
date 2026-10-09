@@ -37,9 +37,18 @@ def test_pipeline_smoke_without_pertpy(tmp_path):
     report = json.loads((out / "report.json").read_text())
     assert "guide_qc" in report
     assert "n_warnings" in report["guide_qc"]
-    assert report.get("mixscape_status") == "skipped_by_config"
+    assert report["mixscape"]["skipped"] is True
+    assert report["mixscape"]["reason"] == "user_skip"
+    assert report["edistance"]["skipped"] is True
+    assert report["edistance"]["reason"] == "user_skip"
+    assert isinstance(report.get("de"), dict) and "skipped" in report["de"]
     assert "matrix_provenance" in report
     assert "X_umap" in report["matrix_provenance"]
+    assert report["matrix_provenance"]["pca_source"] == "log1p_hvg"
+    assert isinstance(report["matrix_provenance"]["n_hvg"], int)
+    assert isinstance(report["matrix_provenance"]["n_pcs"], int)
+    assert report["matrix_provenance"]["n_hvg"] > 0
+    assert report["matrix_provenance"]["n_pcs"] > 0
     manifest = json.loads((out / "run_manifest.json").read_text())
     assert manifest["status"] == "success"
     assert "versions" in manifest

@@ -13,6 +13,11 @@ DEFAULT_MIN_CELLS = 10
 DEFAULT_MIN_MEDIAN_UMI = 5.0
 DEFAULT_MIN_DETECTION_RATE = 0.5
 DEFAULT_LFC_NOISE = 0.25
+# none = flag only (default, conservative); other modes add weighted summaries
+# without discarding per-guide rows or clearing inconsistency flags.
+GUIDE_MERGE_MODES = ("none", "equal", "umi", "confidence", "umi_confidence")
+DEFAULT_GUIDE_MERGE = "none"
+_CONFIDENCE_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
 
 
 def _to_1d(matrix) -> np.ndarray:
@@ -103,7 +108,15 @@ def compute_guide_metrics(
     required = {"guide_id", "gene_target"}
     missing = required - set(obs.columns)
     if missing:
-        raise ValueError(f"Missing obs columns for guide QC: {sorted(missing)}")
+        raise ValueError(
+            f"Guide column mismatch in AnnData.obs: missing {sorted(missing)}. "
+            f"Found: {list(obs.columns)}. "
+            "Expected tertiary h5ad from `python -m perturbseq run` "
+            "(obs must include guide_id, gene_target).\n"
+            "Suggested commands:\n"
+            "  python -m perturbseq run --input-dir <dir> --output-dir <out>\n"
+            "  python -m perturbseq guide-qc --h5ad <sample>.tertiary.h5ad --output-dir <out>"
+        )
 
     baselines = _control_baselines(obs, control)
     ctrl_mask = obs["gene_target"].astype(str).to_numpy() == control
@@ -285,6 +298,127 @@ def compute_gene_guide_consistency(
     return pd.DataFrame(rows)
 
 
+def _confidence_weight(label: object) -> float:
+    return float(_CONFIDENCE_WEIGHT.get(str(label).lower(), 1.0))
+
+
+def _guide_weights(sub: pd.DataFrame, mode: str) -> np.ndarray:
+    n = len(sub)
+    if mode == "equal":
+        return np.ones(n, dtype=float)
+    umi = (
+        sub["median_guide_umi"].astype(float).to_numpy()
+        if "median_guide_umi" in sub.columns
+        else np.ones(n, dtype=float)
+    )
+    umi = np.where(np.isfinite(umi) & (umi > 0), umi, 0.0)
+    conf = (
+        sub["assignment_confidence"].map(_confidence_weight).to_numpy(dtype=float)
+        if "assignment_confidence" in sub.columns
+        else np.ones(n, dtype=float)
+    )
+    if mode == "umi":
+        return umi
+    if mode == "confidence":
+        return conf
+    if mode == "umi_confidence":
+        return umi * conf
+    raise ValueError(f"Unknown guide_merge mode for weights: {mode}")
+
+
+def compute_weighted_guide_summary(
+    guide_df: pd.DataFrame,
+    guide_merge: str = DEFAULT_GUIDE_MERGE,
+    lfc_noise: float = DEFAULT_LFC_NOISE,
+) -> pd.DataFrame:
+    """Per-gene weighted effect summary (does not merge cells or drop guide rows).
+
+    ``guide_merge=none`` returns an empty frame (conservative default: flag only).
+    Other modes compute weighted mean target log2FC and a weight-voted direction.
+    """
+    mode = str(guide_merge or DEFAULT_GUIDE_MERGE).lower()
+    if mode not in GUIDE_MERGE_MODES:
+        raise ValueError(f"guide_merge must be one of {GUIDE_MERGE_MODES}, got {guide_merge!r}")
+    if mode == "none" or guide_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "gene_target",
+                "guide_merge",
+                "weighted_target_log2fc",
+                "weighted_direction",
+                "weighted_direction_vote",
+                "weight_sum",
+                "n_guides_weighted",
+                "guide_weights",
+            ]
+        )
+
+    rows: list[dict] = []
+    working = guide_df.loc[~guide_df["is_control"]].copy()
+    for gene, sub in working.groupby("gene_target", sort=True):
+        weights = _guide_weights(sub, mode)
+        lfcs = sub["target_expr_log2fc_vs_control"].astype(float).to_numpy()
+        finite = np.isfinite(lfcs) & (weights > 0)
+        if finite.any():
+            w = weights[finite]
+            wsum = float(w.sum())
+            wlfc = float(np.dot(lfcs[finite], w) / wsum) if wsum > 0 else float("nan")
+        else:
+            wsum = float(weights.sum())
+            wlfc = float("nan")
+        wdir = _effect_direction(wlfc, lfc_noise)
+
+        # Weight-voted direction among scored guides
+        vote: dict[str, float] = {}
+        for d, w in zip(sub["target_effect_direction"].tolist(), weights, strict=False):
+            if d in {"up", "down", "none"} and w > 0:
+                vote[d] = vote.get(d, 0.0) + float(w)
+        voted = max(vote, key=vote.get) if vote else "unknown"
+
+        weight_labels = [
+            f"{g}:{w:.4g}" for g, w in zip(sub["guide_id"].astype(str), weights, strict=False)
+        ]
+        rows.append(
+            {
+                "gene_target": gene,
+                "guide_merge": mode,
+                "weighted_target_log2fc": wlfc,
+                "weighted_direction": wdir,
+                "weighted_direction_vote": voted,
+                "weight_sum": wsum if finite.any() else float(weights.sum()),
+                "n_guides_weighted": int((weights > 0).sum()),
+                "guide_weights": "|".join(weight_labels),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def attach_weighted_summary(
+    consistency_df: pd.DataFrame,
+    weighted_df: pd.DataFrame,
+    guide_merge: str = DEFAULT_GUIDE_MERGE,
+) -> pd.DataFrame:
+    """Join weighted columns onto gene_guide_consistency; keep inconsistency flags."""
+    mode = str(guide_merge or DEFAULT_GUIDE_MERGE).lower()
+    if consistency_df.empty:
+        return weighted_df.copy() if not weighted_df.empty else consistency_df.copy()
+    out = consistency_df.copy()
+    out["guide_merge"] = mode
+    if weighted_df.empty or mode == "none":
+        return out
+    cols = [
+        "weighted_target_log2fc",
+        "weighted_direction",
+        "weighted_direction_vote",
+        "weight_sum",
+        "n_guides_weighted",
+        "guide_weights",
+    ]
+    merge_cols = ["gene_target"] + [c for c in cols if c in weighted_df.columns]
+    out = out.drop(columns=[c for c in cols if c in out.columns], errors="ignore")
+    return out.merge(weighted_df[merge_cols], on="gene_target", how="left")
+
+
 def build_qc_warnings(
     guide_df: pd.DataFrame,
     consistency_df: pd.DataFrame,
@@ -432,6 +566,8 @@ def summarize_guide_qc(
     guide_df: pd.DataFrame,
     consistency_df: pd.DataFrame,
     warnings_df: pd.DataFrame,
+    *,
+    guide_merge: str = DEFAULT_GUIDE_MERGE,
 ) -> dict:
     warning_counts = (
         warnings_df["warning"].value_counts().to_dict() if not warnings_df.empty else {}
@@ -453,6 +589,7 @@ def summarize_guide_qc(
             if not guide_df.empty
             else {}
         ),
+        "guide_merge": str(guide_merge or DEFAULT_GUIDE_MERGE).lower(),
     }
 
 
@@ -464,7 +601,11 @@ def run_guide_qc(
     min_median_umi: float = DEFAULT_MIN_MEDIAN_UMI,
     min_detection_rate: float = DEFAULT_MIN_DETECTION_RATE,
     lfc_noise: float = DEFAULT_LFC_NOISE,
+    guide_merge: str = DEFAULT_GUIDE_MERGE,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    mode = str(guide_merge or DEFAULT_GUIDE_MERGE).lower()
+    if mode not in GUIDE_MERGE_MODES:
+        raise ValueError(f"guide_merge must be one of {GUIDE_MERGE_MODES}, got {guide_merge!r}")
     guide_df = compute_guide_metrics(
         adata,
         control=control,
@@ -475,9 +616,15 @@ def run_guide_qc(
         lfc_noise=lfc_noise,
     )
     consistency_df = compute_gene_guide_consistency(guide_df, lfc_noise=lfc_noise)
+    weighted_df = compute_weighted_guide_summary(guide_df, guide_merge=mode, lfc_noise=lfc_noise)
+    consistency_df = attach_weighted_summary(consistency_df, weighted_df, guide_merge=mode)
     guide_df = _apply_interpretations(guide_df, consistency_df)
     warnings_df = build_qc_warnings(guide_df, consistency_df)
-    summary = summarize_guide_qc(guide_df, consistency_df, warnings_df)
+    summary = summarize_guide_qc(guide_df, consistency_df, warnings_df, guide_merge=mode)
+    summary["weighted"] = {
+        "enabled": mode != "none",
+        "n_genes": int(len(weighted_df)),
+    }
     return guide_df, consistency_df, warnings_df, summary
 
 
@@ -486,6 +633,8 @@ def write_guide_qc_tables(
     consistency_df: pd.DataFrame,
     warnings_df: pd.DataFrame,
     tables: Path,
+    *,
+    weighted_df: pd.DataFrame | None = None,
 ) -> None:
     tables.mkdir(parents=True, exist_ok=True)
     guide_df.to_csv(tables / "guide_qc.csv", index=False)
@@ -493,3 +642,27 @@ def write_guide_qc_tables(
     if warnings_df.empty and len(warnings_df.columns) == 0:
         warnings_df = pd.DataFrame(columns=["level", "entity", "gene_target", "warning", "detail"])
     warnings_df.to_csv(tables / "qc_warnings.csv", index=False)
+    # Companion weighted table when merge mode produced rows (mode != none).
+    if weighted_df is not None and not weighted_df.empty:
+        weighted_df.to_csv(tables / "gene_guide_weighted.csv", index=False)
+    elif (
+        not consistency_df.empty
+        and "guide_merge" in consistency_df.columns
+        and consistency_df["guide_merge"].astype(str).ne("none").any()
+        and "weighted_target_log2fc" in consistency_df.columns
+    ):
+        cols = [
+            c
+            for c in (
+                "gene_target",
+                "guide_merge",
+                "weighted_target_log2fc",
+                "weighted_direction",
+                "weighted_direction_vote",
+                "weight_sum",
+                "n_guides_weighted",
+                "guide_weights",
+            )
+            if c in consistency_df.columns
+        ]
+        consistency_df[cols].to_csv(tables / "gene_guide_weighted.csv", index=False)

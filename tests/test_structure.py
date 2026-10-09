@@ -27,6 +27,7 @@ def test_target_modules_importable():
     import perturbseq.guide_qc as guide_qc
     import perturbseq.guides as guides
     import perturbseq.io as io
+    import perturbseq.parallel as parallel
     import perturbseq.perturbation as perturbation
     import perturbseq.preprocessing as preprocessing
     import perturbseq.qc as qc
@@ -46,6 +47,9 @@ def test_target_modules_importable():
     assert hasattr(report, "finalize_outputs")
     assert hasattr(robustness, "integrate_evidence")
     assert hasattr(statistics, "check_experimental_design")
+    assert hasattr(statistics, "run_de_contrasts")
+    assert hasattr(parallel, "parallel_map")
+    assert hasattr(parallel, "resolve_n_jobs")
     assert parse_gene_target("NTC_01") == "NT"
     assert DEFAULT_CONTROL_PATTERNS
 

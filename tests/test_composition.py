@@ -2,7 +2,11 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from perturbseq.composition import append_composition_audit, composition_snapshot, write_composition_audit
+from perturbseq.composition import (
+    append_composition_audit,
+    composition_snapshot,
+    write_composition_audit,
+)
 
 
 def _toy_adata(n: int = 20) -> ad.AnnData:

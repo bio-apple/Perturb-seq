@@ -4,12 +4,14 @@ from anndata import AnnData
 from scipy import sparse
 
 from perturbseq.guide_qc import (
+    _effect_direction,
+    _interpretation,
     build_qc_warnings,
     compute_gene_guide_consistency,
     compute_guide_metrics,
+    compute_weighted_guide_summary,
     run_guide_qc,
-    _effect_direction,
-    _interpretation,
+    write_guide_qc_tables,
 )
 
 
@@ -162,3 +164,58 @@ def test_detection_rate_across_samples():
 def test_build_qc_warnings_empty_inputs():
     warn = build_qc_warnings(pd.DataFrame(), pd.DataFrame())
     assert list(warn.columns) == ["level", "entity", "warning", "detail"]
+
+
+def test_weighted_merge_umi_math():
+    """UMI-weighted mean LFC; inconsistency flags retained under merge modes."""
+    adata = _make_adata()
+    guide_df, consistency_df, _warnings, summary = run_guide_qc(
+        adata, control="NT", min_cells=10, min_median_umi=5, guide_merge="umi"
+    )
+    assert summary["guide_merge"] == "umi"
+    assert summary["weighted"]["enabled"] is True
+    geneb = consistency_df.loc[consistency_df["gene_target"] == "GENEB"].iloc[0]
+    # GENEB remains inconsistent even with weighted summary
+    assert bool(geneb["guides_consistent"]) is False
+    assert geneb["guide_merge"] == "umi"
+    assert np.isfinite(geneb["weighted_target_log2fc"])
+
+    # Manual UMI-weighted mean for GENEB guides
+    sub = guide_df.loc[guide_df["gene_target"] == "GENEB"]
+    umi = sub["median_guide_umi"].astype(float).to_numpy()
+    lfc = sub["target_expr_log2fc_vs_control"].astype(float).to_numpy()
+    expected = float(np.dot(lfc, umi) / umi.sum())
+    assert abs(float(geneb["weighted_target_log2fc"]) - expected) < 1e-6
+    # High-UMI guide (design_1, down) should dominate direction vote
+    assert geneb["weighted_direction_vote"] == "down"
+
+    none_df = compute_weighted_guide_summary(guide_df, guide_merge="none")
+    assert none_df.empty
+
+
+def test_weighted_merge_equal_and_confidence(tmp_path):
+    adata = _make_adata()
+    guide_df = compute_guide_metrics(adata, control="NT", min_cells=10, min_median_umi=5)
+    eq = compute_weighted_guide_summary(guide_df, guide_merge="equal")
+    genea = eq.loc[eq["gene_target"] == "GENEA"].iloc[0]
+    lfcs = guide_df.loc[guide_df["gene_target"] == "GENEA", "target_expr_log2fc_vs_control"].astype(float)
+    assert abs(float(genea["weighted_target_log2fc"]) - float(lfcs.mean())) < 1e-6
+
+    conf = compute_weighted_guide_summary(guide_df, guide_merge="confidence")
+    assert not conf.empty
+    umi_conf = compute_weighted_guide_summary(guide_df, guide_merge="umi_confidence")
+    assert "guide_weights" in umi_conf.columns
+
+    guide_df2, cons, warns, _ = run_guide_qc(
+        adata, control="NT", min_cells=10, guide_merge="umi_confidence"
+    )
+    write_guide_qc_tables(guide_df2, cons, warns, tmp_path)
+    assert (tmp_path / "gene_guide_weighted.csv").exists()
+    assert (tmp_path / "gene_guide_consistency.csv").exists()
+    # Default none does not write companion weighted table
+    guide_df3, cons3, warns3, _ = run_guide_qc(adata, control="NT", guide_merge="none")
+    out2 = tmp_path / "none"
+    write_guide_qc_tables(guide_df3, cons3, warns3, out2)
+    assert not (out2 / "gene_guide_weighted.csv").exists()
+    assert (out2 / "gene_guide_consistency.csv").exists()
+    assert "guide_merge" in pd.read_csv(out2 / "gene_guide_consistency.csv").columns

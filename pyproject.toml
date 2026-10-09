@@ -8,25 +8,47 @@ version = "0.1.0"
 description = "Tertiary Perturb-seq analysis from DRAGEN scRNA CRISPR outputs, using pertpy."
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["perturb-seq", "scanpy", "pertpy", "single-cell", "CRISPR"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Intended Audience :: Science/Research",
+]
+# Core-only (no pertpy). Default / recommended install is .[de] — see README.
 dependencies = [
-  "anndata>=0.10",
-  "leidenalg>=0.10",
-  "matplotlib>=3.8",
-  "numpy>=1.26",
-  "pandas>=2.1",
-  "python-igraph>=0.11",
-  "pyyaml>=6.0",
-  "scanpy>=1.10",
-  "scipy>=1.11",
-  "seaborn>=0.13",
+  "anndata>=0.10,<0.12",
+  "joblib>=1.3,<2",
+  "leidenalg>=0.10,<0.12",
+  "matplotlib>=3.8,<4",
+  "numpy>=1.26,<3",
+  "pandas>=2.1,<3",
+  "python-igraph>=0.11,<0.12",
+  "pyyaml>=6.0,<7",
+  "scanpy>=1.10,<2",
+  "scipy>=1.11,<2",
+  "seaborn>=0.13,<0.15",
 ]
 
 [project.optional-dependencies]
-pertpy = ["pertpy>=1.3"]
-de = ["pertpy[de]>=1.3"]
-dev = ["pytest>=8"]
+# Mixscape / E-distance (pertpy). PyDESeq2 via pertpy[de] — preferred default path.
+pertpy = ["pertpy>=1.3,<2"]
+de = ["pertpy[de]>=1.3,<2"]
+# Full analysis stack recommended for production runs.
+all = ["pertpy[de]>=1.3,<2", "statsmodels>=0.14,<0.15"]
+dev = [
+  "pytest>=8,<9",
+  "mypy>=1.8,<2",
+  "ruff>=0.9,<0.12",
+  "pre-commit>=3.6,<5",
+  "pyright>=1.1,<2",
+  "pandas-stubs>=2.1,<3",
+  "types-PyYAML>=6.0,<7",
+]
+typing = ["mypy>=1.8,<2", "pyright>=1.1,<2", "pandas-stubs>=2.1,<3", "types-PyYAML>=6.0,<7"]
 
 [project.scripts]
+perturbseq = "perturbseq.cli:main"
 perturbseq-tertiary = "perturbseq.cli:main"
 
 [tool.setuptools.packages.find]
@@ -35,3 +57,80 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "pertpy: tests that require optional pertpy (skipped when not installed)",
+  "slow: slower integration tests (not used in default CI)",
+]
+
+# --- lint / format (ruff) ---
+# CI runs `ruff check` only. Format is opt-in via pre-commit to avoid mass rewrites.
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["results", ".cache"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "SIM", # flake8-simplify
+]
+ignore = [
+  "E501",  # line length — defer to formatter / readability
+  "SIM105",  # try/except/pass is fine for optional JSON reload
+  "SIM108",  # if/else often clearer than forced ternaries
+  "SIM117",  # nested with is often clearer in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# Pragmatic typing: core public APIs only; AnnData/scanpy stay loosely typed.
+[tool.mypy]
+python_version = "3.10"
+packages = ["perturbseq"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_return_any = false
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+pretty = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+  "perturbseq.plots",
+  "perturbseq.demo",
+  "perturbseq.report",
+  "perturbseq.cli",
+]
+ignore_errors = true
+
+[tool.pyright]
+include = ["src/perturbseq"]
+exclude = ["**/__pycache__", "results", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
+reportMissingTypeStubs = false
+# AnnData / scanpy stubs are incomplete; keep core API annotations for humans + mypy.
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportOperatorIssue = false
+reportAttributeAccessIssue = "warning"
+reportArgumentType = "warning"

@@ -16,9 +16,15 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `singlet_only` | `--keep-multiplets` | YAML `true`/`false`. CLI flag **sets `singlet_only: false`** when present (no “force singlet” flag) |
 | `n_mads` | `--n-mads` | float; MAD QC threshold |
 | `n_perms` | `--n-perms` | int; E-test permutations |
+| `min_cells_per_pert` | `--min-cells-per-pert` | int; min cells per perturbation for distance / DE grouping |
+| `etest_power_min_cells` | `--etest-power-min-cells` | int; default 50; below → `low_power` / suppress `significant_adj_reported` |
+| `secondary_distance_metrics` | `--secondary-distance-metrics` | YAML list or CLI comma-separated (e.g. `mmd,wasserstein`); graceful skip if deps missing |
 | `skip_mixscape` | `--skip-mixscape` | bool / `store_true` |
 | `force_mixscape` | `--force-mixscape` | bool / `store_true`; run Mixscape even if target count &gt; `mixscape_max_targets` |
-| `mixscape_max_targets` | `--mixscape-max-targets` | int; skip Mixscape above this unless forced |
+| `mixscape_max_targets` | `--mixscape-max-targets` | int; auto-skip Mixscape above this unless forced / subset |
+| `mixscape_mode` | `--mixscape-mode` | `auto` \| `skip` \| `force` \| `subset` |
+| `mixscape_targets` | `--mixscape-targets` | YAML list or CLI comma-separated genes; implies subset |
+| `mixscape_top_n` | `--mixscape-top-n` | int; top-N by pre-Mixscape E-distance; implies subset |
 | `de_top_n` | `--de-top-n` | int |
 | `n_jobs` | `--n-jobs` | int; `1` = sequential, `-1` = all CPUs (DE / E-test outer loops) |
 | `skip_cell_annotation` | `--skip-cell-annotation` | bool / `store_true` |
@@ -31,7 +37,6 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `n_top_genes` | *(YAML only)* | int; HVG count |
 | `n_pcs` | *(YAML only)* | int |
 | `leiden_resolution` | *(YAML only)* | float |
-| `min_cells_per_pert` | *(YAML only)* | int; min cells per perturbation for distance / DE grouping |
 
 Unknown YAML keys are stored on `PipelineConfig.extra` (not validated as pipeline fields).
 
@@ -41,6 +46,17 @@ Unknown YAML keys are stored on `PipelineConfig.extra` (not validated as pipelin
 | --- | --- |
 | `--config` | Path to YAML; default search `configs/default.yaml` |
 | `--resume` | Skip stages that already succeeded with unchanged inputs/params |
+| `--dry-run` | Validate DRAGEN inputs; print planned stages + resolved params; **no analysis** |
+
+## `config` — generate a commented template
+
+Writes a fully commented YAML covering `configs/default.yaml` values plus all `PipelineConfig` fields:
+
+```bash
+python -m perturbseq config --generate
+python -m perturbseq config generate -o my_pipeline.yaml
+# equivalent: perturbseq config --generate -o configs/pipeline.template.yaml
+```
 
 ## Other subcommands (no YAML merge)
 
@@ -101,4 +117,14 @@ python -m perturbseq run \
   --skip-mixscape \
   --n-jobs 4 \
   --control-patterns '^nt$,^negctrl'
+```
+
+Dry-run (validate + plan only):
+
+```bash
+python -m perturbseq run \
+  --input-dir data/demo \
+  --output-dir results/demo \
+  --skip-mixscape \
+  --dry-run
 ```

@@ -19,6 +19,71 @@ CONTROL_DEFAULT = "NT"
 SKIP_TARGETS = frozenset({"unassigned", ""})
 NA = "N/A"
 
+# Machine-safe analysis status blocks in report.json (always present for optional stages).
+ANALYSIS_STATUS_KEYS = ("mixscape", "edistance", "de", "cell_annotation", "perturbation_clusters")
+
+# Core checklist mirrored from docs/STATISTICAL_CAVEATS.md (kept in-package for report HTML).
+CORE_STATISTICAL_CAVEATS: tuple[str, ...] = (
+    "Cells are not biological replicates — cell-level tests inflate significance; prefer pseudobulk when replicates exist.",
+    "Mixscape NP ≠ proven biological null — NP is transcriptomic resemblance to controls, not proof the guide failed.",
+    "E-distance / E-test quantify multivariate shift, not mechanism; embedding choice changes ranks.",
+    "Wilcoxon without replicates is exploratory only — not for FDR-style population claims.",
+    "UMAP / Leiden describe dataset structure, not perturbation-effect evidence.",
+    "Filtering (QC / singlet / Mixscape KO) changes composition — check composition_audit.csv.",
+    "Guide inconsistency: do not pool discordant same-gene guides into one KO conclusion without review.",
+    "Guide assignment is inherited from DRAGEN — this pipeline does not re-call guides by default.",
+)
+
+
+def skipped_status(reason: str, detail: str | None = None, **extra: Any) -> dict[str, Any]:
+    """Explicit skip/degrade payload for report.json (never bare null / missing key)."""
+    payload: dict[str, Any] = {"skipped": True, "reason": reason}
+    if detail is not None:
+        payload["detail"] = detail
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def completed_status(**extra: Any) -> dict[str, Any]:
+    """Success payload: skipped=false + optional rich fields."""
+    return {"skipped": False, "reason": None, **extra}
+
+
+def status_note(block: Any) -> str | None:
+    """Human-readable one-liner from an analysis status object."""
+    if not isinstance(block, dict):
+        return None
+    detail = block.get("detail")
+    reason = block.get("reason")
+    if block.get("skipped"):
+        if detail and reason:
+            note = f"{reason}: {detail}"
+        else:
+            note = str(detail or reason or "skipped")
+        est = block.get("estimate")
+        if isinstance(est, dict) and est.get("note"):
+            note = f"{note} | estimate: {est['note']}"
+        return note
+    return str(detail) if detail else None
+
+
+def mixscape_kd_caveat(perturbation_type: str | None) -> str | None:
+    """Caveat when Mixscape labels are used for knockdown / CRISPRi/a (weaker than KO)."""
+    if perturbation_type is None:
+        return None
+    token = str(perturbation_type).strip().upper()
+    if token in {"KO", "KNOCKOUT"}:
+        return None
+    if token in {"KD", "CRISPRI", "CRISPRA"} or "KD" in token or "CRISPRI" in token or "CRISPRA" in token:
+        return (
+            "Mixscape assumptions are weaker for knockdown / CRISPRi/a than for CRISPR KO: "
+            "partial repression yields graded (not binary) transcriptomic shifts, so NP vs "
+            f"perturbed ({perturbation_type}) labels are less decisive. Prefer E-distance / "
+            "target-gene knockdown and multi-guide consistency; see docs/STATISTICAL_CAVEATS.md."
+        )
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Provenance / pipeline helpers (shared with resume / finalize paths)
@@ -79,6 +144,8 @@ def write_provenance_manifest(
             "h5ad": report.get("output_h5ad"),
             "report_json": str(output_dir / "report.json"),
             "report_html": str(output_dir / "report.html"),
+            "summary_table_csv": str(output_dir / "summary_table.csv"),
+            "summary_table_md": str(output_dir / "summary_table.md"),
         },
     }
     path.write_text(json.dumps(payload, indent=2, default=str))
@@ -158,9 +225,13 @@ def load_result_tables(output_dir: Path) -> dict[str, Any]:
         edistance = edistance.rename(columns={edistance.columns[0]: "gene_target"})
 
     etest = _read_csv(tables / "etest.csv", index_col=0)
+    distances = _read_csv(tables / "distances.csv")
+    if distances is not None and "gene_target" not in distances.columns and distances.shape[1] >= 1:
+        distances = distances.rename(columns={distances.columns[0]: "gene_target"})
     guide_qc = _read_csv(tables / "guide_qc.csv")
     guide_consistency = _read_csv(tables / "gene_guide_consistency.csv")
     qc_warnings = _read_csv(tables / "qc_warnings.csv")
+    guide_weighted = _read_csv(tables / "gene_guide_weighted.csv")
     pert_clusters = _read_csv(tables / "perturbation_clusters.csv")
     cell_ann = _read_csv(tables / "cell_annotations.csv")
     composition = _read_csv(tables / "composition_by_perturbation.csv")
@@ -186,9 +257,11 @@ def load_result_tables(output_dir: Path) -> dict[str, Any]:
         "report": report,
         "edistance": edistance,
         "etest": etest,
+        "distances": distances,
         "guide_qc": guide_qc,
         "guide_consistency": guide_consistency,
         "qc_warnings": qc_warnings,
+        "guide_weighted": guide_weighted,
         "pert_clusters": pert_clusters,
         "cell_annotations": cell_ann,
         "composition": composition,
@@ -357,7 +430,9 @@ def summarize_perturbation(
 
     gq = tables.get("guide_qc")
     if n_guides is None and gq is not None and "gene_target" in gq.columns:
-        n_guides = int((gq["gene_target"].astype(str) == pert).sum())
+        n_from_gq = int((gq["gene_target"].astype(str) == pert).sum())
+        if n_from_gq > 0:
+            n_guides = n_from_gq
 
     if replicate_col is None:
         n_replicates_display: Any = 1
@@ -373,6 +448,18 @@ def summarize_perturbation(
 
     et_row = _index_lookup(tables.get("etest"), pert)
     edistance = _safe_float(ed_row["edistance"]) if ed_row is not None and "edistance" in ed_row.index else None
+    low_power = None
+    if et_row is not None and "low_power" in et_row.index:
+        low_power = bool(et_row["low_power"])
+    elif ed_row is not None and "n_cells" in ed_row.index:
+        power_min = int(
+            (report.get("config") or {}).get("etest_power_min_cells")
+            or (report.get("edistance") or {}).get("etest_power_min_cells")
+            or 50
+        )
+        n_for_power = _safe_int(ed_row["n_cells"])
+        if n_for_power is not None:
+            low_power = n_for_power < power_min
     effect: dict[str, Any] = {
         "metric": "edistance" if edistance is not None else NA,
         "effect_size": _na(edistance),
@@ -380,8 +467,20 @@ def summarize_perturbation(
         "pvalue": NA,
         "pvalue_adj": NA,
         "significant_adj": NA,
+        "significant_adj_reported": NA,
+        "low_power": _na(low_power) if low_power is not None else NA,
         "note": None,
     }
+    dist_row = _row_lookup(tables.get("distances"), "gene_target", pert)
+    secondary_metrics: dict[str, Any] = {}
+    if dist_row is not None:
+        for col in dist_row.index:
+            if col in {"gene_target", "edistance", "n_cells", "embedding", "pca_source", "metric", "index"}:
+                continue
+            val = _safe_float(dist_row[col])
+            if val is not None:
+                secondary_metrics[str(col)] = val
+    effect["secondary_metrics"] = secondary_metrics if secondary_metrics else NA
     if et_row is not None:
         effect["pvalue"] = _na(_safe_float(et_row.get("pvalue")))
         effect["pvalue_adj"] = _na(_safe_float(et_row.get("pvalue_adj")))
@@ -389,9 +488,20 @@ def summarize_perturbation(
             effect["significant_adj"] = bool(et_row["significant_adj"])
         elif isinstance(effect["pvalue_adj"], float):
             effect["significant_adj"] = effect["pvalue_adj"] < 0.05
+        if "significant_adj_reported" in et_row.index:
+            effect["significant_adj_reported"] = bool(et_row["significant_adj_reported"])
+        elif isinstance(effect["significant_adj"], bool):
+            effect["significant_adj_reported"] = bool(effect["significant_adj"]) and not bool(
+                low_power
+            )
+        if "low_power" in et_row.index:
+            effect["low_power"] = bool(et_row["low_power"])
         if edistance is None and "distance" in et_row.index:
             effect["effect_size"] = _na(_safe_float(et_row["distance"]))
             effect["metric"] = "edistance"
+        if low_power:
+            note = "low_power: E-test significance not reported (n_cells below etest_power_min_cells)"
+            effect["note"] = f"{effect['note']}; {note}" if effect.get("note") else note
     elif edistance is not None:
         effect["note"] = "E-distance available; E-test not run or not tested for this target"
 
@@ -432,13 +542,16 @@ def summarize_perturbation(
         "across_cell_states": composition if composition.get("source") != NA else NA,
     }
     if gc_row is not None:
-        consistency["across_guides"] = {
+        across_guides: dict[str, Any] = {
             "n_guides": n_guides,
             "guides_consistent": None if pd.isna(gc_row.get("guides_consistent")) else bool(gc_row["guides_consistent"]),
             "majority_direction": gc_row.get("majority_direction", NA),
             "median_target_log2fc": _safe_float(gc_row.get("median_target_log2fc")),
             "directions": gc_row.get("directions", NA),
         }
+        if "guide_merge" in gc_row.index and pd.notna(gc_row.get("guide_merge")):
+            across_guides["guide_merge"] = str(gc_row["guide_merge"])
+        consistency["across_guides"] = across_guides
     else:
         consistency["across_guides"] = "N/A — gene_guide_consistency.csv not present"
 
@@ -451,12 +564,82 @@ def summarize_perturbation(
             "note": "Cross-replicate consistency metric not computed; see DESeq2 if available",
         }
 
+    # Per-guide interpretations + structured QC warnings for HTML cards / report.json
+    guide_interpretations: list[dict[str, Any]] = []
+    if gq is not None and not gq.empty and "gene_target" in gq.columns:
+        gq_pert = gq[gq["gene_target"].astype(str) == pert]
+        for _, grow in gq_pert.iterrows():
+            if grow.get("is_control"):
+                continue
+            entry: dict[str, Any] = {
+                "guide_id": str(grow.get("guide_id", "")),
+                "interpretation": str(grow.get("interpretation", NA)),
+                "assignment_confidence": str(grow.get("assignment_confidence", NA)),
+                "target_effect_direction": str(grow.get("target_effect_direction", NA)),
+                "n_cells": _safe_int(grow.get("n_cells")),
+            }
+            if "target_expr_log2fc_vs_control" in grow.index:
+                entry["target_log2fc"] = _safe_float(grow.get("target_expr_log2fc_vs_control"))
+            guide_interpretations.append(entry)
+
+    interp_by_guide = {str(i["guide_id"]): i["interpretation"] for i in guide_interpretations}
+    gene_level_interp = None
+    if guide_interpretations:
+        # Prefer a non-technical knockdown/up call if present; else first guide.
+        for pref in ("target_knockdown_detected", "target_upregulated", "inconsistent_guides"):
+            hit = next((i for i in guide_interpretations if i["interpretation"] == pref), None)
+            if hit:
+                gene_level_interp = hit["interpretation"]
+                break
+        if gene_level_interp is None:
+            gene_level_interp = guide_interpretations[0]["interpretation"]
+
+    qc_warning_rows: list[dict[str, Any]] = []
+    qw = tables.get("qc_warnings")
+    if qw is not None and not qw.empty and "gene_target" in qw.columns:
+        pert_warns = qw[qw["gene_target"].astype(str) == pert]
+        for _, wrow in pert_warns.iterrows():
+            entity = str(wrow.get("entity", ""))
+            level = str(wrow.get("level", ""))
+            linked = interp_by_guide.get(entity) if level == "guide" else gene_level_interp
+            qc_warning_rows.append(
+                {
+                    "level": level,
+                    "entity": entity,
+                    "warning": str(wrow.get("warning", "qc")),
+                    "detail": str(wrow.get("detail", "")),
+                    "interpretation": linked or NA,
+                }
+            )
+
+    weighted_summary: Any = NA
+    w_src = tables.get("guide_weighted")
+    w_row = _row_lookup(w_src, "gene_target", pert) if w_src is not None else None
+    if w_row is None and gc_row is not None and "weighted_target_log2fc" in gc_row.index:
+        w_row = gc_row
+    if w_row is not None and "weighted_target_log2fc" in w_row.index and pd.notna(w_row.get("weighted_target_log2fc")):
+        weighted_summary = {
+            "guide_merge": str(w_row.get("guide_merge", gc_row.get("guide_merge") if gc_row is not None else NA)),
+            "weighted_target_log2fc": _safe_float(w_row.get("weighted_target_log2fc")),
+            "weighted_direction": str(w_row.get("weighted_direction", NA)),
+            "weighted_direction_vote": str(w_row.get("weighted_direction_vote", NA)),
+            "weight_sum": _safe_float(w_row.get("weight_sum")),
+            "n_guides_weighted": _safe_int(w_row.get("n_guides_weighted")),
+            "guide_weights": w_row.get("guide_weights", NA),
+            "note": "Weighted summary is descriptive; inconsistency flags are retained",
+        }
+
     limitations: list[str] = []
     warnings: list[str] = []
-    if report.get("mixscape_skipped"):
-        limitations.append(str(report["mixscape_skipped"]))
-    if report.get("de_note"):
-        limitations.append(str(report["de_note"]))
+    mix_note = status_note(report.get("mixscape")) or (
+        str(report["mixscape_skipped"]) if report.get("mixscape_skipped") else None
+    )
+    if mix_note:
+        limitations.append(mix_note)
+    de_block = report.get("de") if isinstance(report.get("de"), dict) else {}
+    de_note = de_block.get("detail") or de_block.get("note") or report.get("de_note")
+    if de_note:
+        limitations.append(str(de_note))
     if replicate_col is None:
         limitations.append("Single-sample: no replicate-level confidence intervals from DESeq2")
     if de is None:
@@ -469,22 +652,30 @@ def summarize_perturbation(
         warnings.append("No E-distance or DE evidence — human review recommended before claiming an effect")
     if et_row is not None and effect.get("significant_adj") is False and edistance is not None and edistance > 0:
         warnings.append("E-distance ranked but not significant after multiple-testing adjustment")
+    if low_power:
+        warnings.append(
+            "low_power: cell count below etest_power_min_cells — do not treat E-test significance as conclusive"
+        )
+    if (
+        et_row is not None
+        and effect.get("significant_adj") is True
+        and effect.get("significant_adj_reported") is False
+    ):
+        warnings.append("Raw significant_adj=True but significant_adj_reported=False due to low_power")
     if guide_status == "guides_inconsistent":
         warnings.append("Guide effects inconsistent across guides targeting this gene — review gene_guide_consistency.csv")
-    qw = tables.get("qc_warnings")
-    if qw is not None and not qw.empty and "gene_target" in qw.columns:
-        pert_warns = qw[qw["gene_target"].astype(str) == pert]
-        for _, wrow in pert_warns.head(5).iterrows():
-            warnings.append(f"{wrow.get('warning', 'qc')}: {wrow.get('detail', wrow.get('entity', ''))}")
+    for wrow in qc_warning_rows[:8]:
+        warnings.append(f"{wrow['warning']}: {wrow['detail']}")
     limitations.append("Pathway enrichment not run (gene lists from DE tables only)")
 
-    figures = tables.get("figures_dir")
-    volcano_rel = None
-    if figures is not None:
-        for candidate in (figures / f"volcano_{pert}.png", figures / f"volcano_{pert.replace(' ', '_')}.png"):
-            if candidate.exists():
-                volcano_rel = f"figures/{candidate.name}"
-                break
+    guide_qc_block: dict[str, Any] = {
+        "status": qc_status,
+        "warnings": qc_warning_rows[:8] if qc_warning_rows else [],
+        "interpretations": guide_interpretations,
+        "weighted_summary": weighted_summary,
+    }
+
+    figures = _resolve_pert_figures(tables.get("figures_dir"), pert)
 
     cluster = None
     pc = tables.get("pert_clusters")
@@ -501,6 +692,7 @@ def summarize_perturbation(
             "n_replicates": n_replicates_display,
             "qc_status": qc_status,
         },
+        "guide_qc": guide_qc_block,
         "effect_vs_control": {
             **effect,
             "control": control,
@@ -516,8 +708,104 @@ def summarize_perturbation(
         },
         "limitations": limitations,
         "warnings": warnings,
-        "figures": {"volcano": volcano_rel},
+        "figures": figures,
     }
+
+
+def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str | None]:
+    """Relative paths under output_dir for card thumbnails (None if missing)."""
+    out: dict[str, str | None] = {"volcano": None, "umap": None, "edistance": None}
+    if figures_dir is None or not Path(figures_dir).exists():
+        return out
+    figures_dir = Path(figures_dir)
+    for candidate in (
+        figures_dir / f"volcano_{pert}.png",
+        figures_dir / f"volcano_{pert.replace(' ', '_')}.png",
+    ):
+        if candidate.exists():
+            out["volcano"] = f"figures/{candidate.name}"
+            break
+    for name in ("umap.png", "umap_cell_annotation.png"):
+        if (figures_dir / name).exists():
+            out["umap"] = f"figures/{name}"
+            break
+    if (figures_dir / "edistance.png").exists():
+        out["edistance"] = "figures/edistance.png"
+    return out
+
+
+def build_summary_table(perturbations: list[dict[str, Any]]) -> pd.DataFrame:
+    """Publication-ready one-row-per-perturbation summary."""
+    rows: list[dict[str, Any]] = []
+    for s in perturbations:
+        eff = s["effect_vs_control"]
+        genes = s["top_affected"]["genes"]
+        top = genes[0] if isinstance(genes, list) and genes else {}
+        guides = s["consistency"].get("across_guides")
+        guides_consistent: Any = NA
+        if isinstance(guides, dict):
+            gc = guides.get("guides_consistent")
+            guides_consistent = NA if gc is None else gc
+        warns = s.get("warnings") or []
+        rows.append(
+            {
+                "perturbation": s["perturbation"],
+                "n_cells": s["counts"]["n_cells"],
+                "n_guides": s["counts"]["n_guides"],
+                "n_replicates": s["counts"]["n_replicates"],
+                "qc_status": s["counts"]["qc_status"],
+                "edistance": eff.get("effect_size", NA),
+                "pvalue_adj": eff.get("pvalue_adj", NA),
+                "significant_adj": eff.get("significant_adj", NA),
+                "de_method": eff.get("de_method", NA),
+                "de_min_pvalue_adj": eff.get("de_min_pvalue_adj", NA),
+                "top_gene": top.get("gene", NA) if top else NA,
+                "top_gene_lfc": top.get("logfoldchange", NA) if top else NA,
+                "guides_consistent": guides_consistent,
+                "n_warnings": len(warns),
+                "warnings": "; ".join(warns) if warns else NA,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _dataframe_to_markdown(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "_No perturbations summarized._\n"
+    cols = [str(c) for c in df.columns]
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join("---" for _ in cols) + " |"
+    lines = [header, sep]
+    for _, row in df.iterrows():
+        cells = []
+        for c in cols:
+            val = row[c]
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                text = NA
+            else:
+                text = str(val).replace("|", "\\|").replace("\n", " ")
+            cells.append(text)
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def write_summary_tables(
+    output_dir: Path | str,
+    perturbations: list[dict[str, Any]],
+) -> tuple[Path, Path]:
+    """Write summary_table.csv and summary_table.md next to report.html."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = build_summary_table(perturbations)
+    csv_path = output_dir / "summary_table.csv"
+    md_path = output_dir / "summary_table.md"
+    df.to_csv(csv_path, index=False)
+    md_path.write_text(
+        "# Perturbation summary table\n\n"
+        "Publication-ready overview generated with the HTML report.\n\n"
+        + _dataframe_to_markdown(df)
+    )
+    return csv_path, md_path
 
 
 def _precompute_state_composition(cell_ann: pd.DataFrame | None, control: str) -> dict[str, dict[str, Any]]:
@@ -586,12 +874,52 @@ def _fmt(value: Any) -> str:
     return html.escape(str(value))
 
 
+def _fig_thumb(rel: str | None, label: str, *, max_width: int = 220) -> str:
+    if not rel:
+        return ""
+    safe = html.escape(rel)
+    return (
+        f'<a class="fig-thumb" href="{safe}" title="{html.escape(label)}">'
+        f'<img src="{safe}" alt="{html.escape(label)}" style="max-width:{max_width}px"/>'
+        f"<span>{html.escape(label)}</span></a>"
+    )
+
+
+def _caveats_checklist_html(
+    report: dict[str, Any] | None = None,
+    *,
+    caveats: tuple[str, ...] | list[str] | None = None,
+) -> str:
+    """Collapsible checklist from STATISTICAL_CAVEATS.md cores + run-specific notes."""
+    items: list[str] = list(caveats if caveats is not None else CORE_STATISTICAL_CAVEATS)
+    if report:
+        ptype = (report.get("config") or {}).get("perturbation_type")
+        kd_note = mixscape_kd_caveat(ptype if isinstance(ptype, str) else None)
+        if kd_note and kd_note not in items:
+            items.insert(0, kd_note)
+        for c in report.get("statistical_caveats") or []:
+            text = str(c)
+            if text and text not in items:
+                items.append(text)
+    lis = "".join(
+        f'<li><label><input type="checkbox"/> {html.escape(text)}</label></li>' for text in items
+    )
+    return f"""
+<details class="caveats" id="statistical-caveats" open>
+  <summary>Statistical caveats checklist (read before interpreting results)</summary>
+  <ul class="checklist">{lis}</ul>
+  <p class="meta">Full text: <code>docs/STATISTICAL_CAVEATS.md</code></p>
+</details>
+"""
+
+
 def render_html_report(
     report: dict[str, Any],
     perturbations: list[dict[str, Any]],
     *,
     sample_id: str,
     figure_links: list[str] | None = None,
+    caveats: tuple[str, ...] | list[str] | None = None,
 ) -> str:
     """HTML with relative paths into figures/ and per-perturbation Q&A sections."""
     figure_links = figure_links or []
@@ -599,13 +927,16 @@ def render_html_report(
     rows = []
     for s in perturbations:
         eff = s["effect_vs_control"]
+        lp = eff.get("low_power")
+        lp_badge = ' <span class="badge">low_power</span>' if lp is True else ""
         rows.append(
             "<tr>"
-            f"<td><a href='#pert-{html.escape(s['perturbation'])}'>{html.escape(s['perturbation'])}</a></td>"
+            f"<td><a href='#pert-{html.escape(s['perturbation'])}'>{html.escape(s['perturbation'])}</a>"
+            f"{lp_badge}</td>"
             f"<td>{_fmt(s['counts']['n_cells'])}</td>"
             f"<td>{_fmt(eff['effect_size'])}</td>"
             f"<td>{_fmt(eff['pvalue_adj'])}</td>"
-            f"<td>{_fmt(eff['significant_adj'])}</td>"
+            f"<td>{_fmt(eff.get('significant_adj_reported', eff.get('significant_adj')))}</td>"
             f"<td>{_fmt(s['counts']['qc_status'])}</td>"
             "</tr>"
         )
@@ -623,15 +954,63 @@ def render_html_report(
                 for g in genes[:10]
             ]
             gene_html = "<ol>" + "".join(items) + "</ol>"
-        volcano = s.get("figures", {}).get("volcano")
-        vol_html = (
-            f'<p><img src="{html.escape(volcano)}" alt="volcano {pid}" style="max-width:420px"/></p>'
-            if volcano
-            else f"<p>{NA}</p>"
+        figs = s.get("figures") or {}
+        thumbs = "".join(
+            [
+                _fig_thumb(figs.get("volcano"), f"Volcano {s['perturbation']}", max_width=280),
+                _fig_thumb(figs.get("umap"), "UMAP (viz only)", max_width=180),
+                _fig_thumb(figs.get("edistance"), "E-distance bar", max_width=180),
+            ]
         )
+        fig_block = f'<div class="fig-row">{thumbs}</div>' if thumbs else f"<p>{NA}</p>"
         warn = s.get("warnings") or []
         lim = s.get("limitations") or []
         cons = s["consistency"]
+        gqc = s.get("guide_qc") or {}
+        interp = gqc.get("interpretations") or []
+        if interp:
+            interp_html = "<ul>" + "".join(
+                f"<li><code>{html.escape(str(i.get('guide_id')))}</code>: "
+                f"<em>{html.escape(str(i.get('interpretation')))}</em>"
+                f" (conf={html.escape(str(i.get('assignment_confidence')))}, "
+                f"dir={html.escape(str(i.get('target_effect_direction')))}, "
+                f"n={_fmt(i.get('n_cells'))})</li>"
+                for i in interp[:8]
+            ) + "</ul>"
+        else:
+            interp_html = f"<p>{NA}</p>"
+        qc_warns = gqc.get("warnings") or []
+        if qc_warns:
+            warn_items = []
+            for w in qc_warns[:8]:
+                interp = w.get("interpretation")
+                interp_s = (
+                    f" — <em>{html.escape(str(interp))}</em>"
+                    if interp and interp != NA
+                    else ""
+                )
+                warn_items.append(
+                    f'<li class="warn"><code>{html.escape(str(w.get("warning")))}</code>'
+                    f" [{html.escape(str(w.get('level')))}/{html.escape(str(w.get('entity')))}]: "
+                    f"{html.escape(str(w.get('detail')))}{interp_s}</li>"
+                )
+            qc_warn_html = "<ul>" + "".join(warn_items) + "</ul>"
+        else:
+            qc_warn_html = f"<p>{NA}</p>"
+        wsum = gqc.get("weighted_summary")
+        if isinstance(wsum, dict):
+            weighted_html = (
+                "<ul>"
+                f"<li>Mode: {_fmt(wsum.get('guide_merge'))}</li>"
+                f"<li>Weighted target log2FC: {_fmt(wsum.get('weighted_target_log2fc'))}</li>"
+                f"<li>Weighted direction: {_fmt(wsum.get('weighted_direction'))} "
+                f"(vote: {_fmt(wsum.get('weighted_direction_vote'))})</li>"
+                f"<li>Weights: {_fmt(wsum.get('guide_weights'))}</li>"
+                f"<li>Note: {_fmt(wsum.get('note'))}</li>"
+                "</ul>"
+            )
+        else:
+            weighted_html = f"<p>{NA} — set <code>guide_merge</code> to equal|umi|confidence|umi_confidence</p>"
         sections.append(
             f"""
 <section class="pert" id="pert-{pid}">
@@ -643,13 +1022,22 @@ def render_html_report(
     <li>Replicate count: {_fmt(s['counts']['n_replicates'])}</li>
     <li>QC status: {_fmt(s['counts']['qc_status'])}</li>
   </ul>
+  <h4>Guide interpretations</h4>
+  {interp_html}
+  <h4>QC warnings</h4>
+  {qc_warn_html}
+  <h4>Weighted guide summary</h4>
+  {weighted_html}
   <h3>2. Effect vs {html.escape(str(s['effect_vs_control'].get('control', 'NT')))}</h3>
   <ul>
     <li>Metric: {_fmt(s['effect_vs_control']['metric'])}</li>
     <li>Effect size: {_fmt(s['effect_vs_control']['effect_size'])}</li>
     <li>Confidence interval: {_fmt(s['effect_vs_control']['confidence_interval'])}</li>
     <li>Adjusted p-value (E-test): {_fmt(s['effect_vs_control']['pvalue_adj'])}</li>
-    <li>Significant (adj): {_fmt(s['effect_vs_control']['significant_adj'])}</li>
+    <li>Significant (adj, raw): {_fmt(s['effect_vs_control']['significant_adj'])}</li>
+    <li>Significant (adj, reported): {_fmt(s['effect_vs_control'].get('significant_adj_reported'))}</li>
+    <li>low_power: {_fmt(s['effect_vs_control'].get('low_power'))}</li>
+    <li>Secondary metrics: {_fmt(s['effect_vs_control'].get('secondary_metrics'))}</li>
     <li>DE method: {_fmt(s['effect_vs_control']['de_method'])}</li>
     <li>Note: {_fmt(s['effect_vs_control'].get('note'))}</li>
   </ul>
@@ -666,17 +1054,57 @@ def render_html_report(
   <h3>5. Limitations &amp; warnings</h3>
   <ul>{''.join(f'<li class="warn">{html.escape(w)}</li>' for w in warn) or f'<li>{NA}</li>'}</ul>
   <ul>{''.join(f'<li>{html.escape(x)}</li>' for x in lim)}</ul>
-  <h3>Volcano</h3>
-  {vol_html}
+  <h3>Figures</h3>
+  {fig_block}
 </section>
 """
         )
 
     fig_list = "".join(f'<li><a href="{html.escape(f)}">{html.escape(f)}</a></li>' for f in figure_links)
     global_notes = []
-    for key in ("mixscape_skipped", "de_note", "distance_error", "mixscape_error"):
-        if report.get(key):
+    for key in ANALYSIS_STATUS_KEYS:
+        block = report.get(key)
+        note = status_note(block)
+        if note:
+            label = html.escape(key)
+            skipped = isinstance(block, dict) and block.get("skipped")
+            cls = ' class="warn"' if skipped else ""
+            global_notes.append(f"<li{cls}><code>{label}</code>: {html.escape(note)}</li>")
+        elif isinstance(block, dict) and block.get("skipped") is False:
+            global_notes.append(f"<li><code>{html.escape(key)}</code>: ran</li>")
+        # Surface structured Mixscape skip estimate when present
+        if key == "mixscape" and isinstance(block, dict):
+            est = block.get("estimate")
+            if isinstance(est, dict):
+                bits = []
+                if est.get("approx_work_units") is not None:
+                    bits.append(f"approx_work_units={est['approx_work_units']}")
+                if est.get("approx_relative_to_threshold") is not None:
+                    bits.append(f"relative_to_threshold={est['approx_relative_to_threshold']}")
+                if est.get("approx_memory_hint_gb") is not None:
+                    bits.append(f"approx_memory_hint_gb={est['approx_memory_hint_gb']}")
+                if bits:
+                    global_notes.append(
+                        f'<li class="warn"><code>mixscape.estimate</code>: {html.escape("; ".join(bits))}</li>'
+                    )
+            if block.get("subset"):
+                targets = block.get("selected_targets") or []
+                global_notes.append(
+                    '<li class="warn"><code>mixscape.subset</code>: results cover only '
+                    f"{html.escape(str(len(targets)))} selected targets + control — not the full library.</li>"
+                )
+    # Legacy flat notes (older report.json without structured status blocks)
+    legacy_map = {
+        "mixscape_skipped": "mixscape",
+        "mixscape_error": "mixscape",
+        "distance_error": "edistance",
+        "de_note": "de",
+    }
+    for key, structured in legacy_map.items():
+        if report.get(key) and not isinstance(report.get(structured), dict):
             global_notes.append(f"<li>{html.escape(str(report[key]))}</li>")
+
+    caveats_html = _caveats_checklist_html(report, caveats=caveats)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -686,28 +1114,44 @@ def render_html_report(
 <style>
   body {{ font-family: Georgia, 'Times New Roman', serif; margin: 2rem auto; max-width: 960px;
          line-height: 1.45; color: #1a1a1a; background: #faf9f7; padding: 0 1rem; }}
-  h1,h2,h3 {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; }}
+  h1,h2,h3,h4 {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 1rem 0; }}
   th, td {{ border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }}
   th {{ background: #eee; }}
   .pert {{ border-top: 2px solid #333; margin-top: 2rem; padding-top: 0.5rem; }}
   .warn {{ color: #8a4b08; }}
+  .badge {{ background: #f0e6d8; color: #8a4b08; font-size: 0.75rem; padding: 0.1rem 0.35rem;
+            margin-left: 0.35rem; border: 1px solid #d9c7a8; }}
   code {{ background: #eee; padding: 0 0.2rem; }}
   .meta {{ color: #555; font-size: 0.95rem; }}
   img {{ border: 1px solid #ddd; }}
+  .downloads a {{ margin-right: 1rem; }}
+  .caveats {{ background: #f3efe6; border: 1px solid #d4cbb8; padding: 0.6rem 0.9rem; margin: 1rem 0; }}
+  .caveats summary {{ cursor: pointer; font-weight: 600; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; }}
+  .checklist {{ list-style: none; padding-left: 0; }}
+  .checklist li {{ margin: 0.35rem 0; }}
+  .fig-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-start; }}
+  .fig-thumb {{ display: inline-flex; flex-direction: column; align-items: center; text-decoration: none;
+                color: #333; font-size: 0.8rem; max-width: 280px; }}
+  .fig-thumb img {{ display: block; }}
 </style>
 </head>
 <body>
 <h1>Perturb-seq analysis report</h1>
 <p class="meta">Sample: <strong>{html.escape(sample_id)}</strong> · {n} perturbations summarized</p>
 <p class="meta">Machine-readable: <code>report.json</code> → <code>perturbations</code>. CSV / <code>.h5ad</code> remain downstream interfaces.</p>
+{caveats_html}
+<p class="downloads">Publication-ready summary:
+  <a href="summary_table.csv" download>summary_table.csv</a>
+  <a href="summary_table.md" download>summary_table.md</a>
+</p>
 <h2>Run notes</h2>
 <ul>{''.join(global_notes) or f'<li>{NA}</li>'}</ul>
 <h2>Figures</h2>
 <ul>{fig_list or f'<li>{NA}</li>'}</ul>
 <h2>Perturbation index</h2>
 <table>
-<thead><tr><th>Perturbation</th><th>n_cells</th><th>E-distance</th><th>padj</th><th>sig_adj</th><th>QC</th></tr></thead>
+<thead><tr><th>Perturbation</th><th>n_cells</th><th>E-distance</th><th>padj</th><th>sig_adj_reported</th><th>QC</th></tr></thead>
 <tbody>
 {''.join(rows)}
 </tbody>
@@ -764,6 +1208,7 @@ def write_analysis_report(
     sample_id = str(report.get("sample_id") or output_dir.name)
     html_text = render_html_report(report, html_perts, sample_id=sample_id, figure_links=figure_links)
 
+    write_summary_tables(output_dir, summaries)
     write_report_json(report, output_dir)
     (output_dir / "report.html").write_text(html_text)
     write_provenance_manifest(output_dir, report)
@@ -802,11 +1247,21 @@ def write_html_summary(report: dict, output_dir: Path, filename: str = "report.h
         "n_after_singlet",
         "n_gene_targets",
         "n_de_contrasts",
-        "mixscape_status",
         "de_scope",
         "composition_audit",
     ):
         if key in report:
+            rows.append(f"<tr><td>{html.escape(key)}</td><td>{html.escape(str(report[key]))}</td></tr>")
+    for key in ANALYSIS_STATUS_KEYS:
+        block = report.get(key)
+        if isinstance(block, dict) and "skipped" in block:
+            reason = block.get("reason")
+            label = "skipped" if block.get("skipped") else "ran"
+            text = f"{label}" + (f" ({reason})" if reason else "")
+            if block.get("detail"):
+                text += f" — {block['detail']}"
+            rows.append(f"<tr><td>{html.escape(key)}</td><td>{html.escape(text)}</td></tr>")
+        elif key == "cell_annotation" and key in report:
             rows.append(f"<tr><td>{html.escape(key)}</td><td>{html.escape(str(report[key]))}</td></tr>")
     prov = report.get("matrix_provenance") or {}
     if prov:
@@ -868,16 +1323,24 @@ def finalize_outputs(
 
 
 __all__ = [
+    "ANALYSIS_STATUS_KEYS",
+    "CORE_STATISTICAL_CAVEATS",
     "build_perturbation_summaries",
+    "build_summary_table",
     "collect_package_versions",
+    "completed_status",
     "finalize_outputs",
     "init_report",
     "list_perturbations",
     "load_result_tables",
+    "mixscape_kd_caveat",
     "render_html_report",
+    "skipped_status",
+    "status_note",
     "summarize_perturbation",
     "write_analysis_report",
     "write_html_summary",
     "write_provenance_manifest",
     "write_report_json",
+    "write_summary_tables",
 ]
