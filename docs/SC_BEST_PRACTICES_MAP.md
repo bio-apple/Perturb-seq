@@ -1,0 +1,47 @@
+# Pipeline ↔ sc-best-practices mapping
+
+Methodological basis for each tertiary-analysis stage relative to the [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/) chapter (Heumos / Lotfollahi / Ji; pertpy-based). Stage names match `pipeline.py` / `stages/*/`: `1_input_validation` → `5_report`.
+
+Chapter URL base: `https://www.sc-best-practices.org/conditions/perturbation-modeling/`  
+Anchors below are the live HTML `id`s on that page (some H2s use `conditions-perturbation-modeling-key-takeaway-*` rather than a slugified title).
+
+For matrix layers, pre/post-Mixscape paths, and which steps change inference scope, see [ANALYSIS_DEPENDENCIES.md](ANALYSIS_DEPENDENCIES.md). Module layout: [structure.md](structure.md).
+
+## Mapping table
+
+| Pipeline step | Purpose | sc-best-practices section | Notes |
+| --- | --- | --- | --- |
+| **1_input_validation** — DRAGEN MEX + barcode/feature ingest | Load filtered count matrix and CRISPR features | *pipeline-specific / not in chapter* | Chapter starts from a prepared MuData / AnnData artifact, not Illumina DRAGEN secondary outputs. |
+| **1 / 2** — Guide annotation from DRAGEN assignments | Attach `guide_id`, `gene_target`, `perturbation`, NT vs targeting | [Assigning guides](https://www.sc-best-practices.org/conditions/perturbation-modeling/#assigning-guides) | **Default** keeps DRAGEN GMM calls (`positive_cell_guide_assignments.csv`). Chapter assigns the max-count guide with a count threshold via `pertpy.pp.GuideAssignment`. Same goal; different caller by default. |
+| **2** — Optional `guide_reassign` (compare / apply max-UMI or GMM) | Tertiary check or override of DRAGEN calls | [Assigning guides](https://www.sc-best-practices.org/conditions/perturbation-modeling/#assigning-guides) (related) | Off by default. Closest to the chapter’s max-guide logic when `apply_max` is used; still pipeline-specific plumbing. |
+| **2_preprocessing_qc** — QC (n_counts / n_genes / %MT, MAD) + singlet (`num_features == 1`) | Drop low-quality / multi-guide cells | *pipeline-specific / not in chapter* | Chapter does not prescribe MAD QC or DRAGEN `num_features` singlet filtering. These steps change composition — see `tables/composition_audit.csv`. |
+| **2** — `normalize_total` + `log1p`, keep `layers['counts']`; HVG / PCA / neighbors | Expression representation + embedding for downstream tools | Prep shown inside [Identifying perturbed cells](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) and [Comparing perturbations at scale](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-3) | Same scanpy pattern the chapter uses before Mixscape and before E-distance. Not itself evidence of a KO effect. |
+| **2** — UMAP / Leiden | Structure visualization / descriptive clusters | *not claimed as perturbation evidence* (chapter focus is Mixscape / E-distance / DE / clustering of perturbations) | Aligns with book takeaways: do not treat global UMAP separation as KO proof. See [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md). |
+| **2** — Cell cycle / state annotation | Descriptive labels on cells | *pipeline-specific / not in chapter* | Optional; not used as default perturbation evidence. |
+| **3a_perturbation_modeling** — Mixscape (`X_pert`, KO/NP) | Identify cells where the perturbation “worked” | [Identifying perturbed cells](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) | Direct match (`pertpy.tl.Mixscape`). NP ≠ proven failed edit. Optional KO+NT subset mirrors chapter’s focus on perturbed vs control. |
+| **3a** — E-distance / E-test | Quantify and test transcriptome shift vs control | [Effect size](https://www.sc-best-practices.org/conditions/perturbation-modeling/#effect-size) (under Comparing perturbations at scale) | Direct match (`pertpy.tl.Distance` / `DistanceTest` on `X_pca`). Pipeline may run pre- and post-Mixscape embeddings. |
+| **3a** — Perturbation-mean PCA clustering | Group perturbations with similar effects | [Perturbations with similar effects](https://www.sc-best-practices.org/conditions/perturbation-modeling/#perturbations-with-similar-effects) | Same idea (mean profile in PCA → cluster). Implementation details (e.g. silhouette) are pipeline choices. |
+| **3a** — Guide QC / multi-guide consistency | Per-guide assignment, target effect, cytotoxicity; gene-level agreement | *pipeline-specific / not in chapter* | Extends beyond the chapter’s single-guide narrative; surfaces in `guide_qc.csv` / `gene_guide_consistency.csv` and HTML cards. |
+| **3b_statistical_inference** — Pseudobulk + PyDESeq2 (when replicates exist) | Genes affected by each perturbation | [Differential expression per perturbation](https://www.sc-best-practices.org/conditions/perturbation-modeling/#differential-expression-per-perturbation) | Direct match (`PseudobulkSpace` + `PyDESeq2`). Chapter also points to the book’s broader DE chapter for the pseudobulk rationale. |
+| **3b** — Wilcoxon on log-norm cells (no / insufficient replicates) | Exploratory DE only | *partial — chapter recommends pseudobulk DE* | Fallback when `replicate_col` lacks ≥2 levels; not a substitute for the chapter’s replicate-aware design. |
+| **4_robustness** — Sensitivity / effect consistency / confidence flags | Flag preprocessing- or guide-sensitive claims | *pipeline-specific / not in chapter* | Operational hardening around the same scientific claims the chapter motivates. |
+| **5_report** — H5AD / CSV / JSON / HTML / provenance | Deliverables and machine-readable summaries | *pipeline-specific / not in chapter* | Reporting layer for DRAGEN→tertiary runs; not part of the book’s notebook narrative. |
+| *(not a pipeline stage)* — Unseen-perturbation prediction | Predict responses never measured | [Predicting unseen perturbations](https://www.sc-best-practices.org/conditions/perturbation-modeling/#predicting-unseen-perturbations) | **Out of scope.** Documented as external / non-default (scGen, foundation models); chapter cautions that simple baselines often win. |
+
+## Chapter sections (reference)
+
+| Section title (as published) | Anchor |
+| --- | --- |
+| Motivation | [`#conditions-perturbation-modeling-key-takeaway-1`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-1) |
+| Dataset | [`#dataset`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#dataset) |
+| Assigning guides | [`#assigning-guides`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#assigning-guides) |
+| Identifying perturbed cells | [`#conditions-perturbation-modeling-key-takeaway-2`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) |
+| Differential expression per perturbation | [`#differential-expression-per-perturbation`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#differential-expression-per-perturbation) |
+| Comparing perturbations at scale | [`#conditions-perturbation-modeling-key-takeaway-3`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-3) |
+| Effect size | [`#effect-size`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#effect-size) |
+| Perturbations with similar effects | [`#perturbations-with-similar-effects`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#perturbations-with-similar-effects) |
+| Predicting unseen perturbations | [`#predicting-unseen-perturbations`](https://www.sc-best-practices.org/conditions/perturbation-modeling/#predicting-unseen-perturbations) |
+
+## Honest boundary
+
+This pipeline is **aligned with** the chapter’s path (assign guides → identify perturbed cells → DE on pseudobulks → E-distance / cluster similar perturbations), not a line-by-line reproduction. DRAGEN ingest, default GMM assignment, MAD/singlet QC, guide-level QC, robustness flags, and the HTML/JSON report are **pipeline-specific**. Unseen-perturbation prediction is **intentionally omitted**.
