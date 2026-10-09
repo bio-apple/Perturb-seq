@@ -17,7 +17,7 @@ from perturbseq._deps import PERTPY_MISSING_MSG, is_pertpy_import_error, warn_if
 from perturbseq.composition import append_composition_audit
 from perturbseq.guides import run_guide_qc, write_guide_qc_tables
 from perturbseq.perturbation import (
-    cluster_perturbations,
+    build_perturbation_space,
     estimate_mixscape_cost,
     filter_cells_for_mixscape_targets,
     merge_mixscape_annotations,
@@ -477,29 +477,61 @@ def stage_perturbation_modeling(
             if pre.get("skipped") is False:
                 report["edistance"]["pre_phase"] = pre
 
+    space_method = str(getattr(config, "perturbation_space", "pca_silhouette") or "pca_silhouette")
     try:
-        pert_clusters = cluster_perturbations(analysis_obj, groupby="gene_target")
-        pert_clusters.to_csv(tables / "perturbation_clusters.csv")
+        space = build_perturbation_space(
+            analysis_obj,
+            method=space_method,
+            groupby="gene_target",
+            random_state=config.random_state,
+        )
+        space.clusters.to_csv(tables / "perturbation_clusters.csv")
+        if space.embeddings is not None and not space.embeddings.empty:
+            space.embeddings.to_csv(tables / "perturbation_space_embeddings.csv")
+        analysis_obj.uns["perturbation_space"] = {
+            "method": space.method,
+            "backend": space.backend,
+            **{
+                k: v
+                for k, v in space.metadata.items()
+                if isinstance(v, (str, int, float, bool, type(None)))
+            },
+        }
         report.setdefault("matrix_provenance", {})["perturbation_clusters"] = {
-            "embedding": "X_pca",
+            "method": space.method,
+            "backend": space.backend,
+            "embedding": space.metadata.get("embedding", "X_pca"),
             "pca_source": pca_source,
             "depends_on_mixscape": bool(mixscape_ok),
+            **{k: v for k, v in space.metadata.items() if k != "embedding"},
         }
+        n_clust = (
+            int(space.clusters["pert_cluster"].nunique())
+            if "pert_cluster" in space.clusters.columns
+            else None
+        )
         report["perturbation_clusters"] = completed_status(
-            n_clusters=int(pert_clusters["pert_cluster"].nunique())
-            if "pert_cluster" in pert_clusters.columns
-            else None,
+            method=space.method,
+            backend=space.backend,
+            n_clusters=n_clust,
             depends_on_mixscape=bool(mixscape_ok),
             pca_source=pca_source,
+            space_meta={
+                k: v
+                for k, v in space.metadata.items()
+                if isinstance(v, (str, int, float, bool, type(None)))
+            },
         )
     except ImportError as exc:
         if is_pertpy_import_error(exc):
             msg = (
-                "pertpy is required for perturbation clustering. "
-                'Install with: pip install -e ".[de]" (or pip install "pertpy[de]>=1.3").'
+                "pertpy is required for this perturbation-space path. "
+                'Install with: pip install -e ".[de]" (or pip install "pertpy[de]>=1.3"), '
+                "or use --perturbation-space kmeans / lr_classifier (local backends)."
             )
-            report["perturbation_clusters"] = skipped_status("missing_pertpy", detail=msg)
-            # User already opted out of Mixscape/E-distance: keep this a quiet note.
+            report["perturbation_clusters"] = skipped_status(
+                "missing_pertpy", detail=msg, method=space_method
+            )
             if config.skip_mixscape and config.skip_distance:
                 print(f"NOTE: {msg}", flush=True)
             else:
@@ -508,11 +540,21 @@ def stage_perturbation_modeling(
         else:
             raise
     except Exception as exc:  # noqa: BLE001
-        report["perturbation_clusters"] = skipped_status("failed", detail=str(exc))
+        report["perturbation_clusters"] = skipped_status(
+            "failed", detail=str(exc), method=space_method
+        )
 
     print("Running guide-level QC / consistency", flush=True)
+    qc_filter_path = tables / "qc_filter_by_guide.csv"
+    qc_filter_df = pd.read_csv(qc_filter_path) if qc_filter_path.is_file() else None
     guide_df, consistency_df, warnings_df, guide_summary = run_guide_qc(
-        rna, control=config.control, guide_merge=config.guide_merge
+        rna,
+        control=config.control,
+        guide_merge=config.guide_merge,
+        perturbation_type=config.perturbation_type,
+        on_target_lfc_cutoff=config.on_target_lfc_cutoff,
+        on_target_min_fail_guides=config.on_target_min_fail_guides,
+        qc_filter_df=qc_filter_df,
     )
     write_guide_qc_tables(guide_df, consistency_df, warnings_df, tables)
     plot_guide_qc(guide_df, consistency_df, figures)

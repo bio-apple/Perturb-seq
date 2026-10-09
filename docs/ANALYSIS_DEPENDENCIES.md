@@ -20,7 +20,7 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | --- | --- | --- | --- | --- | --- |
 | Load + guide annotate | descriptive | DRAGEN MEX + assignments | `guide_id`, `gene_target`, `perturbation` | No | Composition already reflects DRAGEN calling |
 | Guide reassignment (optional) | QC / optional filtering | CRISPR count matrix + DRAGEN calls | comparison CSV; optional override | **Yes** if `apply_*` | Default `off`; CatchR / Cell Ranger FB not installed |
-| QC (MAD + min cells/gene) | filtering | raw `X` | filtered AnnData + QC log | **Yes** — drops cells/genes | Alters sample composition by library size / MT / sparsity |
+| QC (MAD + min cells/gene; optional perturbation-aware) | filtering | raw `X` (+ NT mask when aware) | filtered AnnData + QC log + `qc_filter_by_guide.csv` | **Yes** — drops cells/genes | Global MAD can drop strong phenotypes; prefer `perturbation_aware_qc` |
 | Singlet filter | filtering | `num_features` | singlet cells | **Yes** — drops 0/≥2 guide cells | Can deplete rare guides or doublets carrying real biology |
 | Normalize / log1p | transform | `layers['counts']` → `X` | log-norm expression | No (representation) | Downstream on `X` is not count-scale |
 | HVG / PCA / neighbors | descriptive | log-norm `X` (HVG) | `X_pca`, graph | No for perturbation claims | Global structure; confounded by cell cycle, ambient, guide load |
@@ -30,11 +30,12 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size |
 | Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object (default inferential subset) | **Yes** | Before/after in `mixscape_ko_filter` + `tables/mixscape_ko_filter_composition.csv` |
 | E-distance / E-test | inferential (effect size) | `X_pca` from `X_pert` when Mixscape ran | `edistance.csv`, `etest.csv`, `distances.csv`, optional `distance_mmd.csv` | Uses KO+NT set | Embedding choice changes ranks; bootstrap CI `edistance_ci_low`/`edistance_ci_high` (`n_bootstrap`, default 100); `low_power` when `n_cells < etest_power_min_cells`; secondary metrics may skip (`missing_jax` / `failed`) |
-| DE (Wilcoxon) | exploratory / inferential* | log-norm `X` | `de_*.csv` | Uses `de_group` definition | Cell-level p-values ≠ replicate inference; **covariates not modeled**; `evidence_level=exploratory` |
-| DE (PyDESeq2) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | Uses `de_group` + replicates + optional covariates | Requires `replicate_col` with ≥2 levels; design in `report.de.design_formula`; `evidence_level=inferential` |
-| Perturbation clustering | descriptive | mean `X_pca` per gene_target | `perturbation_clusters.csv` | Uses current cell set | Pathway-like grouping, not proof of mechanism |
+| DE (Wilcoxon fallback) | exploratory | log-norm `X` | `de_*.csv` | Uses `de_group` | Only when &lt;2 pseudobulk units; cell-level p-values inflate significance; **covariates not modeled**; `evidence_level=exploratory` |
+| DE (PyDESeq2, bio reps) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | `de_group` + `replicate_col` + optional covariates | `replicate_col` ≥2 levels; `method=pydeseq2_pseudobulk`; `evidence_level=inferential` |
+| DE (PyDESeq2, no bio reps) | exploratory | `layers['counts']` pseudobulk | `de_*.csv` | `de_group` + `sample_id` or technical pseudo-reps | `method=pydeseq2_pseudobulk_no_bio_reps`; not a substitute for bio reps (Squair 2021) |
+| Perturbation clustering | descriptive | method-dependent (`perturbation_space`: mean `X_pca` / KMeans / LR coeffs) | `perturbation_clusters.csv`, optional `perturbation_space_embeddings.csv` | Uses current cell set; method in provenance | Pathway-like grouping, not proof of mechanism |
 
-\*Wilcoxon is exploratory when there is no biological replicate column. Machine-readable `evidence_level` is on each DE CSV row, `report.json` → `de` / `experimental_design`, and per-perturbation summaries.
+\*Only true multi-rep `replicate_col` yields `evidence_level=inferential`. No-bio-rep pseudobulk and Wilcoxon stay `exploratory`. Machine-readable `evidence_level` is on each DE CSV row, `report.json` → `de` / `experimental_design`, and per-perturbation summaries.
 
 ## Pre- vs post-Mixscape paths
 

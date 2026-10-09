@@ -10,6 +10,9 @@ from perturbseq.guide_qc import (
     compute_gene_guide_consistency,
     compute_guide_metrics,
     compute_weighted_guide_summary,
+    expected_on_target_direction,
+    on_target_effect_score,
+    on_target_pass,
     run_guide_qc,
     write_guide_qc_tables,
 )
@@ -219,3 +222,121 @@ def test_weighted_merge_equal_and_confidence(tmp_path):
     assert not (out2 / "gene_guide_weighted.csv").exists()
     assert (out2 / "gene_guide_consistency.csv").exists()
     assert "guide_merge" in pd.read_csv(out2 / "gene_guide_consistency.csv").columns
+
+
+def test_on_target_score_direction_by_perturbation_type():
+    assert expected_on_target_direction("KO") == "down"
+    assert expected_on_target_direction("KD") == "down"
+    assert expected_on_target_direction("CRISPRi") == "down"
+    assert expected_on_target_direction("CRISPRa") == "up"
+    assert on_target_pass(-0.5, "KO", 0.25) is True
+    assert on_target_pass(-0.1, "KO", 0.25) is False
+    assert on_target_pass(0.5, "CRISPRa", 0.25) is True
+    assert on_target_pass(-0.5, "CRISPRa", 0.25) is False
+    assert on_target_effect_score(-1.0, "KO") == 1.0
+    assert on_target_effect_score(1.0, "CRISPRa") == 1.0
+
+
+def _make_low_efficiency_adata() -> AnnData:
+    """GENEA: 3 adequate guides, 2 fail KO downregulation → potential_low_efficiency."""
+    genes = ["GENEA", "OTHER"]
+    n_nt, n_g = 10, 12
+    n = n_nt + 3 * n_g
+    rng = np.random.default_rng(1)
+    X = rng.poisson(5, size=(n, len(genes))).astype(np.float32)
+    X[:n_nt, 0] = 10
+    # g1: strong KD; g2/g3: no change (low efficiency)
+    X[n_nt : n_nt + n_g, 0] = 2
+    X[n_nt + n_g : n_nt + 2 * n_g, 0] = 10
+    X[n_nt + 2 * n_g :, 0] = 11
+    guide_ids = (
+        ["NT_ctrl"] * n_nt
+        + ["GENEA|g1"] * n_g
+        + ["GENEA|g2"] * n_g
+        + ["GENEA|g3"] * n_g
+    )
+    gene_targets = ["NT"] * n_nt + ["GENEA"] * (3 * n_g)
+    obs = pd.DataFrame(
+        {
+            "guide_id": guide_ids,
+            "gene_target": gene_targets,
+            "sample_id": ["s1"] * n,
+            "guide_umi": [40] * n,
+            "num_features": 1,
+            "n_counts": rng.integers(1000, 2000, size=n),
+            "n_genes": rng.integers(200, 400, size=n),
+            "pct_counts_mt": rng.uniform(1, 5, size=n),
+        }
+    )
+    return AnnData(X=sparse.csr_matrix(X), obs=obs, var=pd.DataFrame(index=genes))
+
+
+def test_low_efficiency_guides_not_no_phenotype():
+    adata = _make_low_efficiency_adata()
+    guide_df, consistency_df, warnings_df, summary = run_guide_qc(
+        adata,
+        control="NT",
+        min_cells=10,
+        min_median_umi=5,
+        perturbation_type="KO",
+        on_target_lfc_cutoff=0.25,
+        on_target_min_fail_guides=2,
+    )
+    genea = guide_df.loc[guide_df["gene_target"] == "GENEA"]
+    assert set(genea.columns) >= {
+        "on_target_score",
+        "on_target_pass",
+        "low_efficiency_guide",
+    }
+    assert int((~genea["on_target_pass"]).sum()) == 2
+    assert int(genea["low_efficiency_guide"].sum()) == 2
+    assert (genea.loc[genea["low_efficiency_guide"], "interpretation"] == "potential_low_efficiency_guide").all()
+    # Passing guide keeps knockdown label; gene-level table carries potential_low_efficiency.
+    assert (
+        genea.loc[genea["guide_id"] == "GENEA|g1", "interpretation"].iloc[0]
+        == "target_knockdown_detected"
+    )
+
+    row = consistency_df.loc[consistency_df["gene_target"] == "GENEA"].iloc[0]
+    assert int(row["n_low_efficiency_guides"]) == 2
+    assert bool(row["potential_low_efficiency"]) is True
+    assert row["interpretation"] == "potential_low_efficiency_guides"
+    assert "no phenotype" not in str(row["interpretation"]).lower()
+
+    kinds = set(warnings_df["warning"])
+    assert "potential_low_efficiency_guides" in kinds
+    assert "low_efficiency_guide" in kinds
+    assert "no_clear_effect_adequate_guides" not in kinds
+    assert summary["n_genes_potential_low_efficiency"] == 1
+
+
+def test_crispr_a_on_target_expected_up():
+    """CRISPRa: upregulation passes; downregulation fails."""
+    genes = ["GENEA"]
+    n_nt, n_g = 10, 12
+    n = n_nt + 2 * n_g
+    X = np.ones((n, 1), dtype=np.float32) * 5
+    X[:n_nt, 0] = 5
+    X[n_nt : n_nt + n_g, 0] = 20  # up → pass for a
+    X[n_nt + n_g :, 0] = 2  # down → fail for a
+    obs = pd.DataFrame(
+        {
+            "guide_id": ["NT_ctrl"] * n_nt + ["GENEA|up"] * n_g + ["GENEA|down"] * n_g,
+            "gene_target": ["NT"] * n_nt + ["GENEA"] * (2 * n_g),
+            "sample_id": ["s1"] * n,
+            "guide_umi": [40] * n,
+            "num_features": 1,
+            "n_counts": [1500] * n,
+            "n_genes": [300] * n,
+            "pct_counts_mt": [2.0] * n,
+        }
+    )
+    adata = AnnData(X=sparse.csr_matrix(X), obs=obs, var=pd.DataFrame(index=genes))
+    guide_df, _, _, _ = run_guide_qc(
+        adata, control="NT", min_cells=10, perturbation_type="CRISPRa", on_target_lfc_cutoff=0.25
+    )
+    up = guide_df.loc[guide_df["guide_id"] == "GENEA|up"].iloc[0]
+    down = guide_df.loc[guide_df["guide_id"] == "GENEA|down"].iloc[0]
+    assert bool(up["on_target_pass"]) is True
+    assert bool(down["on_target_pass"]) is False
+    assert bool(down["low_efficiency_guide"]) is True

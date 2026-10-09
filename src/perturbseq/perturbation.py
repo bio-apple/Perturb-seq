@@ -9,6 +9,7 @@ or stage wiring (``stages.perturbation_modeling``). Guide QC math lives in ``gui
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -565,20 +566,339 @@ def run_edistance(
     return edistances, etest_results
 
 
-def cluster_perturbations(adata: AnnData, groupby: str = "gene_target", n_neighbors: int = 5) -> pd.DataFrame:
-    pt = require_pertpy()
+# Configurable perturbation-space construction (CLI --perturbation-space).
+# pca_silhouette = historical default (mean PCA + graph clustering).
+PERTURBATION_SPACE_METHODS: tuple[str, ...] = ("pca_silhouette", "kmeans", "lr_classifier")
+
+
+@dataclass
+class PerturbationSpaceResult:
+    """Embeddings + cluster labels from ``build_perturbation_space``."""
+
+    clusters: pd.DataFrame
+    embeddings: pd.DataFrame | None
+    method: str
+    backend: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _ensure_pca(adata: AnnData) -> None:
     if "X_pca" not in adata.obsm:
         sc.pp.pca(adata)
-    profiles = pt.tl.PseudobulkSpace().compute(adata, target_col=groupby, embedding_key="X_pca", mode="mean")
-    k = min(n_neighbors, max(2, profiles.n_obs - 1))
+
+
+def _mean_embedding_profiles(
+    adata: AnnData,
+    groupby: str,
+    *,
+    embedding_key: str = "X_pca",
+) -> AnnData:
+    """One observation per group = mean of ``obsm[embedding_key]`` rows."""
+    labels = adata.obs[groupby].astype(str)
+    emb = np.asarray(adata.obsm[embedding_key], dtype=float)
+    groups = list(pd.unique(labels))
+    rows = []
+    for g in groups:
+        mask = (labels == g).to_numpy()
+        rows.append(emb[mask].mean(axis=0))
+    profiles = AnnData(X=np.asarray(rows, dtype=float))
+    profiles.obs_names = pd.Index([str(g) for g in groups], name=groupby)
+    profiles.obs[groupby] = profiles.obs_names.astype(str)
+    return profiles
+
+
+def _cluster_profiles_leiden(profiles: AnnData, *, n_neighbors: int = 5) -> AnnData:
+    """Graph clustering on a per-perturbation profile AnnData (``use_rep='X'``)."""
+    if profiles.n_obs < 2:
+        profiles.obs["pert_cluster"] = "0"
+        return profiles
+    k = min(int(n_neighbors), max(2, profiles.n_obs - 1))
     sc.pp.neighbors(profiles, use_rep="X", n_neighbors=k)
     try:
         sc.tl.leiden(profiles, resolution=1.0, flavor="igraph", n_iterations=2, key_added="pert_cluster")
     except Exception:
         profiles.obs["pert_cluster"] = "0"
+    return profiles
+
+
+def _cluster_profiles_kmeans(
+    profiles: AnnData,
+    *,
+    n_clusters: int | None = None,
+    random_state: int = 0,
+) -> tuple[AnnData, dict[str, Any]]:
+    """KMeans on profile rows; optional silhouette pick of k in [2, max]."""
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    meta: dict[str, Any] = {}
+    n = int(profiles.n_obs)
+    if n < 2:
+        profiles.obs["pert_cluster"] = "0"
+        meta["n_clusters"] = 1
+        return profiles, meta
+    x = np.asarray(profiles.X, dtype=float)
+    max_k = min(8, n - 1)
+    if n_clusters is not None:
+        k = max(2, min(int(n_clusters), n))
+        if k >= n:
+            k = max(1, n - 1) if n > 1 else 1
+        chosen = int(k)
+        meta["k_selection"] = "user"
+    else:
+        best_k, best_score = 2, -1.0
+        for k in range(2, max_k + 1):
+            labels = KMeans(n_clusters=k, n_init=10, random_state=random_state).fit_predict(x)
+            if len(set(labels)) < 2:
+                continue
+            score = float(silhouette_score(x, labels))
+            if score > best_score:
+                best_k, best_score = k, score
+        chosen = int(best_k)
+        meta["k_selection"] = "silhouette"
+        meta["silhouette_score"] = best_score
+    if chosen <= 1:
+        profiles.obs["pert_cluster"] = "0"
+        meta["n_clusters"] = 1
+        return profiles, meta
+    labels = KMeans(n_clusters=chosen, n_init=10, random_state=random_state).fit_predict(x)
+    profiles.obs["pert_cluster"] = pd.Series(labels, index=profiles.obs_names).astype(str)
+    meta["n_clusters"] = int(chosen)
+    return profiles, meta
+
+
+def _embeddings_frame(profiles: AnnData, groupby: str) -> pd.DataFrame:
+    x = np.asarray(profiles.X, dtype=float)
+    cols = [f"dim_{i}" for i in range(x.shape[1])]
+    frame = pd.DataFrame(x, index=profiles.obs_names.astype(str), columns=cols)
+    frame.index.name = groupby
+    return frame
+
+
+def _clusters_frame(profiles: AnnData, groupby: str) -> pd.DataFrame:
     table = profiles.obs[["pert_cluster"]].copy()
+    table.index = profiles.obs_names.astype(str)
     table.index.name = groupby
     return table
+
+
+def _space_pca_silhouette(
+    adata: AnnData,
+    *,
+    groupby: str,
+    n_neighbors: int,
+) -> PerturbationSpaceResult:
+    """Mean PCA per perturbation + neighbors/Leiden (historical default).
+
+    Prefers pertpy ``PseudobulkSpace`` when importable; otherwise local mean of
+    ``obsm['X_pca']`` (same biological intent). Method name keeps the proposal /
+    docs label ``pca_silhouette``; clustering uses Leiden on the profile graph.
+    """
+    _ensure_pca(adata)
+    backend = "local"
+    try:
+        pt = require_pertpy()
+        profiles = pt.tl.PseudobulkSpace().compute(
+            adata, target_col=groupby, embedding_key="X_pca", mode="mean"
+        )
+        backend = "pertpy"
+    except ImportError:
+        profiles = _mean_embedding_profiles(adata, groupby, embedding_key="X_pca")
+    profiles = _cluster_profiles_leiden(profiles, n_neighbors=n_neighbors)
+    return PerturbationSpaceResult(
+        clusters=_clusters_frame(profiles, groupby),
+        embeddings=_embeddings_frame(profiles, groupby),
+        method="pca_silhouette",
+        backend=backend,
+        metadata={"embedding": "X_pca", "clusterer": "leiden", "n_neighbors": int(n_neighbors)},
+    )
+
+
+def _space_kmeans(
+    adata: AnnData,
+    *,
+    groupby: str,
+    n_clusters: int | None,
+    random_state: int,
+) -> PerturbationSpaceResult:
+    """KMeans on per-perturbation mean PCA profiles (pertpy KMeansSpace-like intent).
+
+    Local implementation: mean ``X_pca`` → sklearn KMeans (silhouette-selected k
+    unless ``n_clusters`` is set). Does not call cell-level ``pt.tl.KMeansSpace``,
+    which labels cells rather than producing one embedding per perturbation.
+    """
+    _ensure_pca(adata)
+    profiles = _mean_embedding_profiles(adata, groupby, embedding_key="X_pca")
+    profiles, km_meta = _cluster_profiles_kmeans(
+        profiles, n_clusters=n_clusters, random_state=random_state
+    )
+    return PerturbationSpaceResult(
+        clusters=_clusters_frame(profiles, groupby),
+        embeddings=_embeddings_frame(profiles, groupby),
+        method="kmeans",
+        backend="local",
+        metadata={
+            "embedding": "X_pca_mean",
+            "clusterer": "kmeans",
+            "note": (
+                "Local KMeans on perturbation-mean PCA profiles "
+                "(pertpy KMeansSpace-like response clustering)."
+            ),
+            **km_meta,
+        },
+    )
+
+
+def _lr_coefficients_local(
+    adata: AnnData,
+    *,
+    groupby: str,
+    embedding_key: str = "X_pca",
+    random_state: int = 0,
+    max_iter: int = 500,
+) -> AnnData:
+    """One-vs-rest logistic regression; coefficient rows = perturbation embeddings."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import LabelEncoder
+
+    labels = adata.obs[groupby].astype(str)
+    x = np.asarray(adata.obsm[embedding_key], dtype=float)
+    classes = sorted(labels.unique())
+    if len(classes) < 2:
+        profiles = AnnData(X=np.zeros((len(classes), x.shape[1]), dtype=float))
+        profiles.obs_names = pd.Index(classes, name=groupby)
+        return profiles
+    enc = LabelEncoder()
+    y = enc.fit_transform(labels.to_numpy())
+    # Multinomial / OVR coefficients: shape (n_classes, n_features) for multinomial.
+    clf = LogisticRegression(
+        multi_class="multinomial",
+        solver="lbfgs",
+        max_iter=int(max_iter),
+        random_state=int(random_state),
+    )
+    clf.fit(x, y)
+    coef = np.asarray(clf.coef_, dtype=float)
+    # sklearn may drop a class column in some binary cases; align to enc.classes_.
+    order = list(enc.classes_)
+    if coef.shape[0] == 1 and len(order) == 2:
+        # Binary: single coef row for class 1; class 0 ≈ -coef.
+        coef = np.vstack([-coef[0], coef[0]])
+    profiles = AnnData(X=coef)
+    profiles.obs_names = pd.Index([str(c) for c in order], name=groupby)
+    profiles.obs[groupby] = profiles.obs_names.astype(str)
+    return profiles
+
+
+def _space_lr_classifier(
+    adata: AnnData,
+    *,
+    groupby: str,
+    n_clusters: int | None,
+    random_state: int,
+) -> PerturbationSpaceResult:
+    """LR coefficients as perturbation embedding (pertpy LRClassifierSpace-like).
+
+    Prefers ``pt.tl.LRClassifierSpace`` when available; otherwise local multinomial
+    logistic regression on ``X_pca``. Clusters coefficient rows with KMeans.
+    """
+    _ensure_pca(adata)
+    try:
+        pt = require_pertpy()
+        profiles = pt.tl.LRClassifierSpace().compute(
+            adata,
+            target_col=groupby,
+            embedding_key="X_pca",
+            random_state=int(random_state),
+        )
+        backend = "pertpy"
+    except ImportError:
+        profiles = _lr_coefficients_local(
+            adata, groupby=groupby, embedding_key="X_pca", random_state=random_state
+        )
+        backend = "local"
+    except Exception as exc:  # noqa: BLE001 — prefer local over failing the stage
+        warnings.warn(
+            f"pertpy LRClassifierSpace failed ({exc}); using local logistic regression",
+            stacklevel=2,
+        )
+        profiles = _lr_coefficients_local(
+            adata, groupby=groupby, embedding_key="X_pca", random_state=random_state
+        )
+        backend = "local"
+    profiles, km_meta = _cluster_profiles_kmeans(
+        profiles, n_clusters=n_clusters, random_state=random_state
+    )
+    return PerturbationSpaceResult(
+        clusters=_clusters_frame(profiles, groupby),
+        embeddings=_embeddings_frame(profiles, groupby),
+        method="lr_classifier",
+        backend=backend,
+        metadata={
+            "embedding": "lr_coefficients",
+            "clusterer": "kmeans",
+            "note": (
+                "Logistic-regression coefficients as perturbation embedding "
+                "(pertpy LRClassifierSpace when available, else local sklearn)."
+            ),
+            **km_meta,
+        },
+    )
+
+
+def build_perturbation_space(
+    adata: AnnData,
+    method: str = "pca_silhouette",
+    *,
+    groupby: str = "gene_target",
+    n_neighbors: int = 5,
+    n_clusters: int | None = None,
+    random_state: int = 0,
+) -> PerturbationSpaceResult:
+    """Build a perturbation-level embedding and cluster labels.
+
+    Parameters
+    ----------
+    method
+        ``pca_silhouette`` (default) — mean PCA + Leiden (backward-compatible).
+        ``kmeans`` — KMeans on mean PCA profiles (response-pattern clustering).
+        ``lr_classifier`` — LR coefficient embedding + KMeans (marker-like space).
+    """
+    method = str(method).strip().lower()
+    if method not in PERTURBATION_SPACE_METHODS:
+        raise ValueError(
+            f"perturbation_space must be one of {PERTURBATION_SPACE_METHODS}, got {method!r}"
+        )
+    if method == "pca_silhouette":
+        return _space_pca_silhouette(adata, groupby=groupby, n_neighbors=n_neighbors)
+    if method == "kmeans":
+        return _space_kmeans(
+            adata, groupby=groupby, n_clusters=n_clusters, random_state=random_state
+        )
+    return _space_lr_classifier(
+        adata, groupby=groupby, n_clusters=n_clusters, random_state=random_state
+    )
+
+
+def cluster_perturbations(
+    adata: AnnData,
+    groupby: str = "gene_target",
+    n_neighbors: int = 5,
+    *,
+    method: str = "pca_silhouette",
+    n_clusters: int | None = None,
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """Cluster perturbations; thin wrapper over ``build_perturbation_space``."""
+    result = build_perturbation_space(
+        adata,
+        method=method,
+        groupby=groupby,
+        n_neighbors=n_neighbors,
+        n_clusters=n_clusters,
+        random_state=random_state,
+    )
+    return result.clusters
 
 
 __all__ = [
@@ -586,8 +906,11 @@ __all__ = [
     "DEFAULT_ETEST_POWER_MIN_CELLS",
     "DEFAULT_N_BOOTSTRAP",
     "DEFAULT_SECONDARY_DISTANCE_METRICS",
+    "PERTURBATION_SPACE_METHODS",
+    "PerturbationSpaceResult",
     "annotate_edistance_bootstrap_ci",
     "annotate_etest_power",
+    "build_perturbation_space",
     "cluster_perturbations",
     "combine_distance_tables",
     "compute_gene_guide_consistency",

@@ -30,29 +30,30 @@
 DRAGEN MEX + guide assignment
   → 拆分 Gene Expression / CRISPR Direct Capture
   → 注释 guide_id、gene_target、NT vs perturbed
-  → QC（n_counts / n_genes / %MT，MAD 自适应）                         [filtering]
+  → QC（n_counts / n_genes / %MT，MAD；推荐 --perturbation-aware-qc）   [filtering]
   → 默认保留 num_features == 1 的单 guide 细胞                         [filtering]
   → normalize / log1p（保留 layers['counts']）+ HVG / PCA / Leiden     [descriptive]
   → UMAP                                                               [visualization only]
   → 细胞注释：细胞周期 + 状态打分（非组织细胞类型）                      [descriptive]
   → Mixscape：signature → KO/NP；可按 KO+NT 子集                       [filtering/classification]
   → E-distance / E-test（report 标注 pca_source；pre/post Mixscape）   [inferential]
-  → 差异表达：有重复则 pseudobulk + PyDESeq2；否则探索性 Wilcoxon      [inferential/exploratory]
+  → 差异表达：优先 pseudobulk + PyDESeq2（有真重复→inferential；否则 exploratory）；Wilcoxon 仅作不足 2 个 pseudobulk 单元时的回退
   → 按扰动平均 PCA 轮廓聚类
   → Guide QC：按 guide 评估 assignment / 靶效应 / 毒性与一致性
 ```
 
-**统计边界**（完整版与文献：[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CAVEATS.md)）：细胞不是独立生物学重复。单样本、无 `replicate` 时，Wilcoxon 只能当探索，不能当组间结论。Mixscape 把“拿到 targeting guide 但转录组仍像对照”的细胞标成 NP；NP 与真正无效应无法仅靠转录组区分。全局 Leiden/UMAP **不是**扰动效应证据。QC / singlet / Mixscape KO 过滤会改变样本组成，见 `tables/composition_audit.csv`。同基因多 guide 的效应方向不一致时，不要把该基因的细胞简单合并当作单一效力结论。
+**统计边界**（完整版与文献：[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CAVEATS.md)）：细胞不是独立生物学重复。默认优先 `sample_id`+扰动的 pseudobulk + PyDESeq2；无真生物学重复时仍标 `exploratory`（`pydeseq2_pseudobulk_no_bio_reps`），不能当组间 FDR 结论（Squair 2021）。单样本且未开 `--pseudo-replicates` 时才回退 Wilcoxon。Mixscape 把“拿到 targeting guide 但转录组仍像对照”的细胞标成 NP；NP 与真正无效应无法仅靠转录组区分。全局 Leiden/UMAP **不是**扰动效应证据。QC / singlet / Mixscape KO 过滤会改变样本组成，见 `tables/composition_audit.csv`。同基因多 guide 的效应方向不一致时，不要把该基因的细胞简单合并当作单一效力结论。
 
 ### 常见坑 / Common pitfalls
 
 | 坑 | 原因（简述） | 怎么做 |
 | --- | --- | --- |
 | **同基因多 guide 不一致** | assignment / UMI / 不完全编辑 / off-target / 毒性等导致效应方向打架 | 看 `gene_guide_consistency.csv`、`qc_warnings.csv`；**不要**把不一致 guide 合并成单一「基因 KO」结论 |
+| **多 guide 靶基因 mRNA 未按预期变化** | ≥2 条合格 guide 未通过 on-target 代理（`potential_low_efficiency`） | 标为潜在低效 guide；**不要**据此下「该基因无表型」结论 |
 | **Mixscape 标大量 NP** | 相对 NT 池的转录组分类；池依赖；≠ 证明 guide 失败 | 对照 `composition_audit.csv`；NP ≠ 已证实的生物学无效 |
-| **无重复却谈 FDR / 组间推断** | 细胞 ≠ 生物学重复；无 `replicate_col` 只有探索性 Wilcoxon | 只当假设排序；≥2 真重复再用 pseudobulk + PyDESeq2 |
+| **无重复却谈 FDR / 组间推断** | 细胞 ≠ 生物学重复；无真重复的 DE（Wilcoxon 或 exploratory PyDESeq2）不能当组间推断 | 只当假设排序；≥2 真重复才有 `evidence_level=inferential` |
 | **把 UMAP/Leiden 当效应证据** | 全局结构混杂批次、周期、guide load 等 | 优先 E-distance / E-test（及有重复时的 DE） |
-| **过滤改变命中** | MAD / singlet / Mixscape KO+NT 会掉细胞 | 比较各阶段 `composition_audit.csv` |
+| **过滤改变命中** | MAD / singlet / Mixscape KO+NT 会掉细胞；全局 MAD 可能系统性丢掉强表型 | 比较 `composition_audit.csv`；推荐 `--perturbation-aware-qc`；看 `qc_filter_by_guide.csv` / `cytotoxicity_qc_depletion` |
 | **默认信任 DRAGEN assignment** | 本三级流程默认不重做 guide calling | assignment 质量上限决定下游一切 |
 
 对照识别默认把 `NegCtrl*`、`NT`/`NTC`、`non-targeting` 等映射为 `NT`。guide 名如 `PDCD10_4`、`ATM/design_3` 会解析成靶基因。可用 `--control-patterns` 改。
@@ -99,11 +100,11 @@ pip install -e ".[dev]" -c constraints.txt
 | 输入校验、guide 注释、QC / MAD 过滤、singlet | ✅ | ✅ |
 | normalize / HVG / PCA / Leiden / UMAP、细胞注释 | ✅ | ✅ |
 | Guide QC（assignment / 靶效应 / 毒性一致性） | ✅ | ✅ |
-| 探索性 Wilcoxon DE（无生物学重复时） | ✅ | ✅（仍可用；可加 `--skip-de`） |
+| 探索性 DE（无真重复：pseudobulk PyDESeq2 / Wilcoxon 回退） | ✅（PyDESeq2 需 pertpy） | ✅ 仅 Wilcoxon；可加 `--skip-de` |
 | Mixscape（KO/NP 分类、`X_pert`） | ✅ | ❌ → `mixscape.reason=missing_pertpy`；请加 `--skip-mixscape` |
 | E-distance / E-test | ✅ | ❌ → `edistance.reason=missing_pertpy`；请加 `--skip-distance` |
-| Pseudobulk + PyDESeq2（有 `replicate_col`） | ✅ | ❌ → 无法走 replicate-aware DE；无重复时仍可 Wilcoxon |
-| 按扰动平均 PCA 轮廓聚类 | ✅（依赖 pertpy Distance） | ❌ → `perturbation_clusters.reason=missing_pertpy` |
+| Pseudobulk + PyDESeq2（有/无 `replicate_col`） | ✅ | ❌ → 无法走 PyDESeq2；无 pertpy 时 Wilcoxon 回退 |
+| 扰动空间聚类（`--perturbation-space`） | ✅ `pca_silhouette`（默认）/ `kmeans` / `lr_classifier` | 成功时 `skipped: false` + `method`；失败 → `reason=failed` |
 
 缺 pertpy 且未加 `--skip-mixscape --skip-distance` 时，流程会发出明确警告，并在 `report.json` 写入显式状态块（如 `"mixscape": {"skipped": true, "reason": "missing_pertpy", ...}`），而不是静默省略字段或裸 `null`。无 pertpy 的推荐命令：
 
@@ -170,11 +171,14 @@ python -m perturbseq run \
   - **已并行**：DE 外层 contrast 循环；E-test 外层组循环（`n_jobs>1` 时按组跑 DistanceTest 再汇总 padj）；E-distance `onesided_distances` 透传 `n_jobs`
   - **未并行**：Mixscape、pertpy DistanceTest 内部置换循环（无 hook）、guide QC 循环（非明显 CPU-bound）
 - `--keep-multiplets`：保留 0 或 ≥2 条 guide 的细胞
+- `--perturbation-aware-qc`：仅用 NT/对照拟合 MAD 阈值再应用于全体（Perturb-seq 推荐，避免强表型被 QC 系统性丢掉）
 - `--replicate-col`：`obs` 中的生物学重复列；有重复才走 PyDESeq2
 - `--skip-mixscape` / `--skip-cell-annotation` / `--skip-distance` / `--skip-de`
 - `--perturbation-type KO`：CRISPRi 可改为 `KD`
 - `--guide-reassign off|compare|apply_max|apply_gmm`：可选三级重赋值（对比/覆盖 DRAGEN；默认 off）
 - `--de-covariates true|false|phase,pct_counts_mt,log_n_counts`：PyDESeq2 设计矩阵协变量（Wilcoxon 不建模，仅记录）
+- `--de-prefer-pseudobulk true|false`：默认 true，无真重复也优先 sample_id/伪重复 pseudobulk
+- `--pseudo-replicates N`：单样本技术伪重复（N≥2）探索性 PyDESeq2；不能替代生物学重复
 
 对已有 h5ad 只补注释：
 
@@ -215,6 +219,7 @@ results/sample1/
   figures/            QC、guide 组成、UMAP（可视化标注）、E-distance、火山图、guide_qc
   tables/
     composition_audit.csv   各过滤阶段细胞组成
+    qc_filter_by_guide.csv  各 guide/gene_target 被 QC 移除比例（含 cytotoxicity 标记）
     edistance.csv           主路径（Mixscape 成功时为 post-Mixscape）
     pre_mixscape/ / post_mixscape/   Mixscape 前后 E-distance（若跑 Mixscape）
     de_*.csv、etest.csv、perturbation_clusters.csv、
@@ -242,7 +247,7 @@ Guide QC 三层证据（写在 `tables/guide_qc.csv` 与 `report.json` → `guid
 | Guide 归属 | 沿用 DRAGEN GMM（Illumina 对该试剂盒的推荐） | 默认不再重跑；可选 `--guide-reassign compare`；CatchR/Cell Ranger FB 未安装 |
 | 无效扰动细胞 | Mixscape（Papalexi 2021；pertpy 实现）；KO+NT 为默认推断子集 | 把所有 targeting 细胞都当 KO |
 | 效应大小 | E-distance / E-test（Peidli 2024）；嵌入可用 `X_pert` | 只看 UMAP 是否分开 |
-| 差异表达 | 有重复：pseudobulk + PyDESeq2（可含细胞周期/%MT/log UMI 协变量） | 把细胞当独立样本出组间 p 值；Wilcoxon 不建模协变量 |
+| 差异表达 | 优先 pseudobulk + PyDESeq2（真重复→inferential；否则 exploratory）；Wilcoxon 仅作回退 | 把细胞当独立样本静默出组间 p 值 / 当人口 FDR |
 | 未见扰动预测 / 深度嵌入 | 不作为默认步骤；SCEPTRE/MIMOSCA/PerturbNet 仅文档 | scGen/基础模型在独立基准上常不优于简单基线 |
 
 PerturBase 适合查公开 Perturb-seq 数据集与可视化对照，不是本仓库的计算内核。

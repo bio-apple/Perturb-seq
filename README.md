@@ -28,15 +28,15 @@ Field definitions: [DRAGEN v4.5 CRISPR mode](https://help.dragen.illumina.com/dr
 DRAGEN MEX + guide assignment
   → split Gene Expression / CRISPR Direct Capture
   → annotate guide_id, gene_target, NT vs perturbed
-  → QC (n_counts / n_genes / %MT, MAD)                    [filtering]
+  → QC (n_counts / n_genes / %MT, MAD; prefer --perturbation-aware-qc)  [filtering]
   → default: keep num_features == 1 singlets               [filtering]
   → normalize / log1p (keep layers['counts']) + HVG/PCA/Leiden  [descriptive]
   → UMAP                                                   [visualization only]
   → cell annotation: cell cycle + state scores             [descriptive]
   → Mixscape: KO/NP; optional KO+NT subset                 [filtering/classification]
   → E-distance / E-test (pre/post Mixscape)                [inferential]
-  → DE: replicates → pseudobulk + PyDESeq2; else exploratory Wilcoxon
-  → perturbation-mean PCA silhouette clustering
+  → DE: prefer pseudobulk + PyDESeq2 (bio reps → inferential; else exploratory); Wilcoxon only if <2 pseudobulk units
+  → perturbation space (`--perturbation-space`: pca_silhouette default | kmeans | lr_classifier)
   → Guide QC: assignment / target effect / cytotoxicity consistency
 ```
 
@@ -75,7 +75,7 @@ This pipeline was end-to-end tested with **pertpy==1.4.0** and **scanpy==1.12.4*
 | Input validation, guide annotate, QC/MAD, singlet | ✅ | ✅ |
 | Normalize / HVG / PCA / Leiden / UMAP, cell annotation | ✅ | ✅ |
 | Guide QC | ✅ | ✅ |
-| Exploratory Wilcoxon DE (no replicates) | ✅ | ✅ |
+| Exploratory DE (Wilcoxon fallback / no-bio-rep pseudobulk) | ✅ (PyDESeq2 needs pertpy) | ✅ Wilcoxon only |
 | Mixscape / E-distance / E-test / PyDESeq2 / pert. clusters | ✅ | ❌ → explicit `skipped` + `reason` in `report.json` |
 
 ## Run
@@ -107,7 +107,7 @@ python -m perturbseq run \
 
 Real data: `--input-dir data/raw --output-dir results/sample1 --sample-id sample1 --control NT`.
 
-Useful flags: `--config`, `--resume`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--replicate-col`, `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode auto|skip|force|subset`, `--mixscape-targets` / `--mixscape-top-n` (subset Mixscape), `--perturbation-type KO|KD` (KD/CRISPRi: Mixscape assumptions weaker — see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)), `--guide-reassign off|compare|apply_max|apply_gmm` (optional tertiary vs DRAGEN), `--de-covariates true|false|phase,pct_counts_mt,log_n_counts` (PyDESeq2 design; Wilcoxon ignores).
+Useful flags: `--config`, `--resume`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--perturbation-aware-qc` (fit MAD on NT only — preferred for Perturb-seq), `--replicate-col`, `--de-prefer-pseudobulk true|false`, `--pseudo-replicates N` (exploratory single-sample PyDESeq2), `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode auto|skip|force|subset`, `--mixscape-targets` / `--mixscape-top-n` (subset Mixscape), `--perturbation-type KO|KD` (KD/CRISPRi: Mixscape assumptions weaker — see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)), `--perturbation-space pca_silhouette|kmeans|lr_classifier` (default pca_silhouette), `--guide-reassign off|compare|apply_max|apply_gmm` (optional tertiary vs DRAGEN), `--de-covariates true|false|phase,pct_counts_mt,log_n_counts` (PyDESeq2 design; Wilcoxon ignores).
 
 Standalone: `annotate`, `guide-qc`, `report` (rebuild HTML/JSON without re-running analysis).
 
@@ -122,6 +122,7 @@ results/sample1/
   figures/
   tables/
     composition_audit.csv
+    qc_filter_by_guide.csv   # per-guide / gene_target QC removal (+ cytotoxicity flags)
     edistance.csv, etest.csv, distances.csv, optional distance_mmd.csv, de_*.csv
     guide_qc.csv, gene_guide_consistency.csv, qc_warnings.csv
     gene_guide_weighted.csv   # when guide_merge ≠ none
@@ -143,10 +144,11 @@ Full discussion + citations: **[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CA
 | Pitfall | Short why |
 | --- | --- |
 | Multi-guide inconsistency | Same gene, discordant guide effects — do not pool into one “gene KO” without review (`gene_guide_consistency.csv`) |
+| Low on-target / multi-guide fail | ≥2 adequate guides fail expected target log2FC (`potential_low_efficiency`) — do **not** conclude “no phenotype” |
 | Mixscape labels many NP | Transcriptomic resemblance to NT ≠ proven failed edit |
-| No FDR claims without replicates | Cells ≠ biological replicates; Wilcoxon is exploratory |
+| No FDR claims without replicates | Cells ≠ biological replicates; no-bio-rep DE (Wilcoxon or exploratory PyDESeq2) is exploratory only (Squair 2021) |
 | UMAP/Leiden as “effect” | Global structure is not perturbation evidence |
-| Filtering changes hits | QC / singlet / Mixscape KO drop cells — check `composition_audit.csv` |
+| Filtering changes hits | QC / singlet / Mixscape KO drop cells — check `composition_audit.csv`; prefer `--perturbation-aware-qc`; see `qc_filter_by_guide.csv` |
 | Inherited DRAGEN assignment | This pipeline does not re-call guides by default |
 
 ## Method choices (why these)
@@ -156,7 +158,7 @@ Full discussion + citations: **[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CA
 | Guide assignment | DRAGEN GMM | Re-calling (e.g. crispat) |
 | Non-perturbed cells | Mixscape (Papalexi 2021; stronger for KO than KD/CRISPRi) | Treat all targeting cells as KO |
 | Effect size | E-distance / E-test (Peidli 2024) | UMAP separation alone |
-| DE | Pseudobulk + PyDESeq2 when replicates exist | Cell-level p-values as population FDR |
+| DE | Pseudobulk + PyDESeq2 first (bio reps → inferential; else exploratory); Wilcoxon only as fallback | Silent cell-level Wilcoxon as “the” DE / population FDR |
 | Unseen perturbation prediction | Not a default step | scGen / foundation models as primary |
 
 ## Project layout

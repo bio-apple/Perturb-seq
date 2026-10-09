@@ -40,14 +40,19 @@ def stage_statistical_inference(
     """Stage 3B: pseudobulk / DE / FDR (conceptually parallel to 3A)."""
     print("[3b/5] Statistical inference (pseudobulk DE / design checks)", flush=True)
     de_covs = resolve_de_covariates(rna, getattr(config, "de_covariates", True))
+    de_prefer_pseudobulk = bool(getattr(config, "de_prefer_pseudobulk", True))
+    n_pseudo_replicates = getattr(config, "n_pseudo_replicates", None)
     design = check_experimental_design(
         rna,
         replicate_col=config.replicate_col,
         groupby="gene_target",
         covariates=de_covs,
+        n_pseudo_replicates=n_pseudo_replicates,
+        de_prefer_pseudobulk=de_prefer_pseudobulk,
     )
     report["experimental_design"] = design
-    if design.get("replicate_aware") and not config.skip_de:
+    needs_deseq2 = design.get("recommended_method", "").startswith("pydeseq2") and not config.skip_de
+    if needs_deseq2:
         de_warn = warn_if_pertpy_missing(need_mixscape=False, need_distance=False, need_deseq2=True)
         if de_warn:
             warnings.warn(de_warn, UserWarning, stacklevel=2)
@@ -116,6 +121,9 @@ def stage_statistical_inference(
             min_cells=config.min_cells_per_pert,
             n_jobs=config.n_jobs,
             covariates=de_covs,
+            n_pseudo_replicates=n_pseudo_replicates,
+            de_prefer_pseudobulk=de_prefer_pseudobulk,
+            random_state=config.random_state,
         )
         if de_errors:
             report.setdefault("de_errors", {}).update(de_errors)

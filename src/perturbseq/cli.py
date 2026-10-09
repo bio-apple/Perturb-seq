@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--replicate-col", default=None)
     run.add_argument("--keep-multiplets", action="store_true")
     run.add_argument("--n-mads", type=float, default=None)
+    run.add_argument(
+        "--perturbation-aware-qc",
+        action="store_true",
+        help=(
+            "Fit MAD QC thresholds on NT/control cells only, then apply to all cells. "
+            "Preferred for Perturb-seq so strong phenotypes are not used to set cutoffs that drop them."
+        ),
+    )
     run.add_argument("--n-perms", type=int, default=None)
     run.add_argument(
         "--min-cells-per-pert",
@@ -97,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--de-top-n", type=int, default=None)
     run.add_argument(
+        "--report-plot-top-n",
+        type=int,
+        default=None,
+        help="Max genes for report guide-consistency / target-validation PNGs (default 15)",
+    )
+    run.add_argument(
         "--n-jobs",
         type=int,
         default=None,
@@ -106,6 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--skip-distance", action="store_true")
     run.add_argument("--skip-de", action="store_true")
     run.add_argument("--perturbation-type", default=None, help="Mixscape label, e.g. KO / KD / perturbation")
+    run.add_argument(
+        "--perturbation-space",
+        default=None,
+        choices=["pca_silhouette", "kmeans", "lr_classifier"],
+        help=(
+            "Perturbation-space construction: pca_silhouette (default; mean PCA + Leiden), "
+            "kmeans (mean-PCA KMeans), lr_classifier (LR-coefficient embedding)"
+        ),
+    )
     run.add_argument(
         "--control-patterns",
         default=None,
@@ -122,6 +145,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=list(GUIDE_MERGE_MODES),
         help="Multi-guide weighted summary: none (default, flag only) | equal | umi | confidence | umi_confidence",
+    )
+    run.add_argument(
+        "--on-target-lfc-cutoff",
+        type=float,
+        default=None,
+        help="Guide QC on-target |log2FC| cutoff vs control (default 0.25; KO/KD/i ↓, CRISPRa ↑)",
+    )
+    run.add_argument(
+        "--on-target-min-fail-guides",
+        type=int,
+        default=None,
+        help="≥N adequate guides failing on-target → potential_low_efficiency (default 2)",
     )
     run.add_argument(
         "--guide-reassign",
@@ -144,6 +179,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "DE covariates: 'true' (default candidates: phase,pct_counts_mt,log_n_counts), "
             "'false' to disable, or comma-separated obs columns for PyDESeq2 design"
+        ),
+    )
+    run.add_argument(
+        "--de-prefer-pseudobulk",
+        default=None,
+        help=(
+            "Prefer sample_id(+perturbation) pseudobulk + PyDESeq2 even without bio reps "
+            "(default true). 'false' forces cell-level Wilcoxon fallback."
+        ),
+    )
+    run.add_argument(
+        "--pseudo-replicates",
+        type=int,
+        default=None,
+        dest="n_pseudo_replicates",
+        help=(
+            "Split cells into N≥2 technical pseudo-replicates for exploratory single-sample "
+            "PyDESeq2 (not biological replicates; Squair et al. 2021)"
         ),
     )
     run.add_argument(
@@ -191,6 +244,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional cap on detailed HTML sections (DE targets always included)",
     )
+    report_cmd.add_argument(
+        "--h5ad",
+        type=Path,
+        default=None,
+        help="Optional expression h5ad for guide-consistency / target-validation plots "
+        "(auto-discovers *.tertiary.h5ad in output-dir when omitted)",
+    )
+    report_cmd.add_argument(
+        "--report-plot-top-n",
+        type=int,
+        default=None,
+        help="Max genes for guide-consistency / target-validation PNGs (default: from config / 15)",
+    )
 
     guide_qc = sub.add_parser("guide-qc", help="Guide-level QC / efficacy on an existing tertiary h5ad")
     guide_qc.add_argument("--h5ad", type=Path, required=True)
@@ -204,6 +270,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         choices=list(GUIDE_MERGE_MODES),
         help="Weighted gene-level guide summary (default none = flag inconsistency only)",
+    )
+    guide_qc.add_argument(
+        "--perturbation-type",
+        default="KO",
+        help="Perturbation modality for on-target direction (KO/KD/CRISPRi → ↓, CRISPRa → ↑)",
+    )
+    guide_qc.add_argument(
+        "--on-target-lfc-cutoff",
+        type=float,
+        default=0.25,
+        help="|log2FC| vs control required for on_target_pass (default 0.25)",
+    )
+    guide_qc.add_argument(
+        "--on-target-min-fail-guides",
+        type=int,
+        default=2,
+        help="≥N adequate guides failing on-target → gene potential_low_efficiency (default 2)",
     )
     return parser
 
@@ -223,6 +306,8 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["replicate_col"] = args.replicate_col
     if args.n_mads is not None:
         data["n_mads"] = args.n_mads
+    if getattr(args, "perturbation_aware_qc", False):
+        data["perturbation_aware_qc"] = True
     if args.n_perms is not None:
         data["n_perms"] = args.n_perms
     if getattr(args, "min_cells_per_pert", None) is not None:
@@ -247,14 +332,22 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["mixscape_top_n"] = args.mixscape_top_n
     if args.de_top_n is not None:
         data["de_top_n"] = args.de_top_n
+    if getattr(args, "report_plot_top_n", None) is not None:
+        data["report_plot_top_n"] = args.report_plot_top_n
     if getattr(args, "n_jobs", None) is not None:
         data["n_jobs"] = args.n_jobs
     if args.perturbation_type is not None:
         data["perturbation_type"] = args.perturbation_type
+    if getattr(args, "perturbation_space", None) is not None:
+        data["perturbation_space"] = args.perturbation_space
     if args.random_state is not None:
         data["random_state"] = args.random_state
     if getattr(args, "guide_merge", None) is not None:
         data["guide_merge"] = args.guide_merge
+    if getattr(args, "on_target_lfc_cutoff", None) is not None:
+        data["on_target_lfc_cutoff"] = args.on_target_lfc_cutoff
+    if getattr(args, "on_target_min_fail_guides", None) is not None:
+        data["on_target_min_fail_guides"] = args.on_target_min_fail_guides
     if getattr(args, "guide_reassign", None) is not None:
         data["guide_reassign"] = args.guide_reassign
     if getattr(args, "guide_reassign_min_umi", None) is not None:
@@ -268,6 +361,11 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
             data["de_covariates"] = False
         else:
             data["de_covariates"] = tuple(p.strip() for p in raw.split(",") if p.strip())
+    if getattr(args, "de_prefer_pseudobulk", None) is not None:
+        raw = str(args.de_prefer_pseudobulk).strip().lower()
+        data["de_prefer_pseudobulk"] = raw in {"true", "yes", "1"}
+    if getattr(args, "n_pseudo_replicates", None) is not None:
+        data["n_pseudo_replicates"] = args.n_pseudo_replicates
     if args.control_patterns is not None:
         data["control_patterns"] = tuple(
             p.strip() for p in args.control_patterns.split(",") if p.strip()
@@ -351,6 +449,9 @@ def _run_guide_qc(
     min_median_umi: float,
     min_detection_rate: float,
     guide_merge: str = "none",
+    perturbation_type: str = "KO",
+    on_target_lfc_cutoff: float = 0.25,
+    on_target_min_fail_guides: int = 2,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     figures = output_dir / "figures"
@@ -359,7 +460,11 @@ def _run_guide_qc(
     tables.mkdir(exist_ok=True)
     print(f"Loading {h5ad}", flush=True)
     adata = read_h5ad(h5ad)
-    print(f"Guide QC on {adata.n_obs} cells (guide_merge={guide_merge})", flush=True)
+    print(
+        f"Guide QC on {adata.n_obs} cells "
+        f"(guide_merge={guide_merge}, perturbation_type={perturbation_type})",
+        flush=True,
+    )
     guide_df, consistency_df, warnings_df, summary = run_guide_qc(
         adata,
         control=control,
@@ -367,6 +472,9 @@ def _run_guide_qc(
         min_median_umi=min_median_umi,
         min_detection_rate=min_detection_rate,
         guide_merge=guide_merge,
+        perturbation_type=perturbation_type,
+        on_target_lfc_cutoff=on_target_lfc_cutoff,
+        on_target_min_fail_guides=on_target_min_fail_guides,
     )
     write_guide_qc_tables(guide_df, consistency_df, warnings_df, tables)
     plot_guide_qc(guide_df, consistency_df, figures)
@@ -419,6 +527,9 @@ def main(argv: list[str] | None = None) -> int:
             args.min_median_umi,
             args.min_detection_rate,
             args.guide_merge,
+            args.perturbation_type,
+            args.on_target_lfc_cutoff,
+            args.on_target_min_fail_guides,
         )
     if args.command == "report":
         report = write_analysis_report(
@@ -426,10 +537,17 @@ def main(argv: list[str] | None = None) -> int:
             control=args.control,
             min_cells=args.min_cells,
             html_detail_limit=args.html_detail_limit,
+            h5ad=args.h5ad,
+            report_plot_top_n=args.report_plot_top_n,
         )
         n = report.get("perturbation_summary", {}).get("n_perturbations", 0)
         print(f"Wrote {args.output_dir / 'report.html'} ({n} perturbations)")
         print(f"Updated {args.output_dir / 'report.json'} → perturbations")
+        plots = report.get("report_plots") or {}
+        n_fig = len(plots.get("generated") or [])
+        n_skip = len(plots.get("skipped_plots") or [])
+        if n_fig or n_skip:
+            print(f"Report plots: {n_fig} generated, {n_skip} skipped", flush=True)
         return 0
     try:
         config, config_path = build_run_config(args)

@@ -33,6 +33,7 @@ from perturbseq.perturbation import (
     DEFAULT_ETEST_POWER_MIN_CELLS,
     DEFAULT_N_BOOTSTRAP,
     DEFAULT_SECONDARY_DISTANCE_METRICS,
+    PERTURBATION_SPACE_METHODS,
 )
 from perturbseq.report import init_report
 from perturbseq.repro import (
@@ -67,6 +68,9 @@ class PipelineConfig:
     sample_id: str = "sample1"
     singlet_only: bool = True
     n_mads: float = 5.0
+    # False = global MAD (default, backward-compatible). True = fit MAD on NT/control
+    # only then apply to all cells — preferred for Perturb-seq (avoids dropping strong phenotypes).
+    perturbation_aware_qc: bool = False
     min_cells: int = 3
     n_top_genes: int = 2000
     n_pcs: int = 30
@@ -91,19 +95,33 @@ class PipelineConfig:
     mixscape_targets: tuple[str, ...] = ()
     mixscape_top_n: int | None = None
     de_top_n: int = 10
+    # Cap biologist report plots (guide consistency + target validation) for speed.
+    report_plot_top_n: int = 15
     n_jobs: int = 1
     perturbation_type: str = "KO"
+    # Perturbation-space construction: pca_silhouette (default) | kmeans | lr_classifier
+    perturbation_space: str = "pca_silhouette"
     random_state: int = 0
     control_patterns: tuple[str, ...] = DEFAULT_CONTROL_PATTERNS
     # none = flag inconsistency only (default); equal|umi|confidence|umi_confidence
     # add weighted gene-level summaries without dropping per-guide rows.
     guide_merge: str = "none"
+    # On-target efficiency proxy (guide QC): |log2FC| vs control in expected direction.
+    on_target_lfc_cutoff: float = 0.25
+    # Gene flagged potential_low_efficiency when ≥ this many adequate guides fail on-target.
+    on_target_min_fail_guides: int = 2
     # Optional tertiary guide re-call vs DRAGEN: off | compare | apply_max | apply_gmm
     guide_reassign: str = "off"
     guide_reassign_min_umi: float = 1.0
     # Include cell-level covariates in PyDESeq2 design when available (Wilcoxon: documented ignore).
     # True = default candidates (phase, pct_counts_mt, log_n_counts); False/[] = off; list = explicit.
     de_covariates: bool | tuple[str, ...] = True
+    # Prefer sample_id(+perturbation) sum pseudobulk + PyDESeq2 even without bio reps.
+    # Wilcoxon remains a loud exploratory fallback when <2 pseudobulk units exist.
+    de_prefer_pseudobulk: bool = True
+    # Optional technical pseudo-replicates (N≥2) for single-sample exploratory PyDESeq2.
+    # None/0 = off. Not a substitute for biological replicates.
+    n_pseudo_replicates: int | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -126,6 +144,7 @@ def dry_run_plan(config: PipelineConfig) -> dict[str, Any]:
                 notes.append("skip mixscape")
             if config.skip_distance:
                 notes.append("skip edistance")
+            notes.append(f"perturbation_space={config.perturbation_space}")
         if name == "3b_statistical_inference" and config.skip_de:
             notes.append("skip de")
         stages.append({"stage": name, "action": "run", "notes": notes})
@@ -168,7 +187,20 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
                     kwargs[key] = tuple(p.strip() for p in value.split(",") if p.strip())
             else:
                 kwargs[key] = tuple(str(p).strip() for p in value if str(p).strip())
+        elif key == "de_prefer_pseudobulk" and value is not None:
+            if isinstance(value, bool):
+                kwargs[key] = value
+            else:
+                kwargs[key] = str(value).strip().lower() in {"true", "yes", "1"}
+        elif key == "n_pseudo_replicates":
+            if value is None or value == "" or value is False:
+                kwargs[key] = None
+            else:
+                n = int(value)
+                kwargs[key] = n if n >= 2 else None
         elif key == "mixscape_mode" and value is not None:
+            kwargs[key] = str(value).strip().lower()
+        elif key == "perturbation_space" and value is not None:
             kwargs[key] = str(value).strip().lower()
         elif key == "guide_reassign" and value is not None:
             # YAML 1.1 treats bare `off`/`on` as bool; coerce to mode strings.
@@ -200,6 +232,13 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
         if mode not in allowed:
             raise ValueError(f"mixscape_mode must be one of {sorted(allowed)}, got {kwargs['mixscape_mode']!r}")
         kwargs["mixscape_mode"] = mode
+    if "perturbation_space" in kwargs and kwargs["perturbation_space"] is not None:
+        space = str(kwargs["perturbation_space"]).lower()
+        if space not in PERTURBATION_SPACE_METHODS:
+            raise ValueError(
+                f"perturbation_space must be one of {PERTURBATION_SPACE_METHODS}, got {kwargs['perturbation_space']!r}"
+            )
+        kwargs["perturbation_space"] = space
     if "guide_merge" in kwargs and kwargs["guide_merge"] is not None:
         from perturbseq.guide_qc import GUIDE_MERGE_MODES
 
@@ -227,6 +266,7 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             **common,
             "singlet_only": config.singlet_only,
             "n_mads": config.n_mads,
+            "perturbation_aware_qc": config.perturbation_aware_qc,
             "min_cells": config.min_cells,
             "n_top_genes": config.n_top_genes,
             "n_pcs": config.n_pcs,
@@ -256,6 +296,9 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "n_pcs": config.n_pcs,
             "n_jobs": config.n_jobs,
             "guide_merge": config.guide_merge,
+            "on_target_lfc_cutoff": config.on_target_lfc_cutoff,
+            "on_target_min_fail_guides": config.on_target_min_fail_guides,
+            "perturbation_space": config.perturbation_space,
         },
         "3b_statistical_inference": {
             **common,
@@ -267,11 +310,17 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "de_covariates": config.de_covariates
             if isinstance(config.de_covariates, bool)
             else list(config.de_covariates),
+            "de_prefer_pseudobulk": config.de_prefer_pseudobulk,
+            "n_pseudo_replicates": config.n_pseudo_replicates,
             "min_cells_per_pert": config.min_cells_per_pert,
             "n_jobs": config.n_jobs,
         },
         "4_robustness": {**common},
-        "5_report": {**common, "sample_id": config.sample_id},
+        "5_report": {
+            **common,
+            "sample_id": config.sample_id,
+            "report_plot_top_n": config.report_plot_top_n,
+        },
     }
     return mapping[stage]
 

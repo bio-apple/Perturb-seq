@@ -4,7 +4,15 @@ Limitations that apply when interpreting this pipeline’s outputs. Short “常
 
 ## Cells are not biological replicates
 
-Treating single cells as independent samples for DE / testing **inflates** significance and confuses technical with biological variation. Prefer **pseudobulk across true replicates** when `replicate_col` has ≥2 levels (PyDESeq2 path). Without replicates, cell-level Wilcoxon results are **exploratory only** — not between-condition inferential claims.
+Treating single cells as independent samples for DE / testing **inflates** significance and confuses technical with biological variation (Squair et al. 2021). Default DE path prefers **pseudobulk + PyDESeq2**:
+
+| Design | Method label | `evidence_level` |
+| --- | --- | --- |
+| `replicate_col` with ≥2 true bio-rep levels | `pydeseq2_pseudobulk` | `inferential` |
+| No bio reps, but ≥2 `sample_id` levels (or `--pseudo-replicates N`) | `pydeseq2_pseudobulk_no_bio_reps` | `exploratory` |
+| Single sample and no pseudo-replicates | `wilcoxon_cell_level_exploratory` (loud fallback) | `exploratory` |
+
+Pseudobulk without true biological replicates (including technical pseudo-replicates) is **still not** a substitute for replicate-aware inference — shared dispersion can improve ranking, but population FDR claims require real bio reps.
 
 - Squair et al., *Nature Communications* (2021): confronting false discoveries in single-cell differential expression — [doi:10.1038/s41467-021-25960-2](https://doi.org/10.1038/s41467-021-25960-2)
 
@@ -35,9 +43,9 @@ E-distance quantifies multivariate shift (typically in PCA space) vs control; E-
 - Peidli et al., *Nature Methods* (2024): scPerturb / E-distance — [doi:10.1038/s41592-024-02296-5](https://doi.org/10.1038/s41592-024-02296-5)
 - pertpy Distance / DistanceTest: Heumos et al. 2026 (above)
 
-## Wilcoxon without replicates is exploratory
+## DE without true biological replicates stays exploratory
 
-If there is no usable biological replicate column, the pipeline may still emit Wilcoxon DE tables. Use them for **ranking / hypothesis generation**, not for FDR-style claims about population effects. With replicates → pseudobulk + PyDESeq2 (Squair 2021).
+Default (`de_prefer_pseudobulk: true`): aggregate by `sample_id` + perturbation and run exploratory PyDESeq2 when ≥2 samples exist, or when the user sets `n_pseudo_replicates` / `--pseudo-replicates N` (technical splits — documented risk). Only if fewer than two pseudobulk units can be formed does the pipeline fall back to cell-level Wilcoxon, with a loud `evidence_level=exploratory` warning. Use all no-bio-rep DE for **ranking / hypothesis generation**, not population FDR. True multi-rep `replicate_col` → `evidence_level=inferential` (Squair 2021).
 
 ## UMAP / Leiden are not perturbation evidence
 
@@ -45,13 +53,29 @@ Global HVG → PCA → neighbors → Leiden / UMAP describe **dataset structure*
 
 Aligned with [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/) and [ANALYSIS_DEPENDENCIES.md](ANALYSIS_DEPENDENCIES.md).
 
+## Perturbation-space method choice is descriptive
+
+`--perturbation-space` / YAML `perturbation_space` selects how perturbations are embedded and clustered (`pca_silhouette` default | `kmeans` | `lr_classifier`). All paths write descriptive `perturbation_clusters.csv` (+ optional `perturbation_space_embeddings.csv`); they are **pathway-like groupings**, not proof of shared mechanism. Method + backend are recorded in `report.json` → `perturbation_clusters` / `matrix_provenance.perturbation_clusters`.
+
+| Method | Embedding | Typical use |
+| --- | --- | --- |
+| `pca_silhouette` | Mean `X_pca` per target + Leiden (pertpy PseudobulkSpace when available) | Global effect comparison (default) |
+| `kmeans` | Mean `X_pca` → sklearn KMeans (silhouette-selected *k*) | Response-pattern clusters (pertpy KMeansSpace-like intent; local) |
+| `lr_classifier` | Logistic-regression coefficients (pertpy `LRClassifierSpace` when available, else local) | Marker-like / interpretable similarity space |
+
+Do not treat cluster co-membership alone as genetic interaction evidence; use E-distance / DE / multi-guide consistency for claims.
+
 ## Filtering changes composition
 
 QC (MAD), singlet filter (`num_features == 1`), and Mixscape KO+NT subset all **drop cells** and can deplete rare guides or alter state mix. Compare stages in `tables/composition_audit.csv`. Preprocessing-sensitive hits should be treated cautiously.
 
+**Perturbation-aware QC (preferred for Perturb-seq):** global MAD on `n_counts` / `n_genes` / `%MT` can systematically remove the strongest phenotypes (essential-gene KO, apoptosis, arrest) because those cells define the outlier tails — a false-negative trap. Prefer `--perturbation-aware-qc` / `perturbation_aware_qc: true`: fit MAD thresholds on **NT/control cells only**, then apply to all cells. Per-guide / gene_target QC removal fractions are written to `tables/qc_filter_by_guide.csv`; guides with ≥90% cells removed get a `cytotoxicity_qc_depletion` warning in `guide_qc.csv` / `qc_warnings.csv` (not a silent discard).
+
 ## Guide inconsistency vs biology
 
 `gene_guide_consistency.csv` / guide QC flag same-gene guides with discordant effect directions. Do **not** pool inconsistent guides into one “gene KO” conclusion without inspecting assignment quality, UMI, cytotoxicity proxies, and possible off-target / incomplete edits. Inconsistency can be technical **or** biological; the tables separate “weak assignment” from “assigned but no target effect” via `interpretation` / warnings — still requires human review.
+
+**On-target efficiency proxy.** Per-guide `on_target_score` / `on_target_pass` check that target-gene log2FC moves in the expected direction for `perturbation_type` (KO/KD/CRISPRi → downregulation; CRISPRa → upregulation). If ≥ `on_target_min_fail_guides` (default 2) adequate guides fail this proxy, gene-level `potential_low_efficiency` / `interpretation=potential_low_efficiency_guides` marks **potential low-efficiency guides** — do **not** conclude “no phenotype” for the gene.
 
 Optional `guide_merge` (`none` default | `equal` | `umi` | `confidence` | `umi_confidence`) adds a **descriptive** weighted summary (weighted mean target log2FC + weight-voted direction) for multi-guide genes. It does **not** drop per-guide rows, clear `guides_consistent=False`, or replace gene-level KO calls. Treat weighted columns as a review aid, not a silent merge of discordant guides.
 
@@ -66,7 +90,7 @@ Optional `--guide-reassign compare|apply_max|apply_gmm` compares DRAGEN calls to
 
 ## DE covariates and Wilcoxon limits
 
-When `de_covariates: true` (default), available obs columns among `phase`, `pct_counts_mt`, and `log_n_counts` (from `n_counts`) are included in the **PyDESeq2** design formula with replicates. **Wilcoxon** (no replicates) cannot regress covariates via `scanpy.tl.rank_genes_groups`; requested covariates are recorded in `report.json` / table notes as ignored — still exploratory only.
+When `de_covariates: true` (default), available obs columns among `phase`, `pct_counts_mt`, and `log_n_counts` (from `n_counts`) are included in the **PyDESeq2** design formula. **Wilcoxon** fallback cannot regress covariates via `scanpy.tl.rank_genes_groups`; requested covariates are recorded in `report.json` / table notes as ignored — still exploratory only.
 
 ## Advanced perturbation methods (not bundled)
 
@@ -85,5 +109,5 @@ Prefer Mixscape `X_pert` + E-distance here; treat SCEPTRE/MIMOSCA/PerturbNet as 
 | --- | --- | --- |
 | Guide worked / cell perturbed | Mixscape KO + target knockdown / multi-guide consistency | UMAP blob alone |
 | Perturbation shifts transcriptome | E-distance + E-test (tagged embedding) | Leiden cluster label |
-| Gene-level DE between conditions | Pseudobulk + replicates | Cell-level Wilcoxon p-values alone |
+| Gene-level DE between conditions | Pseudobulk + true bio replicates | Cell-level Wilcoxon / no-bio-rep pseudobulk as population FDR |
 | Gene is validated KO | Orthogonal assay / consistent guides | Single NP-rich guide merged with KO cells |

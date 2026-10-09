@@ -13,11 +13,16 @@ DEFAULT_MIN_CELLS = 10
 DEFAULT_MIN_MEDIAN_UMI = 5.0
 DEFAULT_MIN_DETECTION_RATE = 0.5
 DEFAULT_LFC_NOISE = 0.25
+DEFAULT_ON_TARGET_LFC_CUTOFF = 0.25
+DEFAULT_ON_TARGET_MIN_FAIL_GUIDES = 2
+DEFAULT_PERTURBATION_TYPE = "KO"
 # none = flag only (default, conservative); other modes add weighted summaries
 # without discarding per-guide rows or clearing inconsistency flags.
 GUIDE_MERGE_MODES = ("none", "equal", "umi", "confidence", "umi_confidence")
 DEFAULT_GUIDE_MERGE = "none"
 _CONFIDENCE_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
+# Tokens whose expected on-target mRNA change is upregulation.
+_ACTIVATION_TYPES = frozenset({"A", "CRISPRA", "ACTIVATION", "OE", "OVEREXPRESSION"})
 
 
 def _to_1d(matrix) -> np.ndarray:
@@ -61,6 +66,48 @@ def _effect_direction(log2fc: float, noise: float = DEFAULT_LFC_NOISE) -> str:
     return "none"
 
 
+def expected_on_target_direction(perturbation_type: str = DEFAULT_PERTURBATION_TYPE) -> str:
+    """Expected target-gene mRNA direction for this perturbation modality."""
+    token = str(perturbation_type or DEFAULT_PERTURBATION_TYPE).strip().upper()
+    if token in _ACTIVATION_TYPES:
+        return "up"
+    return "down"
+
+
+def on_target_effect_score(
+    log2fc: float,
+    perturbation_type: str = DEFAULT_PERTURBATION_TYPE,
+) -> float:
+    """Higher = stronger on-target change in the expected direction (KO/KD/i ↓, CRISPRa ↑)."""
+    if not np.isfinite(log2fc):
+        return float("nan")
+    expected = expected_on_target_direction(perturbation_type)
+    return float(-log2fc if expected == "down" else log2fc)
+
+
+def on_target_pass(
+    log2fc: float,
+    perturbation_type: str = DEFAULT_PERTURBATION_TYPE,
+    lfc_cutoff: float = DEFAULT_ON_TARGET_LFC_CUTOFF,
+) -> bool:
+    """Pragmatic on-target check: signed log2FC vs control crosses cutoff in expected direction."""
+    if not np.isfinite(log2fc) or not np.isfinite(lfc_cutoff):
+        return False
+    expected = expected_on_target_direction(perturbation_type)
+    if expected == "down":
+        return bool(log2fc <= -abs(lfc_cutoff))
+    return bool(log2fc >= abs(lfc_cutoff))
+
+
+def _guide_assignment_adequate(row: pd.Series) -> bool:
+    n_ok = int(row["n_cells"]) >= int(row["min_cells_threshold"])
+    umi = float(row["median_guide_umi"])
+    umi_ok = (not np.isfinite(umi)) or umi >= float(row["min_median_umi_threshold"])
+    det = float(row["detection_rate"])
+    det_ok = (not np.isfinite(det)) or det >= float(row["min_detection_rate_threshold"])
+    return bool(n_ok and umi_ok and det_ok)
+
+
 def _interpretation(
     *,
     n_cells: int,
@@ -73,25 +120,53 @@ def _interpretation(
     direction: str,
     gene_consistent: bool | None,
     n_guides_for_gene: int,
+    low_efficiency_guide: bool = False,
 ) -> str:
-    """Distinguish unclear biology from technical failure modes."""
+    """Distinguish low-efficiency / technical failure from unclear biology."""
     if n_cells < min_cells:
         return "too_few_cells"
     if median_umi < min_umi:
         return "low_guide_umi"
     if detection_rate < min_detection:
         return "low_detection"
-    if gene_consistent is False and n_guides_for_gene >= 2:
-        return "inconsistent_guides"
-    if target_in_matrix and direction == "none":
-        return "no_target_effect_with_adequate_guides"
+    # Prefer low-efficiency over "no phenotype" when this guide fails on-target.
+    if low_efficiency_guide:
+        return "potential_low_efficiency_guide"
+    # This guide's own on-target signal beats gene-level inconsistency labeling.
     if target_in_matrix and direction == "down":
         return "target_knockdown_detected"
     if target_in_matrix and direction == "up":
         return "target_upregulated"
+    if gene_consistent is False and n_guides_for_gene >= 2:
+        return "inconsistent_guides"
+    if target_in_matrix and direction == "none":
+        return "no_target_effect_with_adequate_guides"
     if not target_in_matrix:
         return "target_not_in_expression_matrix"
     return "adequate_assignment_unclear_effect"
+
+
+def _gene_on_target_interpretation(
+    *,
+    potential_low_efficiency: bool,
+    guides_consistent: bool | None,
+    n_on_target_pass: int,
+    n_adequate_guides: int,
+    majority_direction: str,
+    expected_direction: str,
+) -> str:
+    """Gene-level label: low-efficiency ≠ no phenotype."""
+    if potential_low_efficiency:
+        return "potential_low_efficiency_guides"
+    if guides_consistent is False:
+        return "inconsistent_guides"
+    if n_on_target_pass >= 1 and majority_direction == expected_direction:
+        return "on_target_effect_detected"
+    if n_adequate_guides >= 1 and majority_direction == "none":
+        return "no_clear_on_target_effect"
+    if n_adequate_guides == 0:
+        return "no_adequate_guides"
+    return "unclear_on_target"
 
 
 def compute_guide_metrics(
@@ -102,6 +177,8 @@ def compute_guide_metrics(
     min_median_umi: float = DEFAULT_MIN_MEDIAN_UMI,
     min_detection_rate: float = DEFAULT_MIN_DETECTION_RATE,
     lfc_noise: float = DEFAULT_LFC_NOISE,
+    perturbation_type: str = DEFAULT_PERTURBATION_TYPE,
+    on_target_lfc_cutoff: float = DEFAULT_ON_TARGET_LFC_CUTOFF,
 ) -> pd.DataFrame:
     """Per-guide QC / efficacy metrics (does not merge guides into gene-level cells)."""
     obs = adata.obs
@@ -171,6 +248,16 @@ def compute_guide_metrics(
                 target_log2fc = float(target_mean - base)
 
         direction = "control" if is_control else _effect_direction(target_log2fc, lfc_noise)
+        score = (
+            float("nan")
+            if is_control
+            else on_target_effect_score(target_log2fc, perturbation_type)
+        )
+        passed = (
+            False
+            if is_control or not target_in_matrix
+            else on_target_pass(target_log2fc, perturbation_type, on_target_lfc_cutoff)
+        )
 
         row: dict = {
             "guide_id": guide,
@@ -195,6 +282,13 @@ def compute_guide_metrics(
             "target_expr_mean": target_mean,
             "target_expr_log2fc_vs_control": target_log2fc,
             "target_effect_direction": direction,
+            "perturbation_type": str(perturbation_type),
+            "expected_on_target_direction": (
+                "control" if is_control else expected_on_target_direction(perturbation_type)
+            ),
+            "on_target_score": score,
+            "on_target_lfc_cutoff": float(on_target_lfc_cutoff),
+            "on_target_pass": passed,
         }
 
         for col, key in (
@@ -228,6 +322,15 @@ def compute_guide_metrics(
     if guide_df.empty:
         return guide_df
 
+    # Adequate assignment + target in matrix + fail on-target → low-efficiency candidate.
+    adequate = guide_df.apply(_guide_assignment_adequate, axis=1)
+    guide_df["low_efficiency_guide"] = (
+        (~guide_df["is_control"])
+        & guide_df["target_in_matrix"].astype(bool)
+        & adequate
+        & (~guide_df["on_target_pass"].astype(bool))
+    )
+
     # Fill interpretation after gene-level consistency is known (placeholder; updated by run_guide_qc).
     guide_df["interpretation"] = "pending"
     return guide_df
@@ -236,6 +339,7 @@ def compute_guide_metrics(
 def compute_gene_guide_consistency(
     guide_df: pd.DataFrame,
     lfc_noise: float = DEFAULT_LFC_NOISE,
+    on_target_min_fail_guides: int = DEFAULT_ON_TARGET_MIN_FAIL_GUIDES,
 ) -> pd.DataFrame:
     """Compare effect directions across guides targeting the same gene (no cell merging)."""
     if guide_df.empty:
@@ -275,6 +379,39 @@ def compute_gene_guide_consistency(
                     if np.isfinite(lfc) and abs(lfc - med) > max(2.5 * mad, lfc_noise * 2):
                         outlier_guides.append(str(guide_id))
 
+        n_adequate = int(
+            (
+                (sub["n_cells"] >= sub["min_cells_threshold"])
+                & (sub["median_guide_umi"] >= sub["min_median_umi_threshold"])
+            ).sum()
+        )
+        n_pass = int(sub["on_target_pass"].astype(bool).sum()) if "on_target_pass" in sub.columns else 0
+        n_low_eff = (
+            int(sub["low_efficiency_guide"].astype(bool).sum())
+            if "low_efficiency_guide" in sub.columns
+            else 0
+        )
+        potential_low_eff = bool(n_low_eff >= int(on_target_min_fail_guides))
+        ptype = (
+            str(sub["perturbation_type"].iloc[0])
+            if "perturbation_type" in sub.columns
+            else DEFAULT_PERTURBATION_TYPE
+        )
+        expected = expected_on_target_direction(ptype)
+        low_eff_ids = (
+            sub.loc[sub["low_efficiency_guide"].astype(bool), "guide_id"].astype(str).tolist()
+            if "low_efficiency_guide" in sub.columns
+            else []
+        )
+        gene_interp = _gene_on_target_interpretation(
+            potential_low_efficiency=potential_low_eff,
+            guides_consistent=consistent,
+            n_on_target_pass=n_pass,
+            n_adequate_guides=n_adequate,
+            majority_direction=str(majority),
+            expected_direction=expected,
+        )
+
         rows.append(
             {
                 "gene_target": gene,
@@ -287,12 +424,14 @@ def compute_gene_guide_consistency(
                 "target_lfc_spread": lfc_spread,
                 "median_target_log2fc": float(finite.median()) if len(finite) else float("nan"),
                 "outlier_guides": "|".join(outlier_guides),
-                "n_adequate_guides": int(
-                    (
-                        (sub["n_cells"] >= sub["min_cells_threshold"])
-                        & (sub["median_guide_umi"] >= sub["min_median_umi_threshold"])
-                    ).sum()
-                ),
+                "n_adequate_guides": n_adequate,
+                "n_on_target_pass": n_pass,
+                "n_low_efficiency_guides": n_low_eff,
+                "low_efficiency_guides": "|".join(low_eff_ids),
+                "potential_low_efficiency": potential_low_eff,
+                "expected_on_target_direction": expected,
+                "on_target_min_fail_guides": int(on_target_min_fail_guides),
+                "interpretation": gene_interp,
             }
         )
     return pd.DataFrame(rows)
@@ -480,9 +619,61 @@ def build_qc_warnings(
                             "detail": f"mean_n_counts={mean_counts:.0f} < 50% of control ({ctrl_mean:.0f})",
                         }
                     )
+        if bool(row.get("cytotoxicity_qc_flag")):
+            frac = row.get("frac_removed_qc", float("nan"))
+            n_before = row.get("n_cells_before_qc", float("nan"))
+            n_removed = row.get("n_cells_removed_qc", float("nan"))
+            warnings.append(
+                {
+                    "level": "guide",
+                    "entity": guide,
+                    "gene_target": row["gene_target"],
+                    "warning": "cytotoxicity_qc_depletion",
+                    "detail": (
+                        f"QC removed {frac:.0%} of cells "
+                        f"({n_removed:.0f}/{n_before:.0f}) — strong cytotoxicity / phenotype signal; "
+                        f"do not treat as silent technical discard"
+                    ),
+                }
+            )
+        if bool(row.get("low_efficiency_guide")):
+            score = row.get("on_target_score", float("nan"))
+            lfc = row.get("target_expr_log2fc_vs_control", float("nan"))
+            expected = row.get("expected_on_target_direction", "down")
+            cutoff = row.get("on_target_lfc_cutoff", DEFAULT_ON_TARGET_LFC_CUTOFF)
+            warnings.append(
+                {
+                    "level": "guide",
+                    "entity": guide,
+                    "gene_target": row["gene_target"],
+                    "warning": "low_efficiency_guide",
+                    "detail": (
+                        f"on_target_pass=False (expected {expected}, "
+                        f"log2FC={lfc if np.isfinite(lfc) else 'nan'}, "
+                        f"score={score if np.isfinite(score) else 'nan'}, "
+                        f"cutoff={cutoff}); potential low-efficiency guide — "
+                        f"do not conclude no phenotype for the gene"
+                    ),
+                }
+            )
 
     if not consistency_df.empty:
         for _, row in consistency_df.iterrows():
+            if row.get("potential_low_efficiency"):
+                warnings.append(
+                    {
+                        "level": "gene",
+                        "entity": row["gene_target"],
+                        "gene_target": row["gene_target"],
+                        "warning": "potential_low_efficiency_guides",
+                        "detail": (
+                            f"{row.get('n_low_efficiency_guides', 0)}/{row['n_guides']} guides "
+                            f"fail on-target (expected {row.get('expected_on_target_direction', 'down')}); "
+                            f"low_efficiency_guides={row.get('low_efficiency_guides', '')} — "
+                            f"do not conclude no phenotype"
+                        ),
+                    }
+                )
             if row["guides_consistent"] is False:
                 warnings.append(
                     {
@@ -514,7 +705,8 @@ def build_qc_warnings(
                     }
                 )
             elif (
-                row["n_adequate_guides"] >= 1
+                not bool(row.get("potential_low_efficiency"))
+                and row["n_adequate_guides"] >= 1
                 and row["majority_direction"] == "none"
                 and row["guides_consistent"] is True
             ):
@@ -524,7 +716,10 @@ def build_qc_warnings(
                         "entity": row["gene_target"],
                         "gene_target": row["gene_target"],
                         "warning": "no_clear_effect_adequate_guides",
-                        "detail": "adequate guides but no target knockdown — likely biology or assay limits",
+                        "detail": (
+                            "adequate guides but no clear on-target change — "
+                            "review assay limits; with ≥2 failing guides see potential_low_efficiency instead"
+                        ),
                     }
                 )
 
@@ -536,6 +731,11 @@ def _apply_interpretations(guide_df: pd.DataFrame, consistency_df: pd.DataFrame)
         consistency_df.set_index("gene_target")["guides_consistent"].to_dict() if not consistency_df.empty else {}
     )
     n_guides_map = consistency_df.set_index("gene_target")["n_guides"].to_dict() if not consistency_df.empty else {}
+    low_eff_map = (
+        consistency_df.set_index("gene_target")["potential_low_efficiency"].to_dict()
+        if not consistency_df.empty and "potential_low_efficiency" in consistency_df.columns
+        else {}
+    )
     interpretations = []
     for _, row in guide_df.iterrows():
         if row["is_control"]:
@@ -554,11 +754,13 @@ def _apply_interpretations(guide_df: pd.DataFrame, consistency_df: pd.DataFrame)
                 direction=str(row["target_effect_direction"]),
                 gene_consistent=consistency_map.get(gene),
                 n_guides_for_gene=int(n_guides_map.get(gene, 1)),
+                low_efficiency_guide=bool(row.get("low_efficiency_guide", False)),
             )
         )
     guide_df = guide_df.copy()
     guide_df["interpretation"] = interpretations
     guide_df["guides_consistent_for_gene"] = guide_df["gene_target"].map(consistency_map)
+    guide_df["potential_low_efficiency_for_gene"] = guide_df["gene_target"].map(low_eff_map)
     return guide_df
 
 
@@ -575,6 +777,16 @@ def summarize_guide_qc(
     n_consistent = int(consistency_df["guides_consistent"].eq(True).sum()) if not consistency_df.empty else 0
     n_inconsistent = int(consistency_df["guides_consistent"].eq(False).sum()) if not consistency_df.empty else 0
     n_unknown = int(consistency_df["guides_consistent"].isna().sum()) if not consistency_df.empty else 0
+    n_low_eff_genes = (
+        int(consistency_df["potential_low_efficiency"].eq(True).sum())
+        if not consistency_df.empty and "potential_low_efficiency" in consistency_df.columns
+        else 0
+    )
+    n_low_eff_guides = (
+        int(guide_df["low_efficiency_guide"].eq(True).sum())
+        if not guide_df.empty and "low_efficiency_guide" in guide_df.columns
+        else 0
+    )
     return {
         "n_guides": int(len(guide_df)),
         "n_guides_noncontrol": int((~guide_df["is_control"]).sum()) if not guide_df.empty else 0,
@@ -582,6 +794,8 @@ def summarize_guide_qc(
         "n_genes_consistent_guides": n_consistent,
         "n_genes_inconsistent_guides": n_inconsistent,
         "n_genes_consistency_unknown": n_unknown,
+        "n_low_efficiency_guides": n_low_eff_guides,
+        "n_genes_potential_low_efficiency": n_low_eff_genes,
         "n_warnings": int(len(warnings_df)),
         "warning_counts": {str(k): int(v) for k, v in warning_counts.items()},
         "interpretation_counts": (
@@ -593,6 +807,81 @@ def summarize_guide_qc(
     }
 
 
+def merge_qc_filter_stats(
+    guide_df: pd.DataFrame,
+    filter_df: pd.DataFrame | None,
+    *,
+    control: str = "NT",
+) -> pd.DataFrame:
+    """Join per-guide QC removal stats from ``qc_filter_by_guide.csv`` onto guide_qc.
+
+    Guides fully removed by QC (absent from post-QC AnnData) are appended as stub rows
+    so cytotoxicity is never a silent discard.
+    """
+    if filter_df is None or filter_df.empty:
+        return guide_df
+    if "category" not in filter_df.columns or "value" not in filter_df.columns:
+        return guide_df
+    guide_rows = filter_df.loc[filter_df["category"].astype(str) == "guide_id"].copy()
+    if guide_rows.empty:
+        return guide_df
+    cols = [
+        c
+        for c in (
+            "n_cells_before_qc",
+            "n_cells_after_qc",
+            "n_cells_removed_qc",
+            "frac_removed_qc",
+            "cytotoxicity_qc_flag",
+        )
+        if c in guide_rows.columns
+    ]
+    if not cols:
+        return guide_df
+
+    out = guide_df.copy() if not guide_df.empty else pd.DataFrame()
+    if not out.empty:
+        out = out.drop(columns=[c for c in cols if c in out.columns], errors="ignore")
+        merge_src = guide_rows.rename(columns={"value": "guide_id"})[["guide_id", *cols]]
+        out = out.merge(merge_src, on="guide_id", how="left")
+    else:
+        out = pd.DataFrame(columns=["guide_id", "gene_target", "is_control", *cols])
+
+    present = set(out["guide_id"].astype(str)) if "guide_id" in out.columns else set()
+    stubs: list[dict] = []
+    for _, row in guide_rows.iterrows():
+        gid = str(row["value"])
+        if gid in present:
+            continue
+        gene = str(row["gene_target"]) if "gene_target" in row.index and pd.notna(row["gene_target"]) else ""
+        is_control = gene == control or gid.lower().startswith("non-targeting")
+        stub = {
+            "guide_id": gid,
+            "gene_target": gene or "unknown",
+            "is_control": is_control,
+            "n_cells": 0,
+            "median_guide_umi": float("nan"),
+            "detection_rate": float("nan"),
+            "min_cells_threshold": DEFAULT_MIN_CELLS,
+            "min_median_umi_threshold": DEFAULT_MIN_MEDIAN_UMI,
+            "min_detection_rate_threshold": DEFAULT_MIN_DETECTION_RATE,
+            "low_efficiency_guide": False,
+            "interpretation": "cytotoxicity_qc_depletion" if row.get("cytotoxicity_qc_flag") else "qc_filtered_out",
+        }
+        for c in cols:
+            stub[c] = row[c]
+        stubs.append(stub)
+    if stubs:
+        out = pd.concat([out, pd.DataFrame(stubs)], ignore_index=True)
+
+    if "cytotoxicity_qc_flag" in out.columns:
+        out["cytotoxicity_qc_flag"] = out["cytotoxicity_qc_flag"].fillna(False).astype(bool)
+        if "is_control" in out.columns:
+            cyto = out["cytotoxicity_qc_flag"].astype(bool) & (~out["is_control"].astype(bool))
+            out.loc[cyto, "interpretation"] = "cytotoxicity_qc_depletion"
+    return out
+
+
 def run_guide_qc(
     adata: AnnData,
     control: str = "NT",
@@ -602,6 +891,10 @@ def run_guide_qc(
     min_detection_rate: float = DEFAULT_MIN_DETECTION_RATE,
     lfc_noise: float = DEFAULT_LFC_NOISE,
     guide_merge: str = DEFAULT_GUIDE_MERGE,
+    perturbation_type: str = DEFAULT_PERTURBATION_TYPE,
+    on_target_lfc_cutoff: float = DEFAULT_ON_TARGET_LFC_CUTOFF,
+    on_target_min_fail_guides: int = DEFAULT_ON_TARGET_MIN_FAIL_GUIDES,
+    qc_filter_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     mode = str(guide_merge or DEFAULT_GUIDE_MERGE).lower()
     if mode not in GUIDE_MERGE_MODES:
@@ -614,16 +907,29 @@ def run_guide_qc(
         min_median_umi=min_median_umi,
         min_detection_rate=min_detection_rate,
         lfc_noise=lfc_noise,
+        perturbation_type=perturbation_type,
+        on_target_lfc_cutoff=on_target_lfc_cutoff,
     )
-    consistency_df = compute_gene_guide_consistency(guide_df, lfc_noise=lfc_noise)
+    consistency_df = compute_gene_guide_consistency(
+        guide_df,
+        lfc_noise=lfc_noise,
+        on_target_min_fail_guides=on_target_min_fail_guides,
+    )
     weighted_df = compute_weighted_guide_summary(guide_df, guide_merge=mode, lfc_noise=lfc_noise)
     consistency_df = attach_weighted_summary(consistency_df, weighted_df, guide_merge=mode)
     guide_df = _apply_interpretations(guide_df, consistency_df)
+    guide_df = merge_qc_filter_stats(guide_df, qc_filter_df, control=control)
     warnings_df = build_qc_warnings(guide_df, consistency_df)
     summary = summarize_guide_qc(guide_df, consistency_df, warnings_df, guide_merge=mode)
     summary["weighted"] = {
         "enabled": mode != "none",
         "n_genes": int(len(weighted_df)),
+    }
+    summary["on_target"] = {
+        "perturbation_type": str(perturbation_type),
+        "expected_direction": expected_on_target_direction(perturbation_type),
+        "lfc_cutoff": float(on_target_lfc_cutoff),
+        "min_fail_guides": int(on_target_min_fail_guides),
     }
     return guide_df, consistency_df, warnings_df, summary
 

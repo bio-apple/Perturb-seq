@@ -24,12 +24,12 @@ ANALYSIS_STATUS_KEYS = ("mixscape", "edistance", "de", "cell_annotation", "pertu
 
 # Core checklist mirrored from docs/STATISTICAL_CAVEATS.md (kept in-package for report HTML).
 CORE_STATISTICAL_CAVEATS: tuple[str, ...] = (
-    "Cells are not biological replicates — cell-level tests inflate significance; prefer pseudobulk when replicates exist.",
+    "Cells are not biological replicates — cell-level tests inflate significance; prefer pseudobulk + PyDESeq2 (even without bio reps stays exploratory).",
     "Mixscape NP ≠ proven biological null — NP is transcriptomic resemblance to controls, not proof the guide failed.",
     "E-distance / E-test quantify multivariate shift, not mechanism; embedding choice changes ranks.",
-    "Wilcoxon without replicates is exploratory only — not for FDR-style population claims.",
+    "Wilcoxon / no-bio-rep pseudobulk DE is exploratory only — not for FDR-style population claims (Squair 2021).",
     "UMAP / Leiden describe dataset structure, not perturbation-effect evidence.",
-    "Filtering (QC / singlet / Mixscape KO) changes composition — check composition_audit.csv.",
+    "Filtering (QC / singlet / Mixscape KO) changes composition — check composition_audit.csv; prefer perturbation-aware QC.",
     "Guide inconsistency: do not pool discordant same-gene guides into one KO conclusion without review.",
     "Guide assignment is inherited from DRAGEN — this pipeline does not re-call guides by default.",
 )
@@ -419,7 +419,11 @@ def summarize_perturbation(
     gc_row = _row_lookup(tables.get("guide_consistency"), "gene_target", pert)
     n_guides = _safe_int(gc_row["n_guides"]) if gc_row is not None and "n_guides" in gc_row.index else None
     guide_status = None
-    if gc_row is not None and "guides_consistent" in gc_row.index:
+    if gc_row is not None and "potential_low_efficiency" in gc_row.index:
+        ple = gc_row["potential_low_efficiency"]
+        if pd.notna(ple) and bool(ple):
+            guide_status = "potential_low_efficiency_guides"
+    if guide_status is None and gc_row is not None and "guides_consistent" in gc_row.index:
         cons_val = gc_row["guides_consistent"]
         if pd.isna(cons_val):
             guide_status = "consistency_unknown"
@@ -544,7 +548,10 @@ def summarize_perturbation(
         de_method = str(de["method"].iloc[0]) if "method" in de.columns else NA
         if "evidence_level" in de.columns:
             de_evidence_level = str(de["evidence_level"].iloc[0])
-        elif de_method == "wilcoxon_cell_level_exploratory":
+        elif de_method in {
+            "wilcoxon_cell_level_exploratory",
+            "pydeseq2_pseudobulk_no_bio_reps",
+        }:
             de_evidence_level = "exploratory"
         elif de_method == "pydeseq2_pseudobulk":
             de_evidence_level = "inferential"
@@ -561,9 +568,11 @@ def summarize_perturbation(
         if padj_col:
             de_padj_min = _safe_float(de[padj_col].min())
         if effect["confidence_interval"] == NA and (
-            replicate_col is None or de_method == "wilcoxon_cell_level_exploratory"
+            replicate_col is None
+            or de_method
+            in {"wilcoxon_cell_level_exploratory", "pydeseq2_pseudobulk_no_bio_reps"}
         ):
-            note = "No replicate CI (single-sample / exploratory Wilcoxon)"
+            note = "No biological-replicate CI (exploratory DE path)"
             effect["note"] = f"{effect['note']}; {note}" if effect.get("note") else note
     if de_evidence_level is None:
         de_block_el = (report.get("de") if isinstance(report.get("de"), dict) else {}) or {}
@@ -598,6 +607,16 @@ def summarize_perturbation(
         }
         if "guide_merge" in gc_row.index and pd.notna(gc_row.get("guide_merge")):
             across_guides["guide_merge"] = str(gc_row["guide_merge"])
+        if "n_low_efficiency_guides" in gc_row.index:
+            across_guides["n_low_efficiency_guides"] = _safe_int(gc_row.get("n_low_efficiency_guides"))
+        if "n_on_target_pass" in gc_row.index:
+            across_guides["n_on_target_pass"] = _safe_int(gc_row.get("n_on_target_pass"))
+        if "potential_low_efficiency" in gc_row.index and pd.notna(gc_row.get("potential_low_efficiency")):
+            across_guides["potential_low_efficiency"] = bool(gc_row["potential_low_efficiency"])
+        if "interpretation" in gc_row.index and pd.notna(gc_row.get("interpretation")):
+            across_guides["interpretation"] = str(gc_row["interpretation"])
+        if "low_efficiency_guides" in gc_row.index and pd.notna(gc_row.get("low_efficiency_guides")):
+            across_guides["low_efficiency_guides"] = str(gc_row["low_efficiency_guides"])
         consistency["across_guides"] = across_guides
     else:
         consistency["across_guides"] = "N/A — gene_guide_consistency.csv not present"
@@ -627,13 +646,26 @@ def summarize_perturbation(
             }
             if "target_expr_log2fc_vs_control" in grow.index:
                 entry["target_log2fc"] = _safe_float(grow.get("target_expr_log2fc_vs_control"))
+            if "on_target_score" in grow.index:
+                entry["on_target_score"] = _safe_float(grow.get("on_target_score"))
+            if "on_target_pass" in grow.index and pd.notna(grow.get("on_target_pass")):
+                entry["on_target_pass"] = bool(grow["on_target_pass"])
+            if "low_efficiency_guide" in grow.index and pd.notna(grow.get("low_efficiency_guide")):
+                entry["low_efficiency_guide"] = bool(grow["low_efficiency_guide"])
             guide_interpretations.append(entry)
 
     interp_by_guide = {str(i["guide_id"]): i["interpretation"] for i in guide_interpretations}
     gene_level_interp = None
-    if guide_interpretations:
-        # Prefer a non-technical knockdown/up call if present; else first guide.
-        for pref in ("target_knockdown_detected", "target_upregulated", "inconsistent_guides"):
+    if gc_row is not None and "interpretation" in gc_row.index and pd.notna(gc_row.get("interpretation")):
+        gene_level_interp = str(gc_row["interpretation"])
+    if gene_level_interp is None and guide_interpretations:
+        # Prefer low-efficiency / knockdown / inconsistency labels when present.
+        for pref in (
+            "potential_low_efficiency_guide",
+            "target_knockdown_detected",
+            "target_upregulated",
+            "inconsistent_guides",
+        ):
             hit = next((i for i in guide_interpretations if i["interpretation"] == pref), None)
             if hit:
                 gene_level_interp = hit["interpretation"]
@@ -693,6 +725,11 @@ def summarize_perturbation(
         limitations.append("No DE table for this perturbation (only top-N by E-distance are tested by default)")
     elif de_method == "wilcoxon_cell_level_exploratory":
         warnings.append("DE p-values are cell-level Wilcoxon (exploratory); not biological-replicate inference")
+    elif de_method == "pydeseq2_pseudobulk_no_bio_reps":
+        warnings.append(
+            "DE uses exploratory PyDESeq2 without true biological replicates "
+            "(sample_id or technical pseudo-replicates); not population inference"
+        )
     if n_cells is not None and n_cells < min_cells:
         warnings.append(f"Low cell count ({n_cells} < {min_cells})")
     if edistance is None and de is None:
@@ -709,6 +746,11 @@ def summarize_perturbation(
         and effect.get("significant_adj_reported") is False
     ):
         warnings.append("Raw significant_adj=True but significant_adj_reported=False due to low_power")
+    if guide_status == "potential_low_efficiency_guides":
+        warnings.append(
+            "Potential low-efficiency guides (on-target proxy failed for ≥2 adequate guides) — "
+            "do not conclude no phenotype; review gene_guide_consistency.csv"
+        )
     if guide_status == "guides_inconsistent":
         warnings.append("Guide effects inconsistent across guides targeting this gene — review gene_guide_consistency.csv")
     for wrow in qc_warning_rows[:8]:
@@ -763,12 +805,21 @@ def summarize_perturbation(
 
 def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str | None]:
     """Relative paths under output_dir for card thumbnails (None if missing)."""
-    out: dict[str, str | None] = {"volcano": None, "umap": None, "edistance": None}
+    out: dict[str, str | None] = {
+        "volcano": None,
+        "umap": None,
+        "edistance": None,
+        "guide_consistency": None,
+        "target_validation": None,
+        "effect_summary": None,
+    }
     if figures_dir is None or not Path(figures_dir).exists():
         return out
     figures_dir = Path(figures_dir)
+    safe = re.sub(r"[^\w.\-]+", "_", str(pert).strip()) or pert
     for candidate in (
         figures_dir / f"volcano_{pert}.png",
+        figures_dir / f"volcano_{safe}.png",
         figures_dir / f"volcano_{pert.replace(' ', '_')}.png",
     ):
         if candidate.exists():
@@ -780,6 +831,22 @@ def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str 
             break
     if (figures_dir / "edistance.png").exists():
         out["edistance"] = "figures/edistance.png"
+    if (figures_dir / "perturbation_effect_summary.png").exists():
+        out["effect_summary"] = "figures/perturbation_effect_summary.png"
+    for candidate in (
+        figures_dir / f"guide_consistency_{pert}.png",
+        figures_dir / f"guide_consistency_{safe}.png",
+    ):
+        if candidate.exists():
+            out["guide_consistency"] = f"figures/{candidate.name}"
+            break
+    for candidate in (
+        figures_dir / f"target_validation_{pert}.png",
+        figures_dir / f"target_validation_{safe}.png",
+    ):
+        if candidate.exists():
+            out["target_validation"] = f"figures/{candidate.name}"
+            break
     return out
 
 
@@ -810,14 +877,23 @@ def build_analysis_verdict(
 
     caveats: list[str] = []
     config = report.get("config") or {}
-    has_wilcoxon = any(
-        (s.get("effect_vs_control") or {}).get("de_method") == "wilcoxon_cell_level_exploratory"
+    has_exploratory_de = any(
+        (s.get("effect_vs_control") or {}).get("de_method")
+        in {"wilcoxon_cell_level_exploratory", "pydeseq2_pseudobulk_no_bio_reps"}
         for s in summaries
     )
     de_block = report.get("de") if isinstance(report.get("de"), dict) else {}
     de_text = str(de_block.get("detail") or report.get("de_note") or "")
-    if config.get("replicate_col") is None or has_wilcoxon or "exploratory" in de_text.lower() or "Wilcoxon" in de_text:
-        caveats.append("single-sample Wilcoxon DE is exploratory only (cells ≠ biological replicates)")
+    if (
+        config.get("replicate_col") is None
+        or has_exploratory_de
+        or "exploratory" in de_text.lower()
+        or "Wilcoxon" in de_text
+    ):
+        caveats.append(
+            "DE without true biological replicates is exploratory only "
+            "(cells ≠ bio reps; Squair 2021)"
+        )
     if n_low_power:
         caveats.append(
             f"{n_low_power} perturbation(s) marked low_power (n_cells below etest_power_min_cells)"
@@ -1041,6 +1117,62 @@ def _caveats_checklist_html(
 """
 
 
+def _key_viz_section(report: dict[str, Any]) -> str:
+    """Top-of-page biologist figures (PNG links, not base64)."""
+    plots = report.get("report_plots") if isinstance(report.get("report_plots"), dict) else {}
+    effect = plots.get("effect_summary")
+    thumbs = []
+    if effect:
+        thumbs.append(_fig_thumb(str(effect), "Perturbation effect summary", max_width=520))
+    gc = plots.get("guide_consistency") or {}
+    tv = plots.get("target_validation") or {}
+    link_bits = []
+    if isinstance(gc, dict) and gc:
+        link_bits.append(
+            "<li>Guide consistency: "
+            + ", ".join(
+                f'<a href="{html.escape(v)}">{html.escape(k)}</a>' for k, v in sorted(gc.items())
+            )
+            + "</li>"
+        )
+    if isinstance(tv, dict) and tv:
+        link_bits.append(
+            "<li>Target validation: "
+            + ", ".join(
+                f'<a href="{html.escape(v)}">{html.escape(k)}</a>' for k, v in sorted(tv.items())
+            )
+            + "</li>"
+        )
+    skips = plots.get("skipped_plots") or []
+    skip_html = ""
+    if skips:
+        skip_html = (
+            "<ul class=\"meta\">"
+            + "".join(
+                f"<li>Skipped <code>{html.escape(str(s.get('plot')))}</code>: "
+                f"{html.escape(str(s.get('detail') or s.get('reason') or 'skipped'))}</li>"
+                for s in skips[:12]
+            )
+            + "</ul>"
+        )
+    if not thumbs and not link_bits and not skip_html:
+        return ""
+    body = ""
+    if thumbs:
+        body += f'<div class="fig-row key-viz">{"".join(thumbs)}</div>'
+    if link_bits:
+        body += "<ul>" + "".join(link_bits) + "</ul>"
+    body += skip_html
+    return f"""
+<section class="key-viz" id="key-visualizations">
+  <h2>Key visualizations</h2>
+  <p class="meta">Effect summary ranks multivariate shift; guide consistency tests multi-guide agreement;
+  target validation checks KO/KD of the perturbed gene itself.</p>
+  {body}
+</section>
+"""
+
+
 def render_html_report(
     report: dict[str, Any],
     perturbations: list[dict[str, Any]],
@@ -1086,6 +1218,8 @@ def render_html_report(
         thumbs = "".join(
             [
                 _fig_thumb(figs.get("volcano"), f"Volcano {s['perturbation']}", max_width=280),
+                _fig_thumb(figs.get("guide_consistency"), "Guide consistency", max_width=220),
+                _fig_thumb(figs.get("target_validation"), "Target validation", max_width=220),
                 _fig_thumb(figs.get("umap"), "UMAP (viz only)", max_width=180),
                 _fig_thumb(figs.get("edistance"), "E-distance bar", max_width=180),
             ]
@@ -1097,16 +1231,38 @@ def render_html_report(
         gqc = s.get("guide_qc") or {}
         interp = gqc.get("interpretations") or []
         if interp:
-            interp_html = "<ul>" + "".join(
-                f"<li><code>{html.escape(str(i.get('guide_id')))}</code>: "
-                f"<em>{html.escape(str(i.get('interpretation')))}</em>"
-                f" (conf={html.escape(str(i.get('assignment_confidence')))}, "
-                f"dir={html.escape(str(i.get('target_effect_direction')))}, "
-                f"n={_fmt(i.get('n_cells'))})</li>"
-                for i in interp[:8]
-            ) + "</ul>"
+            interp_items = []
+            for i in interp[:8]:
+                extras = (
+                    f"conf={html.escape(str(i.get('assignment_confidence')))}, "
+                    f"dir={html.escape(str(i.get('target_effect_direction')))}, "
+                    f"n={_fmt(i.get('n_cells'))}"
+                )
+                if i.get("on_target_score") is not None:
+                    extras += f", on_target_score={_fmt(i.get('on_target_score'))}"
+                if "on_target_pass" in i:
+                    extras += f", on_target_pass={_fmt(i.get('on_target_pass'))}"
+                if i.get("low_efficiency_guide"):
+                    extras += ", <strong>low_efficiency_guide</strong>"
+                interp_items.append(
+                    f"<li><code>{html.escape(str(i.get('guide_id')))}</code>: "
+                    f"<em>{html.escape(str(i.get('interpretation')))}</em> ({extras})</li>"
+                )
+            interp_html = "<ul>" + "".join(interp_items) + "</ul>"
         else:
             interp_html = f"<p>{NA}</p>"
+        across = cons.get("across_guides") if isinstance(cons.get("across_guides"), dict) else {}
+        if across.get("potential_low_efficiency"):
+            low_eff_note = (
+                f'<p class="warn"><strong>Potential low-efficiency guides</strong> '
+                f"(n_low_efficiency={_fmt(across.get('n_low_efficiency_guides'))}/"
+                f"{_fmt(across.get('n_guides'))}; "
+                f"pass={_fmt(across.get('n_on_target_pass'))}; "
+                f"interp={_fmt(across.get('interpretation'))}) — "
+                f"do <em>not</em> conclude no phenotype for this gene.</p>"
+            )
+        else:
+            low_eff_note = ""
         qc_warns = gqc.get("warnings") or []
         if qc_warns:
             warn_items = []
@@ -1151,6 +1307,7 @@ def render_html_report(
     <li>QC status: {_fmt(s['counts']['qc_status'])}</li>
   </ul>
   <h4>Guide interpretations</h4>
+  {low_eff_note}
   {interp_html}
   <h4>QC warnings</h4>
   {qc_warn_html}
@@ -1245,6 +1402,7 @@ def render_html_report(
             global_notes.append(f"<li>{html.escape(str(report[key]))}</li>")
 
     caveats_html = _caveats_checklist_html(report, caveats=caveats)
+    key_viz_html = _key_viz_section(report)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1271,12 +1429,15 @@ def render_html_report(
   .verdict {{ background: #e8f0e9; border: 1px solid #b7c9b9; padding: 0.75rem 1rem; margin: 1rem 0; }}
   .verdict h2 {{ margin: 0 0 0.35rem; font-size: 1.1rem; }}
   .verdict p {{ margin: 0; }}
+  .key-viz {{ background: #eef2f6; border: 1px solid #c5d0db; padding: 0.75rem 1rem; margin: 1rem 0; }}
+  .key-viz h2 {{ margin: 0 0 0.35rem; font-size: 1.1rem; }}
   .checklist {{ list-style: none; padding-left: 0; }}
   .checklist li {{ margin: 0.35rem 0; }}
   .fig-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-start; }}
   .fig-thumb {{ display: inline-flex; flex-direction: column; align-items: center; text-decoration: none;
                 color: #333; font-size: 0.8rem; max-width: 280px; }}
   .fig-thumb img {{ display: block; }}
+  .key-viz .fig-thumb {{ max-width: 560px; }}
 </style>
 </head>
 <body>
@@ -1284,6 +1445,7 @@ def render_html_report(
 <p class="meta">Sample: <strong>{html.escape(sample_id)}</strong> · {n} perturbations summarized</p>
 <p class="meta">Machine-readable: <code>report.json</code> → <code>perturbations</code> / <code>verdict</code>. CSV / <code>.h5ad</code> remain downstream interfaces.</p>
 {verdict_html}
+{key_viz_html}
 {caveats_html}
 <p class="downloads">Publication-ready summary:
   <a href="summary_table.csv" download>summary_table.csv</a>
@@ -1313,6 +1475,9 @@ def write_analysis_report(
     min_cells: int | None = None,
     top_genes: int = 10,
     html_detail_limit: int | None = None,
+    adata: AnnData | None = None,
+    h5ad: Path | str | None = None,
+    report_plot_top_n: int | None = None,
 ) -> dict[str, Any]:
     """Enrich report.json with perturbations and write report.html."""
     output_dir = Path(output_dir)
@@ -1320,6 +1485,24 @@ def write_analysis_report(
     report = dict(tables.get("report") or {})
     control = control or (report.get("config") or {}).get("control") or CONTROL_DEFAULT
     min_cells = min_cells or int((report.get("config") or {}).get("min_cells_per_pert") or 10)
+    cfg = report.get("config") or {}
+    top_n_plots = report_plot_top_n
+    if top_n_plots is None:
+        top_n_plots = int(cfg.get("report_plot_top_n") or 15)
+
+    # Biologist figures before summaries so card thumbnails resolve.
+    from perturbseq.report_plots import generate_report_plots
+
+    plot_status = generate_report_plots(
+        output_dir,
+        tables=tables,
+        adata=adata,
+        h5ad=h5ad,
+        control=control,
+        top_n=top_n_plots,
+        min_guide_cells=min_cells,
+    )
+    report["report_plots"] = plot_status
 
     summaries = build_perturbation_summaries(
         tables, control=control, min_cells=min_cells, top_genes=top_genes
@@ -1367,14 +1550,21 @@ def write_analysis_report(
     return report
 
 
-def write_html_summary(report: dict, output_dir: Path, filename: str = "report.html") -> Path:
+def write_html_summary(
+    report: dict,
+    output_dir: Path,
+    filename: str = "report.html",
+    *,
+    adata: AnnData | None = None,
+    h5ad: Path | str | None = None,
+) -> Path:
     """Write HTML; prefer rich per-perturbation report when tables exist."""
     output_dir = Path(output_dir)
     tables_dir = output_dir / "tables"
     if tables_dir.exists() and any(tables_dir.glob("*.csv")):
         # Persist current report first so the builder can merge.
         write_report_json(report, output_dir)
-        write_analysis_report(output_dir)
+        write_analysis_report(output_dir, adata=adata, h5ad=h5ad)
         path = output_dir / "report.html"
         if filename != "report.html":
             target = output_dir / filename
@@ -1452,7 +1642,8 @@ def finalize_outputs(
     write_h5ad(adata, h5ad_path)
     report["output_h5ad"] = str(h5ad_path)
     write_report_json(report, output_dir)
-    write_html_summary(report, output_dir)
+    # Pass in-memory adata so report plots skip a second disk read.
+    write_html_summary(report, output_dir, adata=adata, h5ad=h5ad_path)
     # Reload enriched report (perturbations section) written by write_analysis_report.
     enriched_path = output_dir / "report.json"
     if enriched_path.exists():

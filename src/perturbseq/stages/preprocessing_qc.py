@@ -18,7 +18,7 @@ from perturbseq.guide_reassignment import run_guide_reassignment
 from perturbseq.guides import annotate_guides, filter_singlets
 from perturbseq.plots import plot_cell_annotation, plot_guide_composition, plot_qc, plot_umap
 from perturbseq.preprocessing import preprocess_rna
-from perturbseq.qc import add_qc_metrics, filter_cells, sample_qc_summary
+from perturbseq.qc import add_qc_metrics, filter_cells, sample_qc_summary, write_qc_filter_by_guide
 from perturbseq.report import completed_status, skipped_status
 from perturbseq.stages._helpers import _embedding_provenance, _mark_stage
 
@@ -47,11 +47,44 @@ def stage_preprocessing_qc(
     report["sample_qc"] = sample_qc_summary(rna)
     append_composition_audit(composition_rows, rna, "loaded")
 
-    rna, qc_log = filter_cells(rna, n_mads=config.n_mads, min_cells=config.min_cells)
-    report["qc"] = qc_log
-    report.setdefault("composition_notes", []).append(
-        f"QC removed {qc_log.get('n_cells_removed_qc', 0)} cells; gene set also filtered (min_cells={config.min_cells})."
+    aware = bool(getattr(config, "perturbation_aware_qc", False))
+    rna, qc_log = filter_cells(
+        rna,
+        n_mads=config.n_mads,
+        min_cells=config.min_cells,
+        perturbation_aware=aware,
+        control=config.control,
     )
+    by_guide = qc_log.pop("qc_filter_by_guide", None)
+    tables = config.output_dir / "tables"
+    if isinstance(by_guide, pd.DataFrame) and not by_guide.empty:
+        filter_path = tables / "qc_filter_by_guide.csv"
+        write_qc_filter_by_guide(by_guide, filter_path)
+        report["qc_filter_by_guide"] = str(filter_path)
+        # Serializable summary for report.json (full table is on disk).
+        qc_log["qc_filter_by_guide_path"] = str(filter_path)
+        flagged = by_guide.loc[by_guide["cytotoxicity_qc_flag"]]
+        if not flagged.empty:
+            labels = (
+                flagged.loc[flagged["category"] == "guide_id", "value"].astype(str).tolist()
+                or flagged["value"].astype(str).tolist()
+            )
+            report.setdefault("composition_notes", []).append(
+                f"QC cytotoxicity flags (≥90% cells removed) for: {', '.join(labels[:20])}"
+                + ("…" if len(labels) > 20 else "")
+            )
+    report["qc"] = {k: v for k, v in qc_log.items() if k != "qc_filter_by_guide"}
+    source = qc_log.get("qc_threshold_source", "all_cells")
+    report.setdefault("composition_notes", []).append(
+        f"QC removed {qc_log.get('n_cells_removed_qc', 0)} cells "
+        f"(perturbation_aware_qc={aware}, thresholds={source}); "
+        f"gene set also filtered (min_cells={config.min_cells})."
+    )
+    if aware and not source.startswith("control"):
+        report["composition_notes"].append(
+            "perturbation_aware_qc requested but fell back to global MAD "
+            f"({qc_log.get('perturbation_aware_fallback', 'insufficient NT cells')})."
+        )
     append_composition_audit(composition_rows, rna, "after_qc")
     n_before_singlet = int(rna.n_obs)
     rna = filter_singlets(rna, singlet_only=config.singlet_only)
@@ -73,7 +106,6 @@ def stage_preprocessing_qc(
             }
         else:
             print(f"Guide reassignment ({config.guide_reassign})", flush=True)
-            tables = config.output_dir / "tables"
             re_summary = run_guide_reassignment(
                 rna,
                 crispr,

@@ -8,9 +8,15 @@ import pytest
 from anndata import AnnData
 
 from perturbseq.statistics import (
+    METHOD_PYDESEQ2,
+    METHOD_PYDESEQ2_NO_BIO_REPS,
+    METHOD_WILCOXON,
+    PSEUDO_REPLICATE_COL,
+    assign_pseudo_replicates,
     build_deseq2_design,
     check_experimental_design,
     exploratory_wilcoxon,
+    resolve_de_aggregation,
     resolve_de_covariates,
     run_de_contrasts,
     run_deseq2_or_wilcoxon,
@@ -38,10 +44,12 @@ def test_experimental_design_flags_no_replicates():
     adata = _planted_wilcoxon_adata()
     design = check_experimental_design(adata, replicate_col=None, groupby="gene_target")
     assert design["replicate_aware"] is False
-    assert design["recommended_method"] == "wilcoxon_cell_level_exploratory"
+    assert design["recommended_method"] == METHOD_WILCOXON
     assert design["evidence_level"] == "exploratory"
+    assert design["de_prefer_pseudobulk"] is True
     assert design["n_groups"] == 2
     assert design["note"] is not None
+    assert "Wilcoxon" in (design["note"] or "") or "wilcoxon" in (design["note"] or "").lower()
 
 
 def test_experimental_design_replicate_aware():
@@ -50,8 +58,63 @@ def test_experimental_design_replicate_aware():
     design = check_experimental_design(adata, replicate_col="replicate", groupby="gene_target")
     assert design["replicate_aware"] is True
     assert design["n_replicates"] == 2
-    assert design["recommended_method"] == "pydeseq2_pseudobulk"
+    assert design["recommended_method"] == METHOD_PYDESEQ2
     assert design["evidence_level"] == "inferential"
+
+
+def test_experimental_design_multi_sample_prefers_exploratory_pseudobulk():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["sample_id"] = (["s1"] * 25 + ["s2"] * 25) * 2
+    design = check_experimental_design(adata, replicate_col=None, groupby="gene_target")
+    assert design["replicate_aware"] is False
+    assert design["recommended_method"] == METHOD_PYDESEQ2_NO_BIO_REPS
+    assert design["evidence_level"] == "exploratory"
+    assert design["pseudobulk_groups_col"] == "sample_id"
+    assert design["design_formula"] is not None
+    assert "Squair" in (design["note"] or "")
+
+
+def test_experimental_design_pseudo_replicates_exploratory():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["sample_id"] = "s1"
+    design = check_experimental_design(
+        adata, replicate_col=None, groupby="gene_target", n_pseudo_replicates=3
+    )
+    assert design["replicate_aware"] is False
+    assert design["recommended_method"] == METHOD_PYDESEQ2_NO_BIO_REPS
+    assert design["evidence_level"] == "exploratory"
+    assert design["n_pseudo_replicates"] == 3
+    assert design["pseudobulk_groups_col"] == PSEUDO_REPLICATE_COL
+
+
+def test_resolve_de_aggregation_priority():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["sample_id"] = (["s1"] * 25 + ["s2"] * 25) * 2
+    adata.obs["replicate"] = (["r1"] * 25 + ["r2"] * 25) * 2
+    # True bio reps win over sample_id / pseudo-reps.
+    plan = resolve_de_aggregation(adata, replicate_col="replicate", n_pseudo_replicates=4)
+    assert plan["method"] == METHOD_PYDESEQ2
+    assert plan["evidence_level"] == "inferential"
+    # Without bio reps, sample_id path when ≥2 samples.
+    plan2 = resolve_de_aggregation(adata, replicate_col=None)
+    assert plan2["method"] == METHOD_PYDESEQ2_NO_BIO_REPS
+    assert plan2["groups_col"] == "sample_id"
+    # Single sample + pseudo-reps.
+    adata.obs["sample_id"] = "only"
+    plan3 = resolve_de_aggregation(adata, n_pseudo_replicates=2)
+    assert plan3["use_pseudo_replicates"] is True
+    assert plan3["method"] == METHOD_PYDESEQ2_NO_BIO_REPS
+    # Prefer off → Wilcoxon even with multi-sample.
+    adata.obs["sample_id"] = (["s1"] * 25 + ["s2"] * 25) * 2
+    plan4 = resolve_de_aggregation(adata, de_prefer_pseudobulk=False)
+    assert plan4["method"] == METHOD_WILCOXON
+
+
+def test_assign_pseudo_replicates_splits_within_group():
+    adata = _planted_wilcoxon_adata()
+    out = assign_pseudo_replicates(adata, groupby="gene_target", n_pseudo_replicates=3, random_state=0)
+    assert PSEUDO_REPLICATE_COL in out.obs
+    assert out.obs[PSEUDO_REPLICATE_COL].nunique() == 3
 
 
 def test_wilcoxon_planted_signal_ranks_and_pvalues():
@@ -82,7 +145,7 @@ def test_run_deseq2_or_wilcoxon_falls_back_without_replicates():
     table = run_deseq2_or_wilcoxon(
         adata, group="KOGENE", reference="NT", replicate_col=None, groupby="gene_target"
     )
-    assert table["method"].iloc[0] == "wilcoxon_cell_level_exploratory"
+    assert table["method"].iloc[0] == METHOD_WILCOXON
     assert table["evidence_level"].iloc[0] == "exploratory"
     assert table.set_index("names").index[0] == "g0"
 
@@ -218,7 +281,26 @@ def test_pipeline_config_parses_guide_reassign_and_de_covariates():
             "output_dir": "/tmp/out",
             "guide_reassign": "compare",
             "de_covariates": ["phase", "log_n_counts"],
+            "de_prefer_pseudobulk": True,
+            "n_pseudo_replicates": 3,
         }
     )
     assert cfg.guide_reassign == "compare"
     assert cfg.de_covariates == ("phase", "log_n_counts")
+    assert cfg.de_prefer_pseudobulk is True
+    assert cfg.n_pseudo_replicates == 3
+
+
+def test_pipeline_config_coerces_n_pseudo_replicates_below_two_to_none():
+    from perturbseq.pipeline import pipeline_config_from_mapping
+
+    cfg = pipeline_config_from_mapping(
+        {
+            "input_dir": "/tmp/in",
+            "output_dir": "/tmp/out",
+            "n_pseudo_replicates": 1,
+            "de_prefer_pseudobulk": "false",
+        }
+    )
+    assert cfg.n_pseudo_replicates is None
+    assert cfg.de_prefer_pseudobulk is False

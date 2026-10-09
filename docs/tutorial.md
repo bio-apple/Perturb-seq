@@ -171,10 +171,12 @@ Full text + literature: **[STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md)**.
 | Pitfall | Why | What to do |
 | --- | --- | --- |
 | **Multi-guide inconsistency** | Same gene, different guides → discordant directions (assignment, UMI, incomplete edit, off-target, cytotoxicity) | Inspect `gene_guide_consistency.csv` / `qc_warnings.csv`; do **not** pool inconsistent guides into one “gene KO” claim |
+| **Low on-target / multi-guide fail** | ≥2 adequate guides fail target log2FC in expected direction (`potential_low_efficiency`) | Flag low-efficiency guides; do **not** conclude “no phenotype” for the gene |
 | **Mixscape labels many NP** | Targeting barcode but transcriptome still resembles NT; pool-dependent; **not** proof the guide failed | Read composition audit; NP ≠ proven biological null |
 | **No FDR claims without replicates** | Cells ≠ biological replicates; no `replicate_col` → exploratory Wilcoxon only | Hypothesis ranking only; ≥2 true replicates → pseudobulk + PyDESeq2 |
 | **UMAP / Leiden as effect** | Global structure ≠ perturbation evidence | Prefer E-distance / E-test (+ replicate-aware DE) |
-| **Filtering changes composition** | MAD QC, singlet, Mixscape KO+NT drop cells | Compare `tables/composition_audit.csv` |
+| **Perturbation-space clusters as mechanism** | `pca_silhouette` / `kmeans` / `lr_classifier` are descriptive embeddings | Compare methods via `--perturbation-space`; do not equate co-cluster with shared pathway |
+| **Filtering changes composition** | MAD QC, singlet, Mixscape KO+NT drop cells | Compare `tables/composition_audit.csv`; prefer `--perturbation-aware-qc` so strong phenotypes do not set MAD cutoffs; check `qc_filter_by_guide.csv` / `cytotoxicity_qc_depletion` |
 | **Inherited guide assignment** | Tertiary pipeline does not re-call guides by default | Assignment quality bounds everything downstream |
 
 ### Hands-on: multi-guide inconsistency (demo)

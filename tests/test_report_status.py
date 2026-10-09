@@ -70,8 +70,11 @@ def test_pipeline_report_has_explicit_skip_blocks(tmp_path):
     assert report["de"]["reason"] == "user_skip"
     assert report["cell_annotation"]["skipped"] is True
     assert report["cell_annotation"]["reason"] == "user_skip"
-    assert report["perturbation_clusters"]["skipped"] is True
-    assert report["perturbation_clusters"]["reason"] in {"missing_pertpy", "failed", "user_skip"}
+    # Default pca_silhouette now has a local backend (no pertpy required).
+    if report["perturbation_clusters"]["skipped"]:
+        assert report["perturbation_clusters"]["reason"] in {"missing_pertpy", "failed", "user_skip"}
+    else:
+        assert report["perturbation_clusters"].get("method") == "pca_silhouette"
 
     html = (out / "report.html").read_text()
     assert "mixscape" in html

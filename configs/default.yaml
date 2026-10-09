@@ -12,6 +12,9 @@ singlet_only: true
 # Adaptive MAD QC (OSCA-style): 5 is permissive enough for small demos while
 # still catching extreme outliers; tighten on real screens after inspecting distributions.
 n_mads: 5.0
+# Prefer true for real Perturb-seq: fit MAD on NT/control only, apply to all cells.
+# Default false keeps backward-compatible global MAD. CLI: --perturbation-aware-qc
+perturbation_aware_qc: false
 # Drop genes detected in fewer cells — reduces noise before HVG/PCA; 3 is a
 # common scanpy floor for tiny libraries (raise for deeper screens).
 min_cells: 3
@@ -26,8 +29,9 @@ n_pcs: 30
 leiden_resolution: 0.5
 # Canonical non-targeting label after control_patterns remapping (demo NegCtrl → NT).
 control: NT
-# null = single-sample / no biological replicates → exploratory Wilcoxon only;
-# set a column name when ≥2 true replicates exist for pseudobulk DESeq2.
+# Biological replicate obs column: ≥2 levels → inferential pseudobulk + PyDESeq2.
+# null / single level: still prefer sample_id(+perturbation) pseudobulk when possible
+# (exploratory PyDESeq2); Wilcoxon only if <2 pseudobulk units (see de_prefer_pseudobulk).
 replicate_col: null
 
 # Optional stages: false = run when deps available. Mixscape auto-skips on
@@ -66,10 +70,15 @@ mixscape_top_n: null
 # Only top-N perturbations by E-distance get DE by default — keeps runtime bounded
 # on large libraries while focusing on the strongest multivariate shifts.
 de_top_n: 10
+# Cap biologist report PNGs (guide consistency heatmaps + target validation violins).
+report_plot_top_n: 15
 # Per-group DE / E-test workers: 1 = sequential (reproducible default), -1 = all CPUs
 n_jobs: 1
 # Mixscape was validated primarily for CRISPR KO; KD/CRISPRi/a get weaker NP/KO labels.
 perturbation_type: KO
+# Perturbation-space: pca_silhouette (default, mean PCA + Leiden) | kmeans | lr_classifier.
+# CLI: --perturbation-space. Stored in report.perturbation_clusters / matrix_provenance.
+perturbation_space: pca_silhouette
 # Fixed seed for PCA / neighbors / UMAP / permutations — reproducible demos and CI.
 random_state: 0
 
@@ -88,6 +97,10 @@ control_patterns:
 # Default none: never silently pool discordant same-gene guides into one KO claim;
 # weighted modes keep per-guide rows + inconsistency flags; they do not overwrite.
 guide_merge: none
+# On-target efficiency proxy: |log2FC| vs control in expected direction (KO/KD/i ↓, CRISPRa ↑).
+# ≥ on_target_min_fail_guides adequate guides failing → potential_low_efficiency (≠ no phenotype).
+on_target_lfc_cutoff: 0.25
+on_target_min_fail_guides: 2
 
 # Optional tertiary guide re-assignment vs DRAGEN GMM calls (CRISPR count matrix required):
 # off | compare | apply_max | apply_gmm
@@ -98,3 +111,9 @@ guide_reassign_min_umi: 1.0
 # DE covariates when columns exist: true = phase / pct_counts_mt / log_n_counts;
 # false = none; or YAML list of obs columns. Used in PyDESeq2 design; Wilcoxon records ignore.
 de_covariates: true
+# Prefer pseudobulk + PyDESeq2 even without true bio reps (sample_id sum, or pseudo-reps).
+# false → cell-level Wilcoxon (still exploratory; discouraged for silent "the" DE).
+de_prefer_pseudobulk: true
+# Optional technical pseudo-replicates for single-sample exploratory PyDESeq2 (null/0 = off).
+# Not a substitute for biological replicates (Squair et al. 2021).
+n_pseudo_replicates: null
