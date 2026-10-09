@@ -10,6 +10,7 @@ from anndata import read_h5ad
 from perturbseq.cell_annotation import annotate_cells, annotation_summary, write_annotation_tables
 from perturbseq.demo import write_demo_dragen
 from perturbseq.guide_qc import GUIDE_MERGE_MODES, run_guide_qc, write_guide_qc_tables
+from perturbseq.guide_reassignment import GUIDE_REASSIGN_MODES
 from perturbseq.io import write_h5ad
 from perturbseq.pipeline import (
     PipelineConfig,
@@ -68,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated secondary metrics after E-distance (e.g. mmd,wasserstein)",
     )
+    run.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=None,
+        help="Cell bootstrap replicates for E-distance CI (default 100; 0 = skip)",
+    )
     run.add_argument("--skip-mixscape", action="store_true")
     run.add_argument("--force-mixscape", action="store_true")
     run.add_argument("--mixscape-max-targets", type=int, default=None)
@@ -115,6 +122,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=list(GUIDE_MERGE_MODES),
         help="Multi-guide weighted summary: none (default, flag only) | equal | umi | confidence | umi_confidence",
+    )
+    run.add_argument(
+        "--guide-reassign",
+        default=None,
+        choices=list(GUIDE_REASSIGN_MODES),
+        help=(
+            "Optional tertiary guide re-call vs DRAGEN: off (default) | compare | apply_max | apply_gmm. "
+            "compare writes agreement QC; apply_* overrides guide_id (keeps *_dragen backups)."
+        ),
+    )
+    run.add_argument(
+        "--guide-reassign-min-umi",
+        type=float,
+        default=None,
+        help="Min CRISPR UMI for max/GMM reassignment (default 1.0)",
+    )
+    run.add_argument(
+        "--de-covariates",
+        default=None,
+        help=(
+            "DE covariates: 'true' (default candidates: phase,pct_counts_mt,log_n_counts), "
+            "'false' to disable, or comma-separated obs columns for PyDESeq2 design"
+        ),
     )
     run.add_argument(
         "--dry-run",
@@ -203,6 +233,8 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["secondary_distance_metrics"] = tuple(
             p.strip() for p in args.secondary_distance_metrics.split(",") if p.strip()
         )
+    if getattr(args, "n_bootstrap", None) is not None:
+        data["n_bootstrap"] = args.n_bootstrap
     if args.mixscape_max_targets is not None:
         data["mixscape_max_targets"] = args.mixscape_max_targets
     if getattr(args, "mixscape_mode", None) is not None:
@@ -223,6 +255,19 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["random_state"] = args.random_state
     if getattr(args, "guide_merge", None) is not None:
         data["guide_merge"] = args.guide_merge
+    if getattr(args, "guide_reassign", None) is not None:
+        data["guide_reassign"] = args.guide_reassign
+    if getattr(args, "guide_reassign_min_umi", None) is not None:
+        data["guide_reassign_min_umi"] = args.guide_reassign_min_umi
+    if getattr(args, "de_covariates", None) is not None:
+        raw = str(args.de_covariates).strip()
+        low = raw.lower()
+        if low in {"true", "yes", "1"}:
+            data["de_covariates"] = True
+        elif low in {"false", "no", "0", "none"}:
+            data["de_covariates"] = False
+        else:
+            data["de_covariates"] = tuple(p.strip() for p in raw.split(",") if p.strip())
     if args.control_patterns is not None:
         data["control_patterns"] = tuple(
             p.strip() for p in args.control_patterns.split(",") if p.strip()

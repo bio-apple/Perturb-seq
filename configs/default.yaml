@@ -1,47 +1,79 @@
 # Central defaults for the tertiary Perturb-seq pipeline.
 # CLI flags override these when provided. Paths may be set here or via CLI.
+# Comments explain *why* each default exists (rationale), not only what it does.
 
 sample_id: sample1
 # input_dir: data/demo
 # output_dir: results/demo
 
+# ICM / DRAGEN practice: multiplet barcodes mix guides and confound gene-level
+# conclusions; keep singlets unless you have a deliberate multiplet analysis.
 singlet_only: true
+# Adaptive MAD QC (OSCA-style): 5 is permissive enough for small demos while
+# still catching extreme outliers; tighten on real screens after inspecting distributions.
 n_mads: 5.0
+# Drop genes detected in fewer cells — reduces noise before HVG/PCA; 3 is a
+# common scanpy floor for tiny libraries (raise for deeper screens).
 min_cells: 3
+# HVG count for embedding / E-distance space; 2000 balances signal vs noise on
+# typical human screens without dominating tiny gene panels.
 n_top_genes: 2000
+# PCA dims for neighbors / UMAP / distance metrics; 30 is a scanpy-style default
+# that is usually enough before noise dominates small n_cells demos.
 n_pcs: 30
+# Leiden resolution for exploratory structure only — not perturbation evidence.
+# 0.5 yields moderate granularity; UMAP/Leiden are viz, not effect tests.
 leiden_resolution: 0.5
+# Canonical non-targeting label after control_patterns remapping (demo NegCtrl → NT).
 control: NT
+# null = single-sample / no biological replicates → exploratory Wilcoxon only;
+# set a column name when ≥2 true replicates exist for pseudobulk DESeq2.
 replicate_col: null
 
+# Optional stages: false = run when deps available. Mixscape auto-skips on
+# genome-scale libraries (see mixscape_max_targets) to avoid OOM / long runtime.
 skip_mixscape: false
 skip_cell_annotation: false
 skip_distance: false
 skip_de: false
 
+# E-test permutations: 200 is a practical smoke/default tradeoff; raise (e.g. 1000+)
+# for publication screens where stable padj ranks matter.
 n_perms: 200
+# Minimum cells to analyze a perturbation group; below this, ranks are unreliable.
 min_cells_per_pert: 10
 # E-test power: below this n_cells → low_power=true; significant_adj_reported suppressed.
 # Peidli et al.: ≥50–100 safer; ~200 more stable. Raise for publication screens.
 etest_power_min_cells: 50
 # Secondary distances for sensitivity (same group filter as E-distance). wasserstein needs JAX.
+# MMD / Wasserstein complement E-distance so ranks are not a single-metric artifact.
 secondary_distance_metrics:
   - mmd
   - wasserstein
+# Cell bootstrap replicates for E-distance CI (0 = skip). Default modest for speed.
+n_bootstrap: 100
+# Genome-scale Mixscape skip: full Mixscape over hundreds of targets is costly and
+# often memory-bound; auto mode skips when n_targets exceeds this unless forced/subset.
 mixscape_max_targets: 40
 force_mixscape: false
 # auto | skip | force | subset — auto skips when n_targets > mixscape_max_targets
+# (genome-scale default path); subset/top-N keeps Mixscape usable on large libraries.
 mixscape_mode: auto
 # Optional subset Mixscape (comma list in CLI; YAML list or empty):
 mixscape_targets: []
 # Optional: top-N by pre-Mixscape E-distance (subset mode); null = off unless mode=subset
 mixscape_top_n: null
+# Only top-N perturbations by E-distance get DE by default — keeps runtime bounded
+# on large libraries while focusing on the strongest multivariate shifts.
 de_top_n: 10
 # Per-group DE / E-test workers: 1 = sequential (reproducible default), -1 = all CPUs
 n_jobs: 1
+# Mixscape was validated primarily for CRISPR KO; KD/CRISPRi/a get weaker NP/KO labels.
 perturbation_type: KO
+# Fixed seed for PCA / neighbors / UMAP / permutations — reproducible demos and CI.
 random_state: 0
 
+# Map common NegCtrl / NTC spellings → control label without hard-coding one vendor ID.
 control_patterns:
   - "^nt$"
   - "^ntc$"
@@ -53,5 +85,16 @@ control_patterns:
   - "^ctrl$"
 
 # Multi-guide gene summary: none (default, flag only) | equal | umi | confidence | umi_confidence
-# Weighted modes keep per-guide rows + inconsistency flags; they do not silently overwrite.
+# Default none: never silently pool discordant same-gene guides into one KO claim;
+# weighted modes keep per-guide rows + inconsistency flags; they do not overwrite.
 guide_merge: none
+
+# Optional tertiary guide re-assignment vs DRAGEN GMM calls (CRISPR count matrix required):
+# off | compare | apply_max | apply_gmm
+# Quote "off" — unquoted off is YAML 1.1 boolean false.
+guide_reassign: "off"
+guide_reassign_min_umi: 1.0
+
+# DE covariates when columns exist: true = phase / pct_counts_mt / log_n_counts;
+# false = none; or YAML list of obs columns. Used in PyDESeq2 design; Wilcoxon records ignore.
+de_covariates: true

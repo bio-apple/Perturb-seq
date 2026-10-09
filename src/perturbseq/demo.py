@@ -11,11 +11,16 @@ from perturbseq.io import SAMPLE_FILES
 
 
 def write_demo_dragen(output_dir: Path, n_cells: int = 120, n_genes: int = 80, seed: int = 0) -> Path:
-    """Write a tiny DRAGEN-like MEX + CRISPR assignment bundle for local testing."""
+    """Write a tiny DRAGEN-like MEX + CRISPR assignment bundle for local testing.
+
+    Plants target gene symbols in the expression matrix so guide QC can score
+    target-gene LFC. IFNGR2 has two guides with conflicting target effects
+    (strong knockdown vs opposing/weak) so ``gene_guide_consistency`` flags
+    multi-guide inconsistency — a hands-on pitfall for the tutorial.
+    """
     rng = np.random.default_rng(seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     sample = "sample1"
-    genes = [f"GENE{i:03d}" for i in range(n_genes - 8)] + [f"MT-GENE{i}" for i in range(8)]
     guides = [
         ("NegCtrl_0001", "NT"),
         ("IFNGR2_1", "IFNGR2"),
@@ -24,9 +29,19 @@ def write_demo_dragen(output_dir: Path, n_cells: int = 120, n_genes: int = 80, s
         ("JAK2_1", "JAK2"),
         ("PDCD10_1", "PDCD10"),
     ]
+    # Real target symbols first so guide_qc can resolve target_in_matrix / LFC.
+    target_symbols = ["IFNGR2", "STAT1", "JAK2", "PDCD10"]
+    n_mt = 8
+    n_filler = max(0, n_genes - len(target_symbols) - n_mt)
+    genes = target_symbols + [f"GENE{i:03d}" for i in range(n_filler)] + [f"MT-GENE{i}" for i in range(n_mt)]
+    if len(genes) != n_genes:
+        raise ValueError(f"n_genes={n_genes} too small for demo layout (need ≥{len(target_symbols) + n_mt})")
     barcodes = [f"CELL{i:04d}" for i in range(n_cells)]
     n_features = n_genes + len(guides)
     matrix = rng.negative_binomial(4, 0.4, size=(n_features, n_cells)).astype(np.float32)
+    # NT-like baseline for planted targets (overwritten per guide below).
+    for ti in range(len(target_symbols)):
+        matrix[ti, :] = rng.integers(10, 16, size=n_cells).astype(np.float32)
     assignments = []
     for i, barcode in enumerate(barcodes):
         roll = rng.random()
@@ -42,8 +57,23 @@ def write_demo_dragen(output_dir: Path, n_cells: int = 120, n_genes: int = 80, s
         umi = int(rng.integers(8, 60))
         assignments.append((barcode, 1, guide_id, str(umi)))
         if target != "NT":
-            module = slice(0, 12)
-            matrix[module, i] = matrix[module, i] + rng.integers(4, 12, size=12)
+            # Generic module shift on filler genes (leave planted targets for LFC logic).
+            start = len(target_symbols)
+            end = min(start + 12, n_genes - n_mt)
+            width = end - start
+            if width > 0:
+                matrix[start:end, i] = matrix[start:end, i] + rng.integers(4, 12, size=width)
+            if target in target_symbols:
+                ti = target_symbols.index(target)
+                if guide_id == "IFNGR2_1":
+                    # Strong knockdown → target_effect_direction "down"
+                    matrix[ti, i] = float(rng.integers(1, 3))
+                elif guide_id == "IFNGR2_2":
+                    # Conflicting / weak guide → "up" vs NT baseline (inconsistency)
+                    matrix[ti, i] = float(rng.integers(22, 30))
+                else:
+                    # Single-guide targets: mild consistent knockdown
+                    matrix[ti, i] = float(rng.integers(1, 4))
         matrix[n_genes + gi, i] = umi
     mtx_path = output_dir / SAMPLE_FILES["matrix"].format(sample=sample)
     tmp = output_dir / "_matrix.mtx"

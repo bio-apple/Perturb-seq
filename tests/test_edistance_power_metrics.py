@@ -10,8 +10,10 @@ import pandas as pd
 from anndata import AnnData
 
 from perturbseq.perturbation import (
+    annotate_edistance_bootstrap_ci,
     annotate_etest_power,
     combine_distance_tables,
+    energy_distance,
     run_secondary_distances,
 )
 from perturbseq.pipeline import PipelineConfig, _embedding_provenance, pipeline_config_from_mapping
@@ -44,6 +46,49 @@ def test_annotate_etest_power_derives_significant_adj_from_padj():
     assert bool(out.loc["A", "significant_adj"]) is True
     assert bool(out.loc["A", "significant_adj_reported"]) is True
     assert bool(out.loc["B", "significant_adj_reported"]) is False
+
+
+def test_bootstrap_edistance_ci_smoke():
+    """Tiny cell-bootstrap CI: finite, ordered, and contains the point estimate."""
+    rng = np.random.default_rng(0)
+    n_nt, n_ko = 30, 25
+    pca = np.zeros((n_nt + n_ko, 6), dtype=float)
+    pca[:n_nt] = rng.normal(0, 0.3, size=(n_nt, 6))
+    pca[n_nt:] = rng.normal(0, 0.3, size=(n_ko, 6))
+    pca[n_nt:, 0] += 3.0
+    obs = pd.DataFrame({"gene_target": ["NT"] * n_nt + ["KO"] * n_ko})
+    adata = AnnData(X=rng.normal(size=(n_nt + n_ko, 8)), obs=obs)
+    adata.obsm["X_pca"] = pca
+
+    point = energy_distance(pca[n_nt:], pca[:n_nt])
+    edist = pd.DataFrame({"edistance": [point], "n_cells": [n_ko]}, index=["KO"])
+    out = annotate_edistance_bootstrap_ci(
+        edist,
+        adata,
+        groupby="gene_target",
+        contrast="NT",
+        n_bootstrap=20,
+        ci_level=0.95,
+        random_state=0,
+        n_jobs=1,
+    )
+    lo = float(out.loc["KO", "edistance_ci_low"])
+    hi = float(out.loc["KO", "edistance_ci_high"])
+    assert np.isfinite(lo) and np.isfinite(hi)
+    assert lo <= hi
+    assert lo <= point <= hi
+    assert int(out.loc["KO", "n_bootstrap"]) == 20
+    assert float(out.loc["KO", "ci_level"]) == 0.95
+
+
+def test_bootstrap_ci_skipped_when_n_bootstrap_zero():
+    rng = np.random.default_rng(1)
+    adata = AnnData(X=rng.normal(size=(20, 4)))
+    adata.obs["gene_target"] = ["NT"] * 10 + ["KO"] * 10
+    adata.obsm["X_pca"] = rng.normal(size=(20, 3))
+    edist = pd.DataFrame({"edistance": [1.0], "n_cells": [10]}, index=["KO"])
+    out = annotate_edistance_bootstrap_ci(edist, adata, n_bootstrap=0)
+    assert "edistance_ci_low" not in out.columns
 
 
 def test_embedding_provenance_always_has_required_keys(tmp_path: Path):

@@ -21,6 +21,14 @@ from perturbseq.preprocessing import preprocess_rna
 from perturbseq.report import init_report, write_html_summary, write_report_json
 from perturbseq.robustness import integrate_evidence
 from perturbseq.statistics import run_deseq2_or_wilcoxon as run_de
+from perturbseq.stages import (
+    stage_input_validation as stage_input_validation_pkg,
+    stage_perturbation_modeling as stage_perturbation_modeling_pkg,
+    stage_preprocessing_qc as stage_preprocessing_qc_pkg,
+    stage_report as stage_report_pkg,
+    stage_robustness as stage_robustness_pkg,
+    stage_statistical_inference as stage_statistical_inference_pkg,
+)
 
 
 def test_target_modules_importable():
@@ -34,6 +42,7 @@ def test_target_modules_importable():
     import perturbseq.report as report
     import perturbseq.robustness as robustness
     import perturbseq.statistics as statistics
+    import perturbseq.stages as stages
 
     assert guides.annotate_guides is annotate_guides_new
     assert hasattr(guide_qc, "run_guide_qc")
@@ -48,10 +57,15 @@ def test_target_modules_importable():
     assert hasattr(robustness, "integrate_evidence")
     assert hasattr(statistics, "check_experimental_design")
     assert hasattr(statistics, "run_de_contrasts")
+    assert hasattr(statistics, "build_deseq2_design")
+    import perturbseq.guide_reassignment as guide_reassignment
+
+    assert hasattr(guide_reassignment, "run_guide_reassignment")
     assert hasattr(parallel, "parallel_map")
     assert hasattr(parallel, "resolve_n_jobs")
     assert parse_gene_target("NTC_01") == "NT"
     assert DEFAULT_CONTROL_PATTERNS
+    assert hasattr(stages, "stage_input_validation")
 
 
 def test_pipeline_stages_documented():
@@ -72,6 +86,12 @@ def test_pipeline_stages_documented():
         stage_report,
     ):
         assert callable(fn)
+    assert stage_input_validation is stage_input_validation_pkg
+    assert stage_preprocessing_qc is stage_preprocessing_qc_pkg
+    assert stage_perturbation_modeling is stage_perturbation_modeling_pkg
+    assert stage_statistical_inference is stage_statistical_inference_pkg
+    assert stage_robustness is stage_robustness_pkg
+    assert stage_report is stage_report_pkg
 
 
 def test_report_and_robustness_helpers(tmp_path: Path):

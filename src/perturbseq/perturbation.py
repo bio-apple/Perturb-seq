@@ -1,4 +1,10 @@
-"""Perturbation modeling: Mixscape, E-distance, and guide-consistency hooks."""
+"""Domain: Mixscape, E-distance, secondary distances, perturbation clustering.
+
+Owns: perturbation-effect modeling algorithms and related helpers.
+Does NOT own: pseudobulk DE / FDR (``statistics``), confidence flags (``robustness``),
+or stage wiring (``stages.perturbation_modeling``). Guide QC math lives in ``guide_qc``
+(re-exported hooks only).
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,111 @@ from perturbseq.parallel import parallel_map, resolve_n_jobs
 DEFAULT_SECONDARY_DISTANCE_METRICS: tuple[str, ...] = ("mmd", "wasserstein")
 # Peidli et al.: E-test is underpowered at small n; ~50–100 safer, ~200 more stable.
 DEFAULT_ETEST_POWER_MIN_CELLS = 50
+# Bootstrap replicates for E-distance CI over cells (0 = skip). Modest default for speed.
+DEFAULT_N_BOOTSTRAP = 100
+DEFAULT_EDISTANCE_CI_LEVEL = 0.95
+
+
+def _pairwise_mean_norm(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean Euclidean distance between all pairs of rows in a and b."""
+    a2 = np.sum(a * a, axis=1)[:, None]
+    b2 = np.sum(b * b, axis=1)[None, :]
+    d2 = np.maximum(a2 + b2 - 2.0 * (a @ b.T), 0.0)
+    return float(np.sqrt(d2).mean())
+
+
+def energy_distance(x: np.ndarray, y: np.ndarray) -> float:
+    """Scalar energy distance between two point clouds (embedding rows)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.ndim != 2 or y.ndim != 2 or x.shape[0] == 0 or y.shape[0] == 0:
+        return float("nan")
+    return (
+        2.0 * _pairwise_mean_norm(x, y)
+        - _pairwise_mean_norm(x, x)
+        - _pairwise_mean_norm(y, y)
+    )
+
+
+def _bootstrap_edistance_one_group(
+    args: tuple[str, np.ndarray, np.ndarray, int, float, int],
+) -> tuple[str, float, float]:
+    """Worker: percentile CI for energy distance by resampling cells in both groups."""
+    group, group_emb, ctrl_emb, n_bootstrap, ci_level, seed = args
+    rng = np.random.default_rng(int(seed))
+    n_g = int(group_emb.shape[0])
+    n_c = int(ctrl_emb.shape[0])
+    if n_g < 2 or n_c < 2 or n_bootstrap <= 0:
+        return str(group), float("nan"), float("nan")
+    stats = np.empty(int(n_bootstrap), dtype=float)
+    for i in range(int(n_bootstrap)):
+        g_idx = rng.integers(0, n_g, size=n_g)
+        c_idx = rng.integers(0, n_c, size=n_c)
+        stats[i] = energy_distance(group_emb[g_idx], ctrl_emb[c_idx])
+    alpha = 1.0 - float(ci_level)
+    lo, hi = np.quantile(stats, [alpha / 2.0, 1.0 - alpha / 2.0])
+    return str(group), float(lo), float(hi)
+
+
+def annotate_edistance_bootstrap_ci(
+    edistances: pd.DataFrame,
+    adata: AnnData,
+    *,
+    groupby: str = "gene_target",
+    contrast: str = "NT",
+    n_bootstrap: int = DEFAULT_N_BOOTSTRAP,
+    ci_level: float = DEFAULT_EDISTANCE_CI_LEVEL,
+    random_state: int = 0,
+    n_jobs: int = 1,
+) -> pd.DataFrame:
+    """Add ``edistance_ci_low`` / ``edistance_ci_high`` via cell bootstrap (percentile CI).
+
+    ``n_bootstrap <= 0`` leaves the frame unchanged (no CI columns). Uses the same
+    energy-distance definition as the unit tests / scPerturb spirit; does not require
+    pertpy. Parallelizes over groups when ``n_jobs != 1``.
+    """
+    out = edistances.copy()
+    n_boot = int(n_bootstrap)
+    if n_boot <= 0 or out.empty:
+        return out
+    if "X_pca" not in adata.obsm:
+        out["edistance_ci_low"] = np.nan
+        out["edistance_ci_high"] = np.nan
+        out["n_bootstrap"] = 0
+        out["ci_level"] = float(ci_level)
+        return out
+
+    labels = adata.obs[groupby].astype(str)
+    embedding = np.asarray(adata.obsm["X_pca"], dtype=float)
+    ctrl_mask = labels == str(contrast)
+    ctrl_emb = embedding[ctrl_mask.to_numpy()]
+    tasks: list[tuple[str, np.ndarray, np.ndarray, int, float, int]] = []
+    for i, group in enumerate(out.index.astype(str)):
+        g_emb = embedding[(labels == group).to_numpy()]
+        # Distinct seed per group for reproducibility across n_jobs.
+        seed = int(random_state) + 1_000_003 * (i + 1)
+        tasks.append((str(group), g_emb, ctrl_emb, n_boot, float(ci_level), seed))
+
+    results = parallel_map(_bootstrap_edistance_one_group, tasks, n_jobs=n_jobs)
+    lo_map = {g: lo for g, lo, _ in results}
+    hi_map = {g: hi for g, _, hi in results}
+    out["edistance_ci_low"] = [lo_map.get(str(g), float("nan")) for g in out.index.astype(str)]
+    out["edistance_ci_high"] = [hi_map.get(str(g), float("nan")) for g in out.index.astype(str)]
+    out["n_bootstrap"] = n_boot
+    out["ci_level"] = float(ci_level)
+    return out
+
+
+def _attach_edistance_ci_to_etest(
+    etest: pd.DataFrame,
+    edistances: pd.DataFrame,
+) -> pd.DataFrame:
+    """Copy bootstrap CI columns from edistance table onto matching E-test rows."""
+    out = etest.copy()
+    for col in ("edistance_ci_low", "edistance_ci_high", "n_bootstrap", "ci_level"):
+        if col in edistances.columns:
+            out[col] = edistances[col].reindex(out.index).to_numpy()
+    return out
 
 
 def estimate_mixscape_cost(
@@ -352,6 +463,8 @@ def run_edistance(
     pca_source: str = "log1p_hvg",
     n_jobs: int = 1,
     power_min_cells: int = DEFAULT_ETEST_POWER_MIN_CELLS,
+    n_bootstrap: int = DEFAULT_N_BOOTSTRAP,
+    ci_level: float = DEFAULT_EDISTANCE_CI_LEVEL,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """E-distance on ``obsm['X_pca']``. ``pca_source`` is recorded for report provenance only.
 
@@ -360,6 +473,8 @@ def run_edistance(
     DistanceTest call (original behavior). pertpy DistanceTest has no internal
     n_jobs hook; only the outer group loop is parallelized here.
 
+    By default, bootstrap percentile CIs over cells are attached
+    (``edistance_ci_low`` / ``edistance_ci_high``; ``n_bootstrap=0`` disables).
     E-test rows are annotated with ``n_cells``, ``low_power``, and
     ``significant_adj_reported`` (significance only trusted when not low-power).
     """
@@ -375,6 +490,16 @@ def run_edistance(
     # Drop helper column used by secondary metrics; keep edistance-focused schema.
     if "metric" in edistances.columns:
         edistances = edistances.drop(columns=["metric"])
+    edistances = annotate_edistance_bootstrap_ci(
+        edistances,
+        adata,
+        groupby=groupby,
+        contrast=contrast,
+        n_bootstrap=n_bootstrap,
+        ci_level=ci_level,
+        random_state=random_state,
+        n_jobs=n_jobs,
+    )
     pt = require_pertpy()
     counts = adata.obs[groupby].astype(str).value_counts()
     keep_groups = set(counts[counts >= min_cells].index)
@@ -436,6 +561,7 @@ def run_edistance(
             edistances["n_cells"] if "n_cells" in edistances.columns else counts,
             power_min_cells=power_min_cells,
         )
+        etest_results = _attach_edistance_ci_to_etest(etest_results, edistances)
     return edistances, etest_results
 
 
@@ -456,12 +582,16 @@ def cluster_perturbations(adata: AnnData, groupby: str = "gene_target", n_neighb
 
 
 __all__ = [
+    "DEFAULT_EDISTANCE_CI_LEVEL",
     "DEFAULT_ETEST_POWER_MIN_CELLS",
+    "DEFAULT_N_BOOTSTRAP",
     "DEFAULT_SECONDARY_DISTANCE_METRICS",
+    "annotate_edistance_bootstrap_ci",
     "annotate_etest_power",
     "cluster_perturbations",
     "combine_distance_tables",
     "compute_gene_guide_consistency",
+    "energy_distance",
     "estimate_mixscape_cost",
     "filter_cells_for_mixscape_targets",
     "merge_mixscape_annotations",

@@ -8,8 +8,10 @@ import pytest
 from anndata import AnnData
 
 from perturbseq.statistics import (
+    build_deseq2_design,
     check_experimental_design,
     exploratory_wilcoxon,
+    resolve_de_covariates,
     run_de_contrasts,
     run_deseq2_or_wilcoxon,
 )
@@ -37,6 +39,7 @@ def test_experimental_design_flags_no_replicates():
     design = check_experimental_design(adata, replicate_col=None, groupby="gene_target")
     assert design["replicate_aware"] is False
     assert design["recommended_method"] == "wilcoxon_cell_level_exploratory"
+    assert design["evidence_level"] == "exploratory"
     assert design["n_groups"] == 2
     assert design["note"] is not None
 
@@ -48,6 +51,7 @@ def test_experimental_design_replicate_aware():
     assert design["replicate_aware"] is True
     assert design["n_replicates"] == 2
     assert design["recommended_method"] == "pydeseq2_pseudobulk"
+    assert design["evidence_level"] == "inferential"
 
 
 def test_wilcoxon_planted_signal_ranks_and_pvalues():
@@ -55,6 +59,7 @@ def test_wilcoxon_planted_signal_ranks_and_pvalues():
     table = exploratory_wilcoxon(adata, groupby="gene_target", group="KOGENE", reference="NT")
     assert not table.empty
     assert table["method"].iloc[0] == "wilcoxon_cell_level_exploratory"
+    assert table["evidence_level"].iloc[0] == "exploratory"
     ranked = table.set_index("names")
     assert ranked.index[0] == "g0"
     p0 = float(ranked.loc["g0", "pvals"])
@@ -78,7 +83,15 @@ def test_run_deseq2_or_wilcoxon_falls_back_without_replicates():
         adata, group="KOGENE", reference="NT", replicate_col=None, groupby="gene_target"
     )
     assert table["method"].iloc[0] == "wilcoxon_cell_level_exploratory"
+    assert table["evidence_level"].iloc[0] == "exploratory"
     assert table.set_index("names").index[0] == "g0"
+
+
+def test_evidence_level_assignment_exploratory_vs_inferential_helper():
+    from perturbseq.statistics import de_evidence_level
+
+    assert de_evidence_level(replicate_aware=False) == "exploratory"
+    assert de_evidence_level(replicate_aware=True) == "inferential"
 
 
 def test_de_contrasts_skips_below_min_cells():
@@ -140,5 +153,72 @@ def test_edistance_ranking_with_pertpy_if_available():
         etest_random_n=0,
         random_state=0,
         n_jobs=1,
+        n_bootstrap=0,
     )
     assert float(edist.loc["STRONG", "edistance"]) > float(edist.loc["NULL", "edistance"])
+
+
+def test_build_deseq2_design_order_and_dedupe():
+    assert build_deseq2_design("de_group") == "~ de_group"
+    assert (
+        build_deseq2_design("de_group", replicate_col="replicate", covariates=["phase", "log_n_counts"])
+        == "~ replicate + phase + log_n_counts + de_group"
+    )
+    # Duplicate groupby / covariate names dropped.
+    assert build_deseq2_design("de_group", covariates=["de_group", "phase"]) == "~ phase + de_group"
+
+
+def test_resolve_de_covariates_true_false_and_list():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["n_counts"] = 1000.0
+    adata.obs["pct_counts_mt"] = 2.0
+    adata.obs["phase"] = "G1"
+    assert resolve_de_covariates(adata, False) == []
+    resolved = resolve_de_covariates(adata, True)
+    assert "log_n_counts" in resolved
+    assert "pct_counts_mt" in resolved
+    assert "phase" in resolved
+    assert "log_n_counts" in adata.obs.columns
+    assert resolve_de_covariates(adata, ["phase", "missing_col"]) == ["phase"]
+
+
+def test_check_experimental_design_records_covariates_for_wilcoxon():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["phase"] = "G1"
+    design = check_experimental_design(
+        adata, replicate_col=None, groupby="gene_target", covariates=["phase"]
+    )
+    assert design["replicate_aware"] is False
+    assert design["covariates"] == ["phase"]
+    assert design["design_formula"] is None
+    assert "covariates" in (design["note"] or "").lower() or "phase" in (design["note"] or "")
+
+
+def test_wilcoxon_records_ignored_covariates():
+    adata = _planted_wilcoxon_adata()
+    adata.obs["phase"] = "G1"
+    table = run_deseq2_or_wilcoxon(
+        adata,
+        group="KOGENE",
+        reference="NT",
+        replicate_col=None,
+        groupby="gene_target",
+        covariates=["phase"],
+    )
+    assert "covariates_ignored" in table.columns
+    assert "phase" in str(table["covariates_ignored"].iloc[0])
+
+
+def test_pipeline_config_parses_guide_reassign_and_de_covariates():
+    from perturbseq.pipeline import pipeline_config_from_mapping
+
+    cfg = pipeline_config_from_mapping(
+        {
+            "input_dir": "/tmp/in",
+            "output_dir": "/tmp/out",
+            "guide_reassign": "compare",
+            "de_covariates": ["phase", "log_n_counts"],
+        }
+    )
+    assert cfg.guide_reassign == "compare"
+    assert cfg.de_covariates == ("phase", "log_n_counts")

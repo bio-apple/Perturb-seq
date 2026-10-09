@@ -2,13 +2,16 @@
 
 Stage map (matches the engineering structure diagram)::
 
-    1. Input & validation          → io
-    2. Preprocessing & QC          → guides, qc, preprocessing
+    1. Input & validation          → stages.input_validation → io
+    2. Preprocessing & QC          → stages.preprocessing_qc → guides, qc, preprocessing
     3. Parallel tracks (sequential in-process):
-         A. Perturbation modeling  → perturbation (+ guide consistency)
-         B. Statistical inference  → statistics
-    4. Robustness & evidence       → robustness
-    5. Reproducible report         → report (H5AD / CSV / JSON / HTML / provenance)
+         A. Perturbation modeling  → stages.perturbation_modeling → perturbation
+         B. Statistical inference  → stages.statistical_inference → statistics
+    4. Robustness & evidence       → stages.robustness → robustness
+    5. Reproducible report         → stages.report → report
+
+Owns: ``PipelineConfig``, dry-run planning, checkpoint/resume orchestration.
+Does NOT own: stage science bodies (``stages/``) or domain algorithms.
 
 Resume / audit artifacts are managed by ``perturbseq.repro.RunTracker``.
 """
@@ -16,7 +19,6 @@ Resume / audit artifacts are managed by ``perturbseq.repro.RunTracker``.
 from __future__ import annotations
 
 import json
-import warnings
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -24,56 +26,35 @@ from typing import Any
 import pandas as pd
 from anndata import AnnData, read_h5ad
 
-from perturbseq._deps import PERTPY_MISSING_MSG, is_pertpy_import_error, warn_if_pertpy_missing
-from perturbseq.cell_annotation import annotate_cells, annotation_summary, write_annotation_tables
-from perturbseq.composition import append_composition_audit, write_composition_audit
-from perturbseq.guides import (
-    DEFAULT_CONTROL_PATTERNS,
-    annotate_guides,
-    filter_singlets,
-    run_guide_qc,
-    write_guide_qc_tables,
-)
-from perturbseq.io import load_dragen_sample, validate_sample_inputs, write_h5ad
+from perturbseq.guide_reassignment import GUIDE_REASSIGN_MODES
+from perturbseq.guides import DEFAULT_CONTROL_PATTERNS
+from perturbseq.io import validate_sample_inputs, write_h5ad
 from perturbseq.perturbation import (
     DEFAULT_ETEST_POWER_MIN_CELLS,
+    DEFAULT_N_BOOTSTRAP,
     DEFAULT_SECONDARY_DISTANCE_METRICS,
-    cluster_perturbations,
-    combine_distance_tables,
-    estimate_mixscape_cost,
-    filter_cells_for_mixscape_targets,
-    merge_mixscape_annotations,
-    run_edistance,
-    run_mixscape,
-    run_secondary_distances,
-    select_mixscape_targets_from_edistance,
 )
-from perturbseq.plots import (
-    plot_cell_annotation,
-    plot_edistance,
-    plot_guide_composition,
-    plot_guide_qc,
-    plot_qc,
-    plot_umap,
-    plot_volcano,
-)
-from perturbseq.preprocessing import preprocess_rna
-from perturbseq.qc import add_qc_metrics, filter_cells, sample_qc_summary
-from perturbseq.report import (
-    completed_status,
-    finalize_outputs,
-    init_report,
-    mixscape_kd_caveat,
-    skipped_status,
-)
+from perturbseq.report import init_report
 from perturbseq.repro import (
     STAGE_ORDER,
     RunTracker,
     config_params_dict,
     sha256_paths,
 )
-from perturbseq.robustness import integrate_evidence
-from perturbseq.statistics import check_experimental_design, run_de_contrasts
+from perturbseq.composition import write_composition_audit
+from perturbseq.stages import (
+    stage_input_validation,
+    stage_perturbation_modeling,
+    stage_preprocessing_qc,
+    stage_report,
+    stage_robustness,
+    stage_statistical_inference,
+)
+from perturbseq.stages._helpers import (
+    _effective_mixscape_mode,
+    _embedding_provenance,
+    _mark_stage,
+)
 
 # Keep in sync with repro.STAGE_ORDER.
 PIPELINE_STAGES = STAGE_ORDER
@@ -101,6 +82,8 @@ class PipelineConfig:
     # Peidli et al.: prefer ≥50–100 cells/pert for trusted E-test; ~200 more stable.
     etest_power_min_cells: int = DEFAULT_ETEST_POWER_MIN_CELLS
     secondary_distance_metrics: tuple[str, ...] = DEFAULT_SECONDARY_DISTANCE_METRICS
+    # Cell bootstrap replicates for E-distance CI (0 = skip). Modest default for speed.
+    n_bootstrap: int = DEFAULT_N_BOOTSTRAP
     mixscape_max_targets: int = 40
     force_mixscape: bool = False
     # auto | skip | force | subset — CLI --skip/--force still work; subset = NT+selected targets.
@@ -115,6 +98,12 @@ class PipelineConfig:
     # none = flag inconsistency only (default); equal|umi|confidence|umi_confidence
     # add weighted gene-level summaries without dropping per-guide rows.
     guide_merge: str = "none"
+    # Optional tertiary guide re-call vs DRAGEN: off | compare | apply_max | apply_gmm
+    guide_reassign: str = "off"
+    guide_reassign_min_umi: float = 1.0
+    # Include cell-level covariates in PyDESeq2 design when available (Wilcoxon: documented ignore).
+    # True = default candidates (phase, pct_counts_mt, log_n_counts); False/[] = off; list = explicit.
+    de_covariates: bool | tuple[str, ...] = True
     extra: dict = field(default_factory=dict)
 
 
@@ -166,8 +155,32 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
                 kwargs[key] = tuple(p.strip() for p in value.split(",") if p.strip())
             else:
                 kwargs[key] = tuple(str(p).strip() for p in value if str(p).strip())
+        elif key == "de_covariates" and value is not None:
+            if isinstance(value, bool):
+                kwargs[key] = value
+            elif isinstance(value, str):
+                low = value.strip().lower()
+                if low in {"true", "yes", "1"}:
+                    kwargs[key] = True
+                elif low in {"false", "no", "0", "none", ""}:
+                    kwargs[key] = False
+                else:
+                    kwargs[key] = tuple(p.strip() for p in value.split(",") if p.strip())
+            else:
+                kwargs[key] = tuple(str(p).strip() for p in value if str(p).strip())
         elif key == "mixscape_mode" and value is not None:
             kwargs[key] = str(value).strip().lower()
+        elif key == "guide_reassign" and value is not None:
+            # YAML 1.1 treats bare `off`/`on` as bool; coerce to mode strings.
+            if value is False:
+                kwargs[key] = "off"
+            elif value is True:
+                raise ValueError(
+                    "guide_reassign got boolean true; use off|compare|apply_max|apply_gmm "
+                    '(quote "off" in YAML to avoid YAML 1.1 bool parsing)'
+                )
+            else:
+                kwargs[key] = str(value).strip().lower()
         else:
             kwargs[key] = value
     if "input_dir" not in kwargs or "output_dir" not in kwargs:
@@ -194,109 +207,16 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
         if mode not in GUIDE_MERGE_MODES:
             raise ValueError(f"guide_merge must be one of {GUIDE_MERGE_MODES}, got {kwargs['guide_merge']!r}")
         kwargs["guide_merge"] = mode
+    if "guide_reassign" in kwargs and kwargs["guide_reassign"] is not None:
+        mode = str(kwargs["guide_reassign"]).lower()
+        if mode not in GUIDE_REASSIGN_MODES:
+            raise ValueError(
+                f"guide_reassign must be one of {GUIDE_REASSIGN_MODES}, got {kwargs['guide_reassign']!r}"
+            )
+        kwargs["guide_reassign"] = mode
     if extra:
         kwargs["extra"] = {**(kwargs.get("extra") or {}), **extra}
     return PipelineConfig(**kwargs)
-
-
-def _mixscape_subset(adata: AnnData, control: str) -> AnnData:
-    if "mixscape_class_global" not in adata.obs:
-        return adata
-    keep = adata.obs["mixscape_class_global"].astype(str).isin([control, "KO"])
-    return adata[keep].copy()
-
-
-def _effective_mixscape_mode(config: PipelineConfig) -> str:
-    """Resolve mixscape_mode with legacy --skip-mixscape / --force-mixscape flags."""
-    mode = (config.mixscape_mode or "auto").strip().lower()
-    if config.skip_mixscape or mode == "skip":
-        return "skip"
-    if config.force_mixscape or mode == "force":
-        return "force"
-    if mode == "subset":
-        return "subset"
-    # Explicit target list / top-n implies subset even under auto.
-    if config.mixscape_targets or config.mixscape_top_n:
-        return "subset"
-    return "auto"
-
-
-def _ko_label(gene: str, perturbation_type: str) -> str:
-    return f"{gene} {perturbation_type}"
-
-
-def _embedding_provenance(adata: AnnData, pca_source: str, config: PipelineConfig) -> dict[str, Any]:
-    """Always-present embedding provenance keys for report.json → matrix_provenance."""
-    if "highly_variable" in adata.var.columns:
-        n_hvg = int(adata.var["highly_variable"].sum())
-    else:
-        n_hvg = int(config.n_top_genes)
-    if "X_pca" in adata.obsm:
-        n_pcs = int(adata.obsm["X_pca"].shape[1])
-    else:
-        n_pcs = int(config.n_pcs)
-    return {"pca_source": str(pca_source), "n_hvg": n_hvg, "n_pcs": n_pcs}
-
-
-def _write_edistance_outputs(
-    edistances: pd.DataFrame,
-    etest: pd.DataFrame | None,
-    tables_dir: Path,
-    figures_dir: Path,
-    secondary: dict[str, pd.DataFrame] | None = None,
-    secondary_status: list[dict[str, Any]] | None = None,
-) -> None:
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    edistances.to_csv(tables_dir / "edistance.csv")
-    plot_edistance(edistances, figures_dir)
-    if etest is not None:
-        etest.to_csv(tables_dir / "etest.csv")
-    secondary = secondary or {}
-    for metric, frame in secondary.items():
-        if frame is not None and not frame.empty:
-            frame.to_csv(tables_dir / f"distance_{metric}.csv")
-    combine_distance_tables(edistances, secondary).to_csv(tables_dir / "distances.csv")
-    if secondary_status is not None:
-        (tables_dir / "distance_metrics_status.json").write_text(
-            json.dumps(secondary_status, indent=2, default=str)
-        )
-
-
-def _compute_secondary_distances(
-    adata: AnnData,
-    config: PipelineConfig,
-    pca_source: str,
-) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
-    metrics = tuple(config.secondary_distance_metrics or ())
-    if not metrics:
-        return {}, []
-    return run_secondary_distances(
-        adata,
-        groupby="gene_target",
-        contrast=config.control,
-        min_cells=config.min_cells_per_pert,
-        metrics=metrics,
-        pca_source=pca_source,
-        n_jobs=config.n_jobs,
-    )
-
-
-def _pca_from_layer(adata: AnnData, layer: str, n_pcs: int) -> None:
-    import scanpy as sc
-
-    tmp = adata.copy()
-    tmp.X = tmp.layers[layer]
-    n_comps = min(n_pcs, max(2, tmp.n_obs - 1), max(2, tmp.n_vars - 1))
-    sc.pp.pca(tmp, n_comps=n_comps)
-    adata.obsm["X_pca"] = tmp.obsm["X_pca"]
-
-
-def _mark_stage(report: dict, stage: str) -> None:
-    stages = list(report.get("stages") or [])
-    if stage not in stages:
-        stages.append(stage)
-    report["stages"] = stages
 
 
 def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
@@ -313,6 +233,8 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "leiden_resolution": config.leiden_resolution,
             "skip_cell_annotation": config.skip_cell_annotation,
             "control_patterns": list(config.control_patterns),
+            "guide_reassign": config.guide_reassign,
+            "guide_reassign_min_umi": config.guide_reassign_min_umi,
         },
         "3a_perturbation_modeling": {
             **common,
@@ -330,6 +252,7 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "min_cells_per_pert": config.min_cells_per_pert,
             "etest_power_min_cells": config.etest_power_min_cells,
             "secondary_distance_metrics": list(config.secondary_distance_metrics),
+            "n_bootstrap": config.n_bootstrap,
             "n_pcs": config.n_pcs,
             "n_jobs": config.n_jobs,
             "guide_merge": config.guide_merge,
@@ -341,6 +264,9 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "replicate_col": config.replicate_col,
             "perturbation_type": config.perturbation_type,
             "de_top_n": config.de_top_n,
+            "de_covariates": config.de_covariates
+            if isinstance(config.de_covariates, bool)
+            else list(config.de_covariates),
             "min_cells_per_pert": config.min_cells_per_pert,
             "n_jobs": config.n_jobs,
         },
@@ -374,707 +300,6 @@ def _read_stage_state(tracker: RunTracker, stage: str) -> dict[str, Any]:
     if not path.is_file():
         return {}
     return json.loads(path.read_text())
-
-
-def stage_input_validation(config: PipelineConfig, report: dict) -> tuple[AnnData, dict[str, Path]]:
-    """Stage 1: DRAGEN MEX + guide reference + assignments."""
-    print(f"[1/5] Input & validation: {config.sample_id} from {config.input_dir}", flush=True)
-    files = validate_sample_inputs(config.input_dir, config.sample_id)
-    rna, _crispr, assignments, feature_ref = load_dragen_sample(config.input_dir, config.sample_id)
-    print(f"Loaded {rna.n_obs} cells × {rna.n_vars} genes", flush=True)
-    report["n_cells_loaded"] = int(rna.n_obs)
-    report["n_genes_loaded"] = int(rna.n_vars)
-    report["input_files"] = {k: str(v) for k, v in files.items()}
-    _mark_stage(report, "1_input_validation")
-    # Carry assignments/ref via temporary attrs for stage 2 (avoid widening return API).
-    rna.uns["_perturbseq_assignments"] = assignments
-    rna.uns["_perturbseq_feature_ref"] = feature_ref
-    return rna, files
-
-
-def stage_preprocessing_qc(
-    rna: AnnData,
-    config: PipelineConfig,
-    report: dict,
-    figures: Path,
-    composition_rows: list[pd.DataFrame],
-) -> AnnData:
-    """Stage 2: guide assignment validation, cell QC, sample QC, normalize/PCA/UMAP."""
-    print("[2/5] Preprocessing & QC", flush=True)
-    assignments = rna.uns.pop("_perturbseq_assignments")
-    feature_ref = rna.uns.pop("_perturbseq_feature_ref")
-    rna = annotate_guides(rna, assignments, feature_ref, config.control_patterns)
-    rna = add_qc_metrics(rna)
-    plot_qc(rna, figures)
-    plot_guide_composition(rna, figures)
-    report["guide_counts"] = rna.obs["num_features"].value_counts().sort_index().to_dict()
-    report["gene_target_counts"] = rna.obs["gene_target"].value_counts().to_dict()
-    report["sample_qc"] = sample_qc_summary(rna)
-    append_composition_audit(composition_rows, rna, "loaded")
-
-    rna, qc_log = filter_cells(rna, n_mads=config.n_mads, min_cells=config.min_cells)
-    report["qc"] = qc_log
-    report.setdefault("composition_notes", []).append(
-        f"QC removed {qc_log.get('n_cells_removed_qc', 0)} cells; gene set also filtered (min_cells={config.min_cells})."
-    )
-    append_composition_audit(composition_rows, rna, "after_qc")
-    n_before_singlet = int(rna.n_obs)
-    rna = filter_singlets(rna, singlet_only=config.singlet_only)
-    report["n_after_singlet"] = int(rna.n_obs)
-    report["n_removed_nonsinglet"] = n_before_singlet - int(rna.n_obs)
-    if config.singlet_only:
-        report["composition_notes"].append(
-            f"Singlet filter removed {report['n_removed_nonsinglet']} cells (num_features != 1)."
-        )
-    append_composition_audit(composition_rows, rna, "after_singlet")
-    if rna.n_obs < 20:
-        raise ValueError(
-            f"Too few cells: only {rna.n_obs} remain after QC/singlet filters (need ≥20).\n"
-            "Suggested commands / knobs:\n"
-            f"  python -m perturbseq run ... --n-mads {max(config.n_mads, 8)}  # relax MAD QC\n"
-            "  python -m perturbseq run ... --keep-multiplets  # keep multi-guide cells\n"
-            f"  # or lower min_cells in YAML (currently {config.min_cells})\n"
-            "  python -m perturbseq run ... --dry-run  # inspect resolved params"
-        )
-
-    rna = preprocess_rna(
-        rna,
-        n_top_genes=config.n_top_genes,
-        n_pcs=config.n_pcs,
-        leiden_resolution=config.leiden_resolution,
-        random_state=config.random_state,
-    )
-    report.setdefault("matrix_provenance", {}).update(
-        {
-            "layers_counts": "raw_umi (preserved before normalize/log1p)",
-            "X": "log1p_normalized",
-            "X_pca_global": "PCA on HVG of log1p X; descriptive structure",
-            "X_umap": "visualization_only; not perturbation-effect evidence",
-            "leiden": "descriptive clusters; not perturbation-effect evidence",
-            **_embedding_provenance(rna, "log1p_hvg", config),
-        }
-    )
-    report["steps"].append("preprocess_hvg_pca_leiden")
-    umap_color = ["leiden", "perturbation"]
-    if rna.obs["gene_target"].nunique() <= 40:
-        umap_color.insert(1, "gene_target")
-    plot_umap(rna, figures, color=umap_color)
-    report["steps"].append("umap")
-    append_composition_audit(composition_rows, rna, "after_preprocess")
-
-    if not config.skip_cell_annotation:
-        print("Annotating cell cycle / cell states", flush=True)
-        rna, markers = annotate_cells(rna)
-        write_annotation_tables(rna, markers, config.output_dir / "tables")
-        plot_cell_annotation(rna, figures)
-        report["cell_annotation"] = completed_status(**annotation_summary(rna))
-        report["steps"].append("cell_annotation")
-        append_composition_audit(composition_rows, rna, "after_cell_annotation")
-    else:
-        report["cell_annotation"] = skipped_status(
-            "user_skip",
-            detail="Cell annotation skipped (--skip-cell-annotation).",
-        )
-
-    _mark_stage(report, "2_preprocessing_qc")
-    return rna
-
-
-def stage_perturbation_modeling(
-    rna: AnnData,
-    config: PipelineConfig,
-    report: dict,
-    figures: Path,
-    tables: Path,
-    composition_rows: list[pd.DataFrame],
-) -> tuple[AnnData, AnnData, pd.DataFrame, bool, dict, pd.DataFrame]:
-    """Stage 3A: Mixscape, E-distance, guide consistency (conceptually parallel to 3B)."""
-    print("[3a/5] Perturbation modeling (Mixscape / E-distance / guide consistency)", flush=True)
-    pertpy_warn = warn_if_pertpy_missing(
-        need_mixscape=not config.skip_mixscape,
-        need_distance=not config.skip_distance,
-        need_deseq2=False,
-    )
-    if pertpy_warn:
-        warnings.warn(pertpy_warn, UserWarning, stacklevel=2)
-        report["pertpy_warning"] = pertpy_warn
-        print(f"WARNING: {pertpy_warn}", flush=True)
-
-    n_targets = int(
-        rna.obs.loc[~rna.obs["gene_target"].isin([config.control, "unassigned"]), "gene_target"].nunique()
-    )
-    report["n_gene_targets"] = n_targets
-    n_cells = int(rna.n_obs)
-    mixscape_estimate = estimate_mixscape_cost(n_cells, n_targets, config.mixscape_max_targets)
-    mixscape_mode = _effective_mixscape_mode(config)
-    mixscape_ok = False
-    skip_mixscape = mixscape_mode == "skip"
-    mixscape_selected: list[str] | None = None
-    pending_auto_skip = mixscape_mode == "auto" and n_targets > config.mixscape_max_targets
-
-    if skip_mixscape:
-        report["mixscape"] = skipped_status(
-            "user_skip",
-            detail=(
-                "Mixscape was skipped (--skip-mixscape / mixscape_mode=skip). Downstream "
-                "E-distance/DE use gene_target on all post-QC cells; no KO/NP classification filter."
-            ),
-            n_targets=n_targets,
-            mixscape_max_targets=config.mixscape_max_targets,
-            mixscape_mode=mixscape_mode,
-            estimate=mixscape_estimate,
-        )
-    elif pending_auto_skip:
-        skip_mixscape = True
-        detail = (
-            f"{n_targets} gene targets > mixscape_max_targets={config.mixscape_max_targets} "
-            "(reason: n_targets>max). Use --force-mixscape / mixscape_mode=force for all targets, "
-            "or mixscape_mode=subset with --mixscape-targets / --mixscape-top-n for a partial run. "
-            "Genome-scale screens are quantified with E-distance by default."
-        )
-        report["mixscape"] = skipped_status(
-            "too_many_targets",
-            detail=detail,
-            n_targets=n_targets,
-            mixscape_max_targets=config.mixscape_max_targets,
-            mixscape_mode=mixscape_mode,
-            estimate=mixscape_estimate,
-        )
-        print(f"WARNING: Mixscape auto-skipped — {detail}", flush=True)
-
-    kd_caveat = mixscape_kd_caveat(config.perturbation_type)
-    if kd_caveat:
-        caveats = list(report.get("statistical_caveats") or [])
-        if kd_caveat not in caveats:
-            caveats.append(kd_caveat)
-        report["statistical_caveats"] = caveats
-
-    edistances = pd.DataFrame()
-    edist_pre = pd.DataFrame()
-    if config.skip_distance:
-        report["edistance"] = skipped_status(
-            "user_skip",
-            detail="E-distance / E-test skipped (--skip-distance).",
-        )
-    else:
-        try:
-            print("Computing E-distance (pre-Mixscape / log-norm PCA)", flush=True)
-            pca_src = "log1p_hvg"
-            emb_prov = _embedding_provenance(rna, pca_src, config)
-            edist_pre, etest_pre = run_edistance(
-                rna,
-                groupby="gene_target",
-                contrast=config.control,
-                n_perms=config.n_perms,
-                min_cells=config.min_cells_per_pert,
-                random_state=config.random_state,
-                pca_source=pca_src,
-                n_jobs=config.n_jobs,
-                power_min_cells=config.etest_power_min_cells,
-            )
-            sec_pre, sec_status_pre = _compute_secondary_distances(rna, config, pca_src)
-            if not skip_mixscape:
-                _write_edistance_outputs(
-                    edist_pre,
-                    etest_pre,
-                    tables / "pre_mixscape",
-                    figures / "pre_mixscape",
-                    secondary=sec_pre,
-                    secondary_status=sec_status_pre,
-                )
-                report["pre_mixscape"] = {
-                    "n_cells": int(rna.n_obs),
-                    "groupby": "gene_target",
-                    "embedding": "X_pca",
-                    **emb_prov,
-                    "depends_on_mixscape": False,
-                    "tables": str(tables / "pre_mixscape"),
-                    "secondary_distances": sec_status_pre,
-                }
-                report["edistance"] = completed_status(
-                    phase="pre_mixscape",
-                    top=edist_pre.head(10).to_dict(),
-                    depends_on_mixscape=False,
-                    **emb_prov,
-                    etest_power_min_cells=config.etest_power_min_cells,
-                    secondary_distances=sec_status_pre,
-                )
-            else:
-                _write_edistance_outputs(
-                    edist_pre,
-                    etest_pre,
-                    tables,
-                    figures,
-                    secondary=sec_pre,
-                    secondary_status=sec_status_pre,
-                )
-                edistances = edist_pre
-                report["edistance_top"] = edistances.head(10).to_dict()
-                report.setdefault("matrix_provenance", {}).update(emb_prov)
-                report.setdefault("matrix_provenance", {})["edistance"] = {
-                    "embedding": "X_pca",
-                    **emb_prov,
-                    "cells": "all_post_qc_singlet",
-                    "depends_on_mixscape": False,
-                }
-                report["edistance"] = completed_status(
-                    phase="primary",
-                    top=edistances.head(10).to_dict(),
-                    depends_on_mixscape=False,
-                    **emb_prov,
-                    etest_power_min_cells=config.etest_power_min_cells,
-                    secondary_distances=sec_status_pre,
-                )
-            report["steps"].append("edistance_pre_or_only")
-        except ImportError as exc:
-            if is_pertpy_import_error(exc):
-                msg = str(exc) if str(exc) else PERTPY_MISSING_MSG
-                warnings.warn(msg, UserWarning, stacklevel=2)
-                report["edistance"] = skipped_status("missing_pertpy", detail=msg)
-                print(f"WARNING: E-distance skipped — {msg}", flush=True)
-            else:
-                raise
-        except Exception as exc:  # noqa: BLE001
-            report["edistance"] = skipped_status("failed", detail=str(exc))
-
-    # Resolve subset target list (user list and/or top-N by pre-Mixscape E-distance).
-    if not skip_mixscape and mixscape_mode == "subset":
-        selected = [str(t) for t in config.mixscape_targets]
-        top_n = config.mixscape_top_n
-        if not selected:
-            top_n = int(top_n) if top_n is not None else int(config.mixscape_max_targets)
-        if top_n is not None and top_n > 0:
-            ranked = select_mixscape_targets_from_edistance(
-                edist_pre,
-                top_n=int(top_n),
-                control=config.control,
-            )
-            for gene in ranked:
-                if gene not in selected:
-                    selected.append(gene)
-        if not selected:
-            skip_mixscape = True
-            detail = (
-                "mixscape_mode=subset requires --mixscape-targets and/or --mixscape-top-n "
-                "(needs a pre-Mixscape E-distance ranking; avoid --skip-distance)."
-            )
-            report["mixscape"] = skipped_status(
-                "subset_no_targets",
-                detail=detail,
-                n_targets=n_targets,
-                mixscape_max_targets=config.mixscape_max_targets,
-                mixscape_mode=mixscape_mode,
-                estimate=mixscape_estimate,
-            )
-            print(f"WARNING: Mixscape subset skipped — {detail}", flush=True)
-        else:
-            mixscape_selected = selected
-            mixscape_estimate = estimate_mixscape_cost(
-                n_cells=int(
-                    (rna.obs["gene_target"].astype(str).isin([config.control, *selected])).sum()
-                ),
-                n_targets=len(selected),
-                mixscape_max_targets=config.mixscape_max_targets,
-            )
-            print(
-                f"Mixscape subset: {len(selected)} targets + {config.control} "
-                f"(full library has {n_targets} targets)",
-                flush=True,
-            )
-
-    analysis_source = rna
-    if not skip_mixscape:
-        try:
-            mixscape_adata = rna
-            if mixscape_selected is not None:
-                mixscape_adata = filter_cells_for_mixscape_targets(
-                    rna, config.control, mixscape_selected
-                )
-            run_mixscape(
-                mixscape_adata,
-                control=config.control,
-                split_by=config.replicate_col,
-                perturbation_type=config.perturbation_type,
-            )
-            if mixscape_selected is not None and mixscape_adata is not rna:
-                merge_mixscape_annotations(rna, mixscape_adata)
-            mixscape_ok = True
-            analysis_source = mixscape_adata
-            global_counts = mixscape_adata.obs["mixscape_class_global"].value_counts().to_dict()
-            report["mixscape_global"] = global_counts
-            subset_detail = ""
-            if mixscape_selected is not None:
-                subset_detail = (
-                    f" Subset Mixscape on {len(mixscape_selected)} targets + {config.control}; "
-                    "labels/results do not cover the full gene library."
-                )
-            report["mixscape"] = completed_status(
-                global_counts=global_counts,
-                detail=(
-                    "Mixscape succeeded. Primary E-distance/DE use KO+control cells and depend on "
-                    "mixscape_class; pre_mixscape/ retains the unfiltered gene_target path."
-                    + subset_detail
-                ),
-                n_targets=n_targets,
-                mixscape_max_targets=config.mixscape_max_targets,
-                mixscape_mode=mixscape_mode,
-                subset=bool(mixscape_selected),
-                selected_targets=list(mixscape_selected) if mixscape_selected else None,
-                estimate=mixscape_estimate if mixscape_selected else None,
-            )
-            plot_umap(
-                mixscape_adata,
-                figures / "mixscape",
-                color=["mixscape_class_global", "perturbation"],
-            )
-            report["steps"].append("mixscape")
-            append_composition_audit(composition_rows, mixscape_adata, "after_mixscape_classify")
-        except ImportError as exc:
-            if is_pertpy_import_error(exc):
-                msg = str(exc) if str(exc) else PERTPY_MISSING_MSG
-                warnings.warn(msg, UserWarning, stacklevel=2)
-                detail = (
-                    f"Mixscape skipped — pertpy missing. {msg} "
-                    "Downstream uses gene_target on all post-QC cells; no KO/NP filter."
-                )
-                report["mixscape"] = skipped_status(
-                    "missing_pertpy",
-                    detail=detail,
-                    n_targets=n_targets,
-                    mixscape_max_targets=config.mixscape_max_targets,
-                    mixscape_mode=mixscape_mode,
-                    estimate=mixscape_estimate,
-                )
-                report["steps"].append("mixscape_skipped_missing_pertpy")
-                print(f"WARNING: Mixscape skipped — {msg}", flush=True)
-            else:
-                raise
-        except Exception as exc:  # noqa: BLE001
-            detail = (
-                f"Mixscape failed ({exc}). Downstream uses gene_target on all post-QC cells; "
-                "no KO/NP filter."
-            )
-            report["mixscape"] = skipped_status(
-                "failed",
-                detail=detail,
-                n_targets=n_targets,
-                mixscape_max_targets=config.mixscape_max_targets,
-                mixscape_mode=mixscape_mode,
-                estimate=mixscape_estimate,
-            )
-            report["steps"].append("mixscape_failed")
-
-    analysis_obj = _mixscape_subset(analysis_source, config.control) if mixscape_ok else rna
-    pca_source = "log1p_hvg"
-    if mixscape_ok:
-        n_before_ko = int(analysis_source.n_obs)
-        n_after_ko = int(analysis_obj.n_obs)
-        report["n_after_mixscape_ko_filter"] = n_after_ko
-        report["n_removed_mixscape_non_ko"] = n_before_ko - n_after_ko
-        report.setdefault("composition_notes", []).append(
-            f"Mixscape KO+{config.control} filter kept {n_after_ko}/{n_before_ko} cells "
-            f"(removed {n_before_ko - n_after_ko} NP/other)."
-        )
-        if mixscape_selected is not None:
-            report["composition_notes"].append(
-                f"Mixscape subset mode: classified {len(mixscape_selected)} targets only "
-                f"(library has {n_targets}); non-selected genes lack mixscape labels."
-            )
-        append_composition_audit(composition_rows, analysis_obj, "after_mixscape_ko_filter")
-        if "X_pert" in analysis_obj.layers:
-            _pca_from_layer(analysis_obj, "X_pert", config.n_pcs)
-            pca_source = "X_pert"
-            emb_post = _embedding_provenance(analysis_obj, pca_source, config)
-            report.setdefault("matrix_provenance", {}).update(
-                {
-                    "X_pca_post_mixscape": "PCA recomputed on layers['X_pert']",
-                    "X_pert": "Mixscape perturbation signature",
-                    **emb_post,
-                }
-            )
-
-    if mixscape_ok and not config.skip_distance:
-        try:
-            print("Computing E-distance (post-Mixscape / X_pert PCA)", flush=True)
-            emb_prov = _embedding_provenance(analysis_obj, pca_source, config)
-            edistances, etest = run_edistance(
-                analysis_obj,
-                groupby="gene_target",
-                contrast=config.control,
-                n_perms=config.n_perms,
-                min_cells=config.min_cells_per_pert,
-                random_state=config.random_state,
-                pca_source=pca_source,
-                n_jobs=config.n_jobs,
-                power_min_cells=config.etest_power_min_cells,
-            )
-            sec_post, sec_status_post = _compute_secondary_distances(
-                analysis_obj, config, pca_source
-            )
-            _write_edistance_outputs(
-                edistances,
-                etest,
-                tables / "post_mixscape",
-                figures / "post_mixscape",
-                secondary=sec_post,
-                secondary_status=sec_status_post,
-            )
-            _write_edistance_outputs(
-                edistances,
-                etest,
-                tables,
-                figures,
-                secondary=sec_post,
-                secondary_status=sec_status_post,
-            )
-            report["edistance_top"] = edistances.head(10).to_dict()
-            report["post_mixscape"] = {
-                "n_cells": int(analysis_obj.n_obs),
-                "groupby": "gene_target",
-                "embedding": "X_pca",
-                **emb_prov,
-                "depends_on_mixscape": True,
-                "tables": str(tables / "post_mixscape"),
-                "secondary_distances": sec_status_post,
-            }
-            report.setdefault("matrix_provenance", {}).update(emb_prov)
-            report.setdefault("matrix_provenance", {})["edistance"] = {
-                "embedding": "X_pca",
-                **emb_prov,
-                "cells": f"mixscape_class_global in {{{config.control}, KO}}",
-                "depends_on_mixscape": True,
-                "primary_tables": str(tables / "edistance.csv"),
-            }
-            report["edistance"] = completed_status(
-                phase="post_mixscape",
-                top=edistances.head(10).to_dict(),
-                depends_on_mixscape=True,
-                **emb_prov,
-                etest_power_min_cells=config.etest_power_min_cells,
-                secondary_distances=sec_status_post,
-            )
-            report["steps"].append("edistance_post_mixscape")
-        except ImportError as exc:
-            if is_pertpy_import_error(exc):
-                msg = str(exc) if str(exc) else PERTPY_MISSING_MSG
-                warnings.warn(msg, UserWarning, stacklevel=2)
-                # Keep pre_mixscape results if any; mark primary path skipped.
-                pre = report.get("edistance") if isinstance(report.get("edistance"), dict) else {}
-                report["edistance"] = skipped_status(
-                    "missing_pertpy",
-                    detail=msg,
-                )
-                if pre.get("skipped") is False:
-                    report["edistance"]["pre_phase"] = pre
-                print(f"WARNING: post-Mixscape E-distance skipped — {msg}", flush=True)
-            else:
-                raise
-        except Exception as exc:  # noqa: BLE001
-            pre = report.get("edistance") if isinstance(report.get("edistance"), dict) else {}
-            report["edistance"] = skipped_status("failed", detail=str(exc))
-            if pre.get("skipped") is False:
-                report["edistance"]["pre_phase"] = pre
-
-    try:
-        pert_clusters = cluster_perturbations(analysis_obj, groupby="gene_target")
-        pert_clusters.to_csv(tables / "perturbation_clusters.csv")
-        report.setdefault("matrix_provenance", {})["perturbation_clusters"] = {
-            "embedding": "X_pca",
-            "pca_source": pca_source,
-            "depends_on_mixscape": bool(mixscape_ok),
-        }
-        report["perturbation_clusters"] = completed_status(
-            n_clusters=int(pert_clusters["pert_cluster"].nunique())
-            if "pert_cluster" in pert_clusters.columns
-            else None,
-            depends_on_mixscape=bool(mixscape_ok),
-            pca_source=pca_source,
-        )
-    except ImportError as exc:
-        if is_pertpy_import_error(exc):
-            msg = (
-                "pertpy is required for perturbation clustering. "
-                'Install with: pip install -e ".[de]" (or pip install "pertpy[de]>=1.3").'
-            )
-            report["perturbation_clusters"] = skipped_status("missing_pertpy", detail=msg)
-            # User already opted out of Mixscape/E-distance: keep this a quiet note.
-            if config.skip_mixscape and config.skip_distance:
-                print(f"NOTE: {msg}", flush=True)
-            else:
-                warnings.warn(msg, UserWarning, stacklevel=2)
-                print(f"WARNING: perturbation clustering skipped — {msg}", flush=True)
-        else:
-            raise
-    except Exception as exc:  # noqa: BLE001
-        report["perturbation_clusters"] = skipped_status("failed", detail=str(exc))
-
-    print("Running guide-level QC / consistency", flush=True)
-    guide_df, consistency_df, warnings_df, guide_summary = run_guide_qc(
-        rna, control=config.control, guide_merge=config.guide_merge
-    )
-    write_guide_qc_tables(guide_df, consistency_df, warnings_df, tables)
-    plot_guide_qc(guide_df, consistency_df, figures)
-    report["guide_qc"] = guide_summary
-    report["steps"].append("guide_qc")
-
-    _mark_stage(report, "3a_perturbation_modeling")
-    return rna, analysis_obj, edistances, mixscape_ok, guide_summary, consistency_df
-
-
-def stage_statistical_inference(
-    rna: AnnData,
-    config: PipelineConfig,
-    report: dict,
-    figures: Path,
-    tables: Path,
-    *,
-    mixscape_ok: bool,
-    edistances: pd.DataFrame,
-) -> tuple[int, dict]:
-    """Stage 3B: pseudobulk / DE / FDR (conceptually parallel to 3A)."""
-    print("[3b/5] Statistical inference (pseudobulk DE / design checks)", flush=True)
-    design = check_experimental_design(rna, replicate_col=config.replicate_col, groupby="gene_target")
-    report["experimental_design"] = design
-    if design.get("replicate_aware") and not config.skip_de:
-        de_warn = warn_if_pertpy_missing(need_mixscape=False, need_distance=False, need_deseq2=True)
-        if de_warn:
-            warnings.warn(de_warn, UserWarning, stacklevel=2)
-            report["pertpy_warning_de"] = de_warn
-            print(f"WARNING: {de_warn}", flush=True)
-
-    de_tables: list[pd.DataFrame] = []
-    if config.skip_de:
-        report["n_de_contrasts"] = 0
-        report["de"] = skipped_status(
-            "user_skip",
-            detail="Differential expression skipped (--skip-de).",
-        )
-    else:
-        counts = rna.copy()
-        if mixscape_ok:
-            counts.obs["de_group"] = counts.obs["mixscape_class"].astype(str)
-            groups = [
-                g
-                for g in counts.obs["de_group"].unique()
-                if str(g).endswith(f" {config.perturbation_type}")
-            ]
-            reference = config.control
-            report["de_scope"] = "mixscape_class (depends on Mixscape classification)"
-            report.setdefault("matrix_provenance", {})["de"] = {
-                "groupby": "mixscape_class",
-                "depends_on_mixscape": True,
-                "counts_layer": "layers['counts'] for PyDESeq2; log1p X for Wilcoxon",
-            }
-        else:
-            counts.obs["de_group"] = counts.obs["gene_target"].astype(str)
-            groups = [g for g in counts.obs["de_group"].unique() if g not in {config.control, "unassigned"}]
-            reference = config.control
-            report["de_scope"] = "gene_target (Mixscape not applied)"
-            report.setdefault("matrix_provenance", {})["de"] = {
-                "groupby": "gene_target",
-                "depends_on_mixscape": False,
-                "counts_layer": "layers['counts'] for PyDESeq2; log1p X for Wilcoxon",
-            }
-        if not edistances.empty:
-            ranked = [g for g in edistances.index if g in set(map(str, groups))]
-            if not ranked and mixscape_ok:
-                gene_ranks = list(edistances.index)
-                ranked = [
-                    g
-                    for gene in gene_ranks
-                    for g in groups
-                    if str(g) == _ko_label(str(gene), config.perturbation_type)
-                ]
-            groups = ranked[: config.de_top_n] if ranked else list(groups)[: config.de_top_n]
-        else:
-            groups = (
-                counts.obs["de_group"].astype(str).value_counts().reindex(groups).sort_values(ascending=False).index.tolist()
-            )[: config.de_top_n]
-        report["de_groups"] = [str(g) for g in groups]
-        contrast_tables, de_errors = run_de_contrasts(
-            counts,
-            groups,
-            reference=reference,
-            replicate_col=config.replicate_col,
-            groupby="de_group",
-            min_cells=config.min_cells_per_pert,
-            n_jobs=config.n_jobs,
-        )
-        if de_errors:
-            report.setdefault("de_errors", {}).update(de_errors)
-        for group, table in contrast_tables:
-            safe = str(group).replace(" ", "_")
-            table.to_csv(tables / f"de_{safe}.csv", index=False)
-            plot_volcano(table, figures, safe)
-            de_tables.append(table.head(50))
-        if de_tables:
-            pd.concat(de_tables, ignore_index=True).to_csv(tables / "de_top50_concat.csv", index=False)
-        report["n_de_contrasts"] = len(de_tables)
-        report["steps"].append("de")
-        de_detail = design.get("note")
-        if de_detail:
-            report["de_note"] = de_detail  # legacy alias for older consumers
-        # If every contrast failed and none produced a table, treat as failed/skip-like.
-        if not de_tables and de_errors:
-            first_err = next(iter(de_errors.values()), "DE produced no contrasts")
-            reason = "missing_pertpy" if "pertpy" in str(first_err).lower() else "failed"
-            report["de"] = skipped_status(reason, detail=str(first_err))
-        else:
-            report["de"] = completed_status(
-                n_contrasts=len(de_tables),
-                scope=report.get("de_scope"),
-                groups=report.get("de_groups"),
-                depends_on_mixscape=bool(mixscape_ok),
-                errors=de_errors or None,
-                detail=de_detail,
-            )
-
-    _mark_stage(report, "3b_statistical_inference")
-    return int(report.get("n_de_contrasts") or 0), design
-
-
-def stage_robustness(
-    report: dict,
-    *,
-    guide_summary: dict,
-    consistency_df: pd.DataFrame,
-    edistances: pd.DataFrame,
-    mixscape_ok: bool,
-    n_de_contrasts: int,
-    design: dict,
-) -> None:
-    """Stage 4: sensitivity / effect consistency / confidence flags."""
-    print("[4/5] Robustness & evidence integration", flush=True)
-    integrate_evidence(
-        report,
-        guide_summary=guide_summary,
-        consistency_df=consistency_df,
-        edistances=edistances,
-        mixscape_ok=mixscape_ok,
-        n_de_contrasts=n_de_contrasts,
-        design=design,
-    )
-    _mark_stage(report, "4_robustness")
-
-
-def stage_report(
-    rna: AnnData,
-    config: PipelineConfig,
-    report: dict,
-    *,
-    input_files: dict[str, Path],
-) -> dict:
-    """Stage 5: H5AD, JSON/HTML reports, provenance manifest."""
-    print("[5/5] Reproducible report", flush=True)
-    report = finalize_outputs(
-        rna,
-        report,
-        config.output_dir,
-        config.sample_id,
-        inputs={k: str(v) for k, v in input_files.items()},
-    )
-    _mark_stage(report, "5_report")
-    return report
 
 
 def run_pipeline(
@@ -1400,4 +625,13 @@ __all__ = [
     "dry_run_plan",
     "pipeline_config_from_mapping",
     "run_pipeline",
+    "stage_input_validation",
+    "stage_perturbation_modeling",
+    "stage_preprocessing_qc",
+    "stage_report",
+    "stage_robustness",
+    "stage_statistical_inference",
+    # Compat for tests / internal callers
+    "_effective_mixscape_mode",
+    "_embedding_provenance",
 ]

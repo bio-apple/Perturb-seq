@@ -24,7 +24,7 @@
 
 ## 流程（先看数据，再定阈值）
 
-文档入口：**[docs/tutorial.ipynb](docs/tutorial.ipynb)**（交互 notebook，合成 demo 可离线）· **[docs/tutorial.md](docs/tutorial.md)**（CLI 对照）· **[docs/CLI_YAML.md](docs/CLI_YAML.md)**（CLI ↔ YAML）· **[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CAVEATS.md)**（统计局限）· **[docs/ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md)**（步骤依赖 / 矩阵层）。
+文档入口：**[docs/tutorial.ipynb](docs/tutorial.ipynb)**（交互 notebook，合成 demo 可离线）· **[docs/tutorial.md](docs/tutorial.md)**（CLI 对照）· **[docs/CLI_YAML.md](docs/CLI_YAML.md)**（CLI ↔ YAML）· **[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CAVEATS.md)**（统计局限）· **[docs/ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md)**（步骤依赖 / 矩阵层）· **[docs/SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md)**（流水线步骤 ↔ sc-best-practices 章节）。
 
 ```
 DRAGEN MEX + guide assignment
@@ -80,6 +80,17 @@ pip install -e ".[dev]" -c constraints.txt
 安装后可用 `python -m perturbseq …` 或入口脚本 `perturbseq` / `perturbseq-tertiary`。
 
 本地 lint hook（可选）：`pre-commit install`（配置见 `.pre-commit-config.yaml`，规则对齐 `pyproject.toml` 的 ruff/mypy）。
+
+### 已测试版本 / 兼容性
+
+本流程曾用 **pertpy==1.4.0** 与 **scanpy==1.12.4** 做端到端验证（conda 环境 `perturbseq-tertiary`，Python 3.12.15；版本来自 `importlib.metadata`）。下表中的支持范围为 `pyproject.toml` / `constraints.txt` / `environment.yml` 声明——排查安装问题时优先对照这些文件，而不是已漂移的本地环境。
+
+| 包 | 已测试（E2E） | 支持范围 |
+| --- | --- | --- |
+| Python | 3.12.15 | `>=3.10` |
+| scanpy | 1.12.4 | `>=1.10,<2` |
+| pertpy | 1.4.0 | `>=1.3,<2`（`pertpy` / `de` / `all` extras） |
+| anndata | 0.13.4 | `>=0.10,<0.14` |
 
 ### 无 pertpy 时的降级路径
 
@@ -162,6 +173,8 @@ python -m perturbseq run \
 - `--replicate-col`：`obs` 中的生物学重复列；有重复才走 PyDESeq2
 - `--skip-mixscape` / `--skip-cell-annotation` / `--skip-distance` / `--skip-de`
 - `--perturbation-type KO`：CRISPRi 可改为 `KD`
+- `--guide-reassign off|compare|apply_max|apply_gmm`：可选三级重赋值（对比/覆盖 DRAGEN；默认 off）
+- `--de-covariates true|false|phase,pct_counts_mt,log_n_counts`：PyDESeq2 设计矩阵协变量（Wilcoxon 不建模，仅记录）
 
 对已有 h5ad 只补注释：
 
@@ -208,7 +221,7 @@ results/sample1/
     guide_qc.csv、gene_guide_consistency.csv、qc_warnings.csv
 ```
 
-阶段名与编排一致：`1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`。同输入 + 同 config 重跑时，用 `run_manifest.json` / `stages/*/status.json` 对照每步 checksum 与参数，而不仅是再出一个 `.h5ad`。
+阶段名与编排一致：`1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`。各步与 sc-best-practices 章节对照（含 pipeline-specific 边界）：[docs/SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md)。同输入 + 同 config 重跑时，用 `run_manifest.json` / `stages/*/status.json` 对照每步 checksum 与参数，而不仅是再出一个 `.h5ad`。
 
 `report.json` 另含 `matrix_provenance`、`composition_notes`，以及可选步骤的统一状态对象 `mixscape` / `edistance` / `de` / `cell_annotation` / `perturbation_clusters`（`skipped` + `reason`，成功时 `skipped: false` 并附结果字段；见 [docs/ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md)）。`report.html` / `report.json` → `perturbations` 对每个扰动回答：①细胞/guide/重复数与 QC；②相对 NT 的效应量、CI、校正 p；③跨 guide/样本/细胞状态一致性；④顶层受影响基因（通路富集可选，缺依赖则 N/A）；⑤局限与需人工复核的警告。CSV / `.h5ad` / JSON 仍是下游接口。
 
@@ -226,11 +239,11 @@ Guide QC 三层证据（写在 `tables/guide_qc.csv` 与 `report.json` → `guid
 
 | 步骤 | 选择 | 不选的 |
 | --- | --- | --- |
-| Guide 归属 | 沿用 DRAGEN GMM（Illumina 对该试剂盒的推荐） | 默认不再重跑 assignment；若要对比方法见 crispat |
-| 无效扰动细胞 | Mixscape（Papalexi 2021；pertpy 实现） | 把所有 targeting 细胞都当 KO |
-| 效应大小 | E-distance / E-test（Peidli 2024） | 只看 UMAP 是否分开 |
-| 差异表达 | 有重复：pseudobulk + PyDESeq2（Squair 2021） | 把细胞当独立样本出组间 p 值 |
-| 未见扰动预测 | 不作为默认步骤 | scGen/基础模型在独立基准上常不优于简单基线 |
+| Guide 归属 | 沿用 DRAGEN GMM（Illumina 对该试剂盒的推荐） | 默认不再重跑；可选 `--guide-reassign compare`；CatchR/Cell Ranger FB 未安装 |
+| 无效扰动细胞 | Mixscape（Papalexi 2021；pertpy 实现）；KO+NT 为默认推断子集 | 把所有 targeting 细胞都当 KO |
+| 效应大小 | E-distance / E-test（Peidli 2024）；嵌入可用 `X_pert` | 只看 UMAP 是否分开 |
+| 差异表达 | 有重复：pseudobulk + PyDESeq2（可含细胞周期/%MT/log UMI 协变量） | 把细胞当独立样本出组间 p 值；Wilcoxon 不建模协变量 |
+| 未见扰动预测 / 深度嵌入 | 不作为默认步骤；SCEPTRE/MIMOSCA/PerturbNet 仅文档 | scGen/基础模型在独立基准上常不优于简单基线 |
 
 PerturBase 适合查公开 Perturb-seq 数据集与可视化对照，不是本仓库的计算内核。
 
@@ -243,10 +256,11 @@ src/perturbseq/
   io.py              # 1. DRAGEN MEX / guide 参考 / metadata 校验
   guides.py          # 2. guide 解析、NT 识别；re-export guide_qc
   guide_qc.py        #    guide 级 QC / 一致性（实现保留，由 guides 汇总）
+  guide_reassignment.py  # 可选：max/GMM 与 DRAGEN 对比或覆盖
   qc.py              # 2. 细胞 & 样本 QC
   preprocessing.py   # 2. 标准化 / PCA / UMAP（preprocess.py 兼容别名）
   perturbation.py    # 3a. Mixscape、E-distance、guide consistency
-  statistics.py      # 3b. pseudobulk DE、FDR、实验设计检查
+  statistics.py      # 3b. pseudobulk DE、协变量设计、FDR、实验设计检查
   _deps.py           # pertpy 可选依赖检测与安装提示
   robustness.py      # 4. 敏感性 / 效应一致性 / confidence flags
   report.py          # 5. H5AD / JSON / HTML / provenance

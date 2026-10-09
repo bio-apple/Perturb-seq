@@ -4,7 +4,7 @@
 
 Tertiary analysis on **DRAGEN scRNA CRISPR / Perturb-seq secondary outputs**, using **scanpy + pertpy**. Aligned with [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/), [pertpy](https://pertpy.scverse.org/en/latest/index.html) ([Heumos et al. 2026](https://www.nature.com/articles/s41592-025-02909-7)), and the [Illumina Connected Multiomics Perturb-seq walkthrough](https://help.multiomics.illumina.com/icm/analyses/walkthroughs/perturb-seq).
 
-**Docs:** [tutorial notebook](docs/tutorial.ipynb) · [tutorial.md](docs/tutorial.md) · [CLI ↔ YAML](docs/CLI_YAML.md) · [Statistical caveats](docs/STATISTICAL_CAVEATS.md) · [Step dependencies](docs/ANALYSIS_DEPENDENCIES.md)
+**Docs:** [tutorial notebook](docs/tutorial.ipynb) · [tutorial.md](docs/tutorial.md) · [CLI ↔ YAML](docs/CLI_YAML.md) · [Statistical caveats](docs/STATISTICAL_CAVEATS.md) · [Step dependencies](docs/ANALYSIS_DEPENDENCIES.md) · [sc-best-practices map](docs/SC_BEST_PRACTICES_MAP.md)
 
 > Chinese readers: [README.zh-CN.md](README.zh-CN.md) covers the same install / run / outputs / caveats in 中文 (full detail). This English file is the maintainable primary README for packaging (`pyproject.toml` → `readme`).
 
@@ -57,6 +57,17 @@ conda activate perturbseq-tertiary
 
 Entry points: `python -m perturbseq …` or `perturbseq` / `perturbseq-tertiary`.
 
+### Tested versions / Compatibility
+
+This pipeline was end-to-end tested with **pertpy==1.4.0** and **scanpy==1.12.4** (conda env `perturbseq-tertiary`, Python 3.12.15; versions from `importlib.metadata`). Supported ranges below match `pyproject.toml` / `constraints.txt` / `environment.yml` — prefer those files over a drifted local env when debugging installs.
+
+| Package | Tested (E2E) | Supported range |
+| --- | --- | --- |
+| Python | 3.12.15 | `>=3.10` |
+| scanpy | 1.12.4 | `>=1.10,<2` |
+| pertpy | 1.4.0 | `>=1.3,<2` (`pertpy` / `de` / `all` extras) |
+| anndata | 0.13.4 | `>=0.10,<0.14` |
+
 ### Without pertpy
 
 | Capability | `.[de]` | Core only |
@@ -96,7 +107,7 @@ python -m perturbseq run \
 
 Real data: `--input-dir data/raw --output-dir results/sample1 --sample-id sample1 --control NT`.
 
-Useful flags: `--config`, `--resume`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--replicate-col`, `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode auto|skip|force|subset`, `--mixscape-targets` / `--mixscape-top-n` (subset Mixscape), `--perturbation-type KO|KD` (KD/CRISPRi: Mixscape assumptions weaker — see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)).
+Useful flags: `--config`, `--resume`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--replicate-col`, `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode auto|skip|force|subset`, `--mixscape-targets` / `--mixscape-top-n` (subset Mixscape), `--perturbation-type KO|KD` (KD/CRISPRi: Mixscape assumptions weaker — see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)), `--guide-reassign off|compare|apply_max|apply_gmm` (optional tertiary vs DRAGEN), `--de-covariates true|false|phase,pct_counts_mt,log_n_counts` (PyDESeq2 design; Wilcoxon ignores).
 
 Standalone: `annotate`, `guide-qc`, `report` (rebuild HTML/JSON without re-running analysis).
 
@@ -119,9 +130,11 @@ results/sample1/
 
 Stages: `1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`.
 
+Which stage maps to which book section (Mixscape, pseudobulk DE, E-distance, …) — and what is pipeline-specific: **[docs/SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md)**.
+
 Key `obs` columns: `guide_id`, `gene_target`, `perturbation`, `num_features`, `guide_umi`, `mixscape_class*`. Raw UMI in `layers['counts']`; `X` is log-norm. UMAP/Leiden describe structure only.
 
-Guide QC: assignment / transcriptional effect / cytotoxicity layers in `guide_qc.csv`; multi-guide consistency in `gene_guide_consistency.csv`; warnings in `qc_warnings.csv`. These map onto each perturbation card in `report.html` (QC status, interpretations, top warnings). Optional `guide_merge: none|equal|umi|confidence|umi_confidence` (YAML / `--guide-merge`, default `none`) adds a descriptive weighted gene-level summary without dropping per-guide rows or clearing inconsistency flags.
+Guide QC: assignment / transcriptional effect / cytotoxicity layers in `guide_qc.csv`; multi-guide consistency in `gene_guide_consistency.csv`; warnings in `qc_warnings.csv`. These map onto each perturbation card in `report.html` (QC status, interpretations, top warnings). Optional `guide_merge: none|equal|umi|confidence|umi_confidence` (YAML / `--guide-merge`, default `none`) adds a descriptive weighted gene-level summary without dropping per-guide rows or clearing inconsistency flags. Optional `guide_reassign` compares DRAGEN calls to max-UMI / lightweight GMM (`tables/guide_reassignment_comparison.csv`); default remains DRAGEN. Mixscape `layers['X_pert']` is the built-in perturbation signature for E-distance; SCEPTRE / MIMOSCA / PerturbNet are documented external options only ([STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)).
 
 ## 常见坑 / Common pitfalls
 

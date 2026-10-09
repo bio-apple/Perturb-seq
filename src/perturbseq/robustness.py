@@ -1,4 +1,9 @@
-"""Sensitivity / stability checks and confidence flags for evidence integration."""
+"""Domain: sensitivity / consistency signals and integrated confidence flags.
+
+Owns: deriving confidence flags from guide QC, Mixscape success, DE, design.
+Does NOT own: running Mixscape/DE themselves (``perturbation``, ``statistics``) or
+writing the HTML/JSON report (``report``). Stage 4 only calls into this module.
+"""
 
 from __future__ import annotations
 

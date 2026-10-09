@@ -19,6 +19,7 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `min_cells_per_pert` | `--min-cells-per-pert` | int; min cells per perturbation for distance / DE grouping |
 | `etest_power_min_cells` | `--etest-power-min-cells` | int; default 50; below → `low_power` / suppress `significant_adj_reported` |
 | `secondary_distance_metrics` | `--secondary-distance-metrics` | YAML list or CLI comma-separated (e.g. `mmd,wasserstein`); graceful skip if deps missing |
+| `n_bootstrap` | `--n-bootstrap` | int; default 100; cell bootstrap for E-distance CI (`0` = skip) |
 | `skip_mixscape` | `--skip-mixscape` | bool / `store_true` |
 | `force_mixscape` | `--force-mixscape` | bool / `store_true`; run Mixscape even if target count &gt; `mixscape_max_targets` |
 | `mixscape_max_targets` | `--mixscape-max-targets` | int; auto-skip Mixscape above this unless forced / subset |
@@ -37,6 +38,10 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `n_top_genes` | *(YAML only)* | int; HVG count |
 | `n_pcs` | *(YAML only)* | int |
 | `leiden_resolution` | *(YAML only)* | float |
+| `guide_merge` | `--guide-merge` | `none` \| `equal` \| `umi` \| `confidence` \| `umi_confidence` |
+| `guide_reassign` | `--guide-reassign` | `off` \| `compare` \| `apply_max` \| `apply_gmm` |
+| `guide_reassign_min_umi` | `--guide-reassign-min-umi` | float; min CRISPR UMI for max/GMM |
+| `de_covariates` | `--de-covariates` | `true` / `false` / YAML list / CLI comma-separated obs cols |
 
 Unknown YAML keys are stored on `PipelineConfig.extra` (not validated as pipeline fields).
 

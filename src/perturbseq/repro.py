@@ -1,4 +1,9 @@
-"""Reproducibility helpers: checksums, config, stage status, resume, manifest."""
+"""Reproducibility helpers: checksums, config, stage status, resume, manifest.
+
+Owns: file/param hashing, ``RunTracker`` (status.json / checkpoints / invalidate).
+Does NOT own: pipeline stage science or ``PipelineConfig`` field definitions.
+``status.json`` records ``input_checksums`` + ``params_hash``; mismatches invalidate.
+"""
 
 from __future__ import annotations
 
@@ -111,6 +116,17 @@ def config_params_dict(raw: dict[str, Any]) -> dict[str, Any]:
     return _jsonable(raw)
 
 
+def sha256_params(params: dict[str, Any] | None) -> str:
+    """Stable sha256 over a params mapping (canonical JSON)."""
+    payload = json.dumps(
+        _jsonable(params or {}),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def load_yaml_config(path: Path | str) -> dict[str, Any]:
     path = Path(path)
     with path.open() as handle:
@@ -159,6 +175,7 @@ _CONFIG_FIELD_COMMENTS: dict[str, str] = {
     "min_cells_per_pert": "Min cells per perturbation for distance / DE grouping",
     "etest_power_min_cells": "Below this n_cells, mark E-test as low_power (default 50)",
     "secondary_distance_metrics": "Secondary metrics after E-distance (e.g. mmd, wasserstein)",
+    "n_bootstrap": "Cell bootstrap replicates for E-distance CI (default 100; 0 = skip)",
     "mixscape_max_targets": "Skip Mixscape when unique targets exceed this (unless force)",
     "force_mixscape": "Run Mixscape even above mixscape_max_targets",
     "mixscape_mode": "auto | skip | force | subset (CLI --skip/--force still work)",
@@ -170,6 +187,9 @@ _CONFIG_FIELD_COMMENTS: dict[str, str] = {
     "random_state": "Seed for PCA / neighbors / UMAP / etc.",
     "control_patterns": "Regexes matched against guide/target names to label NT/control",
     "guide_merge": "Multi-guide summary: none | equal | umi | confidence | umi_confidence",
+    "guide_reassign": "Tertiary guide re-call: off | compare | apply_max | apply_gmm",
+    "guide_reassign_min_umi": "Min CRISPR UMI for max/GMM reassignment",
+    "de_covariates": "true | false | list of obs cols for PyDESeq2 (Wilcoxon ignores)",
 }
 
 
@@ -294,6 +314,7 @@ class RunTracker:
             self.manifest["inputs"] = inputs
         if params is not None:
             self.manifest["params"] = params
+            self.manifest["params_hash"] = sha256_params(params)
         if config_path is not None:
             self.manifest["config_path"] = config_path
             cfg = Path(config_path)
@@ -365,7 +386,15 @@ class RunTracker:
             return False
         prev_params = status.get("params") or {}
         prev_inputs = status.get("input_checksums") or {}
-        if prev_params != params or prev_inputs != input_checksums:
+        prev_params_hash = status.get("params_hash")
+        expected_params_hash = sha256_params(params)
+        if prev_params_hash:
+            params_changed = prev_params_hash != expected_params_hash
+        else:
+            # Legacy status.json without params_hash: compare params mapping.
+            params_changed = prev_params != _jsonable(params)
+        inputs_changed = prev_inputs != input_checksums
+        if params_changed or inputs_changed:
             self.logger.info(
                 "Stage %s inputs/params changed; invalidating from here",
                 stage,
@@ -409,6 +438,7 @@ class RunTracker:
             "outputs": {},
             "output_checksums": {},
             "params": params,
+            "params_hash": sha256_params(params),
             "error": None,
         }
         self.write_status(stage, payload)

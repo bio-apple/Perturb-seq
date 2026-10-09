@@ -8,6 +8,7 @@ import pandas as pd
 
 from perturbseq.report import (
     CORE_STATISTICAL_CAVEATS,
+    build_analysis_verdict,
     build_perturbation_summaries,
     build_summary_table,
     load_result_tables,
@@ -31,6 +32,10 @@ def _write_fake_results(tmp_path):
             "gene_target": ["GENEA", "GENEB", "GENEC"],
             "edistance": [3.0, 1.5, 0.2],
             "n_cells": [40, 25, 12],
+            "edistance_ci_low": [2.5, 1.1, 0.05],
+            "edistance_ci_high": [3.6, 1.9, 0.4],
+            "n_bootstrap": [100, 100, 100],
+            "ci_level": [0.95, 0.95, 0.95],
         }
     ).to_csv(tables / "edistance.csv", index=False)
 
@@ -41,6 +46,10 @@ def _write_fake_results(tmp_path):
             "significant": [True, False],
             "pvalue_adj": [0.02, 0.4],
             "significant_adj": [True, False],
+            "edistance_ci_low": [2.5, 1.1],
+            "edistance_ci_high": [3.6, 1.9],
+            "n_bootstrap": [100, 100],
+            "ci_level": [0.95, 0.95],
         },
         index=["GENEA", "GENEB"],
     ).to_csv(tables / "etest.csv")
@@ -48,6 +57,7 @@ def _write_fake_results(tmp_path):
     pd.DataFrame(
         {
             "method": ["wilcoxon_cell_level_exploratory"] * 3,
+            "evidence_level": ["exploratory"] * 3,
             "contrast": ["GENEA_vs_NT"] * 3,
             "names": ["TP53", "MDM2", "GAPDH"],
             "scores": [5.0, 4.0, 1.0],
@@ -136,7 +146,9 @@ def _write_fake_results(tmp_path):
             "skipped": False,
             "reason": None,
             "detail": "Single-sample run: exploratory Wilcoxon.",
+            "evidence_level": "exploratory",
         },
+        "experimental_design": {"evidence_level": "exploratory", "replicate_aware": False},
         "mixscape": {"skipped": True, "reason": "user_skip", "detail": "skipped for test"},
         "edistance": {"skipped": False, "reason": None},
         "de_note": "Single-sample run: exploratory Wilcoxon.",
@@ -162,7 +174,11 @@ def test_summarize_perturbation_five_questions(tmp_path):
     # n_cells=40 < etest_power_min_cells=50 → low_power suppresses reported significance
     assert s["effect_vs_control"]["low_power"] is True
     assert s["effect_vs_control"]["significant_adj_reported"] is False
-    assert s["effect_vs_control"]["confidence_interval"] == "N/A"
+    ci = s["effect_vs_control"]["confidence_interval"]
+    assert isinstance(ci, dict)
+    assert ci["low"] == 2.5 and ci["high"] == 3.6
+    assert ci["source"] == "edistance_bootstrap_cells"
+    assert s["effect_vs_control"]["evidence_level"] == "exploratory"
 
     assert isinstance(s["consistency"]["across_guides"], dict)
     assert s["consistency"]["across_guides"]["guides_consistent"] is True
@@ -259,3 +275,57 @@ def test_html_maps_qc_warnings_and_interpretations(tmp_path):
     assert "QC warnings" in html
     assert "Weighted guide summary" in html
     assert "target_knockdown_detected" in html  # GENEA interpretation on card
+
+
+def test_build_analysis_verdict_from_fake_tables(tmp_path):
+    """Verdict helper: significant (non-low-power) + inconsistent guides + Wilcoxon caveat."""
+    summaries = [
+        {
+            "perturbation": "GENEA",
+            "counts": {"qc_status": "guides_consistent"},
+            "effect_vs_control": {
+                "significant_adj_reported": True,
+                "low_power": False,
+                "de_method": "wilcoxon_cell_level_exploratory",
+            },
+            "consistency": {"across_guides": {"guides_consistent": True}},
+        },
+        {
+            "perturbation": "GENEB",
+            "counts": {"qc_status": "guides_inconsistent"},
+            "effect_vs_control": {
+                "significant_adj_reported": False,
+                "low_power": True,
+                "de_method": "wilcoxon_cell_level_exploratory",
+            },
+            "consistency": {"across_guides": {"guides_consistent": False}},
+        },
+        {
+            "perturbation": "GENEC",
+            "counts": {"qc_status": "ok"},
+            "effect_vs_control": {
+                "significant_adj_reported": False,
+                "low_power": True,
+                "de_method": "N/A",
+            },
+            "consistency": {"across_guides": "N/A"},
+        },
+    ]
+    report = {"config": {"replicate_col": None}, "de": {"detail": "Single-sample run: exploratory Wilcoxon."}}
+    verdict = build_analysis_verdict(summaries, report)
+    assert verdict["n_perturbations"] == 3
+    assert verdict["n_significant_reported"] == 1
+    assert verdict["n_low_power"] == 2
+    assert verdict["n_guides_inconsistent"] == 1
+    assert "Wilcoxon" in verdict["summary_sentence"] or "exploratory" in verdict["summary_sentence"]
+    assert "1 have E-test significance reported" in verdict["summary_sentence"]
+    assert "1 gene(s) show inconsistent" in verdict["summary_sentence"]
+
+    out = _write_fake_results(tmp_path)
+    written = write_analysis_report(out, control="NT")
+    assert "verdict" in written
+    assert written["summary_sentence"] == written["verdict"]["summary_sentence"]
+    assert written["verdict"]["n_guides_inconsistent"] >= 1
+    html = (out / "report.html").read_text()
+    assert 'id="analysis-verdict"' in html
+    assert written["summary_sentence"] in html

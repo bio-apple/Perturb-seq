@@ -471,11 +471,42 @@ def summarize_perturbation(
         "low_power": _na(low_power) if low_power is not None else NA,
         "note": None,
     }
+    # Prefer E-distance bootstrap CI when present (matches metric=edistance).
+    ci_src = None
+    if ed_row is not None and "edistance_ci_low" in ed_row.index:
+        ci_src = ed_row
+    elif et_row is not None and "edistance_ci_low" in et_row.index:
+        ci_src = et_row
+    if ci_src is not None and "edistance_ci_high" in ci_src.index:
+        ci_lo = _safe_float(ci_src.get("edistance_ci_low"))
+        ci_hi = _safe_float(ci_src.get("edistance_ci_high"))
+        if ci_lo is not None and ci_hi is not None:
+            ci_level = _safe_float(ci_src.get("ci_level")) if "ci_level" in ci_src.index else 0.95
+            n_boot = _safe_int(ci_src.get("n_bootstrap")) if "n_bootstrap" in ci_src.index else None
+            effect["confidence_interval"] = {
+                "low": ci_lo,
+                "high": ci_hi,
+                "level": ci_level if ci_level is not None else 0.95,
+                "source": "edistance_bootstrap_cells",
+                "n_bootstrap": _na(n_boot),
+            }
     dist_row = _row_lookup(tables.get("distances"), "gene_target", pert)
     secondary_metrics: dict[str, Any] = {}
     if dist_row is not None:
         for col in dist_row.index:
-            if col in {"gene_target", "edistance", "n_cells", "embedding", "pca_source", "metric", "index"}:
+            if col in {
+                "gene_target",
+                "edistance",
+                "n_cells",
+                "embedding",
+                "pca_source",
+                "metric",
+                "index",
+                "edistance_ci_low",
+                "edistance_ci_high",
+                "n_bootstrap",
+                "ci_level",
+            }:
                 continue
             val = _safe_float(dist_row[col])
             if val is not None:
@@ -508,10 +539,18 @@ def summarize_perturbation(
     de = (tables.get("de_by_pert") or {}).get(pert)
     de_padj_min = None
     de_method = None
+    de_evidence_level = None
     if de is not None and not de.empty:
         de_method = str(de["method"].iloc[0]) if "method" in de.columns else NA
+        if "evidence_level" in de.columns:
+            de_evidence_level = str(de["evidence_level"].iloc[0])
+        elif de_method == "wilcoxon_cell_level_exploratory":
+            de_evidence_level = "exploratory"
+        elif de_method == "pydeseq2_pseudobulk":
+            de_evidence_level = "inferential"
         top1 = _top_de_genes(de, n=1)
-        if top1 and "ci_low" in top1[0]:
+        # Only fall back to DESeq2 gene-level CI when E-distance bootstrap CI is absent.
+        if effect["confidence_interval"] == NA and top1 and "ci_low" in top1[0]:
             effect["confidence_interval"] = {
                 "low": top1[0]["ci_low"],
                 "high": top1[0]["ci_high"],
@@ -526,6 +565,14 @@ def summarize_perturbation(
         ):
             note = "No replicate CI (single-sample / exploratory Wilcoxon)"
             effect["note"] = f"{effect['note']}; {note}" if effect.get("note") else note
+    if de_evidence_level is None:
+        de_block_el = (report.get("de") if isinstance(report.get("de"), dict) else {}) or {}
+        if de_block_el.get("evidence_level"):
+            de_evidence_level = str(de_block_el["evidence_level"])
+        else:
+            design = report.get("experimental_design") or {}
+            if design.get("evidence_level"):
+                de_evidence_level = str(design["evidence_level"])
 
     top_genes_list = _top_de_genes(de, n=top_genes)
     composition = _composition_for_pert(
@@ -698,12 +745,14 @@ def summarize_perturbation(
             "control": control,
             "de_min_pvalue_adj": _na(de_padj_min),
             "de_method": _na(de_method),
+            "evidence_level": _na(de_evidence_level),
         },
         "consistency": consistency,
         "top_affected": {
             "genes": top_genes_list if top_genes_list else NA,
             "pathways": "N/A — pathway enrichment not run (optional; DE gene list above)",
             "evidence": de_method or ("edistance" if edistance is not None else NA),
+            "evidence_level": _na(de_evidence_level),
             "perturbation_cluster": _na(cluster),
         },
         "limitations": limitations,
@@ -734,6 +783,70 @@ def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str 
     return out
 
 
+def build_analysis_verdict(
+    summaries: list[dict[str, Any]],
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Auto-generate a skim-friendly analysis verdict from guide QC + E-test + DE.
+
+    Returns structured counts plus ``summary_sentence`` for report.json / HTML.
+    """
+    report = report or {}
+    n = len(summaries)
+    n_sig = 0
+    n_low_power = 0
+    n_inconsistent = 0
+    for s in summaries:
+        eff = s.get("effect_vs_control") or {}
+        if eff.get("low_power") is True:
+            n_low_power += 1
+        if eff.get("significant_adj_reported") is True:
+            n_sig += 1
+        guides = (s.get("consistency") or {}).get("across_guides")
+        if isinstance(guides, dict) and guides.get("guides_consistent") is False:
+            n_inconsistent += 1
+        elif (s.get("counts") or {}).get("qc_status") == "guides_inconsistent":
+            n_inconsistent += 1
+
+    caveats: list[str] = []
+    config = report.get("config") or {}
+    has_wilcoxon = any(
+        (s.get("effect_vs_control") or {}).get("de_method") == "wilcoxon_cell_level_exploratory"
+        for s in summaries
+    )
+    de_block = report.get("de") if isinstance(report.get("de"), dict) else {}
+    de_text = str(de_block.get("detail") or report.get("de_note") or "")
+    if config.get("replicate_col") is None or has_wilcoxon or "exploratory" in de_text.lower() or "Wilcoxon" in de_text:
+        caveats.append("single-sample Wilcoxon DE is exploratory only (cells ≠ biological replicates)")
+    if n_low_power:
+        caveats.append(
+            f"{n_low_power} perturbation(s) marked low_power (n_cells below etest_power_min_cells)"
+        )
+    if n_inconsistent:
+        caveats.append(
+            f"{n_inconsistent} gene(s) with inconsistent multi-guide effects — do not pool without review"
+        )
+
+    sentence = (
+        f"Among {n} perturbation(s), {n_sig} have E-test significance reported after power "
+        f"filtering (non-low-power); {n_inconsistent} gene(s) show inconsistent multi-guide effects."
+    )
+    if caveats:
+        # Avoid repeating the inconsistency clause already in the lead sentence.
+        lead_caveats = [c for c in caveats if "inconsistent multi-guide" not in c]
+        if lead_caveats:
+            sentence += " Key caveats: " + "; ".join(lead_caveats[:3]) + "."
+
+    return {
+        "n_perturbations": n,
+        "n_significant_reported": n_sig,
+        "n_low_power": n_low_power,
+        "n_guides_inconsistent": n_inconsistent,
+        "caveats": caveats,
+        "summary_sentence": sentence,
+    }
+
+
 def build_summary_table(perturbations: list[dict[str, Any]]) -> pd.DataFrame:
     """Publication-ready one-row-per-perturbation summary."""
     rows: list[dict[str, Any]] = []
@@ -755,9 +868,24 @@ def build_summary_table(perturbations: list[dict[str, Any]]) -> pd.DataFrame:
                 "n_replicates": s["counts"]["n_replicates"],
                 "qc_status": s["counts"]["qc_status"],
                 "edistance": eff.get("effect_size", NA),
+                "edistance_ci_low": (
+                    (eff.get("confidence_interval") or {}).get("low", NA)
+                    if isinstance(eff.get("confidence_interval"), dict)
+                    and (eff.get("confidence_interval") or {}).get("source") == "edistance_bootstrap_cells"
+                    else NA
+                ),
+                "edistance_ci_high": (
+                    (eff.get("confidence_interval") or {}).get("high", NA)
+                    if isinstance(eff.get("confidence_interval"), dict)
+                    and (eff.get("confidence_interval") or {}).get("source") == "edistance_bootstrap_cells"
+                    else NA
+                ),
                 "pvalue_adj": eff.get("pvalue_adj", NA),
                 "significant_adj": eff.get("significant_adj", NA),
+                "significant_adj_reported": eff.get("significant_adj_reported", NA),
+                "low_power": eff.get("low_power", NA),
                 "de_method": eff.get("de_method", NA),
+                "evidence_level": eff.get("evidence_level", NA),
                 "de_min_pvalue_adj": eff.get("de_min_pvalue_adj", NA),
                 "top_gene": top.get("gene", NA) if top else NA,
                 "top_gene_lfc": top.get("logfoldchange", NA) if top else NA,
@@ -1039,6 +1167,7 @@ def render_html_report(
     <li>low_power: {_fmt(s['effect_vs_control'].get('low_power'))}</li>
     <li>Secondary metrics: {_fmt(s['effect_vs_control'].get('secondary_metrics'))}</li>
     <li>DE method: {_fmt(s['effect_vs_control']['de_method'])}</li>
+    <li>DE evidence_level: {_fmt(s['effect_vs_control'].get('evidence_level'))}</li>
     <li>Note: {_fmt(s['effect_vs_control'].get('note'))}</li>
   </ul>
   <h3>3. Consistency</h3>
@@ -1061,6 +1190,17 @@ def render_html_report(
         )
 
     fig_list = "".join(f'<li><a href="{html.escape(f)}">{html.escape(f)}</a></li>' for f in figure_links)
+    verdict = report.get("verdict") if isinstance(report.get("verdict"), dict) else {}
+    summary_sentence = report.get("summary_sentence") or verdict.get("summary_sentence")
+    if summary_sentence:
+        verdict_html = f"""
+<section class="verdict" id="analysis-verdict">
+  <h2>Analysis verdict</h2>
+  <p>{html.escape(str(summary_sentence))}</p>
+</section>
+"""
+    else:
+        verdict_html = ""
     global_notes = []
     for key in ANALYSIS_STATUS_KEYS:
         block = report.get(key)
@@ -1128,6 +1268,9 @@ def render_html_report(
   .downloads a {{ margin-right: 1rem; }}
   .caveats {{ background: #f3efe6; border: 1px solid #d4cbb8; padding: 0.6rem 0.9rem; margin: 1rem 0; }}
   .caveats summary {{ cursor: pointer; font-weight: 600; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; }}
+  .verdict {{ background: #e8f0e9; border: 1px solid #b7c9b9; padding: 0.75rem 1rem; margin: 1rem 0; }}
+  .verdict h2 {{ margin: 0 0 0.35rem; font-size: 1.1rem; }}
+  .verdict p {{ margin: 0; }}
   .checklist {{ list-style: none; padding-left: 0; }}
   .checklist li {{ margin: 0.35rem 0; }}
   .fig-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-start; }}
@@ -1139,7 +1282,8 @@ def render_html_report(
 <body>
 <h1>Perturb-seq analysis report</h1>
 <p class="meta">Sample: <strong>{html.escape(sample_id)}</strong> · {n} perturbations summarized</p>
-<p class="meta">Machine-readable: <code>report.json</code> → <code>perturbations</code>. CSV / <code>.h5ad</code> remain downstream interfaces.</p>
+<p class="meta">Machine-readable: <code>report.json</code> → <code>perturbations</code> / <code>verdict</code>. CSV / <code>.h5ad</code> remain downstream interfaces.</p>
+{verdict_html}
 {caveats_html}
 <p class="downloads">Publication-ready summary:
   <a href="summary_table.csv" download>summary_table.csv</a>
@@ -1190,6 +1334,9 @@ def write_analysis_report(
         "n_with_de": sum(1 for s in summaries if s["top_affected"]["genes"] != NA),
         "n_warnings": sum(len(s.get("warnings") or []) for s in summaries),
     }
+    verdict = build_analysis_verdict(summaries, report)
+    report["verdict"] = verdict
+    report["summary_sentence"] = verdict["summary_sentence"]
 
     figures_dir = output_dir / "figures"
     figure_links: list[str] = []
@@ -1325,6 +1472,7 @@ def finalize_outputs(
 __all__ = [
     "ANALYSIS_STATUS_KEYS",
     "CORE_STATISTICAL_CAVEATS",
+    "build_analysis_verdict",
     "build_perturbation_summaries",
     "build_summary_table",
     "collect_package_versions",

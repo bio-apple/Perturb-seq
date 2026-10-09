@@ -59,8 +59,25 @@ Optional `guide_merge` (`none` default | `equal` | `umi` | `confidence` | `umi_c
 
 This tertiary pipeline does **not** re-call guides by default. Assignment quality (GMM on CRISPR capture) bounds everything downstream.
 
+Optional `--guide-reassign compare|apply_max|apply_gmm` compares DRAGEN calls to a simple max-UMI baseline and a lightweight per-guide 2-component GMM on CRISPR counts (sklearn). Default remains **off** — DRAGEN secondary GMM is preferred. External alternatives (not installed here): Cell Ranger Feature Barcode, CatchR, pertpy `GuideAssignment`.
+
 - [DRAGEN scRNA CRISPR mode](https://help.dragen.illumina.com/dragen-v4.5/product-guides/dragen-v4.5/dragen-single-cell-pipeline/dragen-scrna-illumina#crispr-mode)
 - [Illumina Connected Multiomics · Perturb-seq walkthrough](https://help.multiomics.illumina.com/icm/analyses/walkthroughs/perturb-seq)
+
+## DE covariates and Wilcoxon limits
+
+When `de_covariates: true` (default), available obs columns among `phase`, `pct_counts_mt`, and `log_n_counts` (from `n_counts`) are included in the **PyDESeq2** design formula with replicates. **Wilcoxon** (no replicates) cannot regress covariates via `scanpy.tl.rank_genes_groups`; requested covariates are recorded in `report.json` / table notes as ignored — still exploratory only.
+
+## Advanced perturbation methods (not bundled)
+
+| Method | Role | In this repo |
+| --- | --- | --- |
+| Mixscape `layers['X_pert']` | Perturbation signature; KO/NP; post-Mixscape E-distance PCA | **Implemented** (pertpy) |
+| SCEPTRE | Causal / resampling inference for CRISPR screens | Documented only — R/Bioconductor ecosystem |
+| MIMOSCA | Covariate-aware linear perturbation model | Documented only — optional external |
+| PerturbNet / deep autoencoders | Learned low-dim phenotype embeddings | Documented only — do **not** pull heavy DL stacks into the default path |
+
+Prefer Mixscape `X_pert` + E-distance here; treat SCEPTRE/MIMOSCA/PerturbNet as advanced follow-ups when you need causal identification or custom embeddings.
 
 ## Practical checklist
 

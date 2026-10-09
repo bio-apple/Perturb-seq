@@ -32,7 +32,7 @@ conda activate perturbseq-tertiary
 python -m perturbseq write-demo --output-dir data/demo
 ```
 
-**Why:** Creates a minimal DRAGEN-shaped bundle (`sample1.scRNA.*`) with NegCtrl + targeting guides, singletons, and a few multiplets / empty assignments. Same file names the real pipeline expects.
+**Why:** Creates a minimal DRAGEN-shaped bundle (`sample1.scRNA.*`) with NegCtrl + targeting guides, singletons, and a few multiplets / empty assignments. Same file names the real pipeline expects. The demo also plants **IFNGR2** with two guides that have **conflicting target-gene effects** so guide QC can flag multi-guide inconsistency (see Common pitfalls below).
 
 **Inspect:**
 
@@ -135,7 +135,7 @@ Or rebuild HTML/JSON from an existing results directory without re-running analy
 python -m perturbseq report --output-dir results/demo
 ```
 
-`report.html` is organized around questions per perturbation (cell counts, effect size, consistency, top genes, warnings). Each card also surfaces guide `interpretation` / `qc_warnings` (and optional weighted summary when `guide_merge` ≠ `none`). Prefer CSV / h5ad / `report.json` for downstream scripting. Skipped optional steps appear as objects like `"mixscape": {"skipped": true, "reason": "user_skip", ...}` — not missing keys or bare `null`.
+`report.html` opens with an **Analysis verdict** card (one sentence from guide QC + E-test + DE — also in `report.json` as `verdict` / `summary_sentence`). Below that, each perturbation answers cell counts, effect size, consistency, top genes, warnings. Cards surface guide `interpretation` / `qc_warnings` (and optional weighted summary when `guide_merge` ≠ `none`). Prefer CSV / h5ad / `report.json` for downstream scripting. Skipped optional steps appear as objects like `"mixscape": {"skipped": true, "reason": "user_skip", ...}` — not missing keys or bare `null`.
 
 ## Step 5 — Optional follow-ons
 
@@ -176,6 +176,22 @@ Full text + literature: **[STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md)**.
 | **UMAP / Leiden as effect** | Global structure ≠ perturbation evidence | Prefer E-distance / E-test (+ replicate-aware DE) |
 | **Filtering changes composition** | MAD QC, singlet, Mixscape KO+NT drop cells | Compare `tables/composition_audit.csv` |
 | **Inherited guide assignment** | Tertiary pipeline does not re-call guides by default | Assignment quality bounds everything downstream |
+
+### Hands-on: multi-guide inconsistency (demo)
+
+Synthetic `write-demo` plants **IFNGR2** with two guides: `IFNGR2_1` knocks down the target gene; `IFNGR2_2` has a conflicting (upregulated) target effect. After Step 2:
+
+```bash
+python - <<'PY'
+import pandas as pd
+c = pd.read_csv("results/demo/tables/gene_guide_consistency.csv")
+print(c.loc[c["gene_target"] == "IFNGR2", ["gene_target", "directions", "guides_consistent"]])
+w = pd.read_csv("results/demo/tables/qc_warnings.csv")
+print(w.loc[w["warning"] == "inconsistent_guides"])
+PY
+```
+
+Expect `guides_consistent == False` and an `inconsistent_guides` warning. The HTML verdict / IFNGR2 card should surface the same flag. Do **not** pool those guides into one KO claim.
 
 Demo NegCtrl / targeting modules are synthetic — do not over-interpret gene names.
 

@@ -2,7 +2,7 @@
 
 This document separates **descriptive** structure discovery from steps that **filter cells** or change **inference scope**. Global HVG / PCA / neighbors / Leiden / UMAP are **not** perturbation-effect evidence by default.
 
-Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape/E-distance), `statistics.py` (DE), `composition.py` (filter composition audit), orchestrated by `pipeline.py`. See also `docs/structure.md`.
+Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape/E-distance), `statistics.py` (DE), `composition.py` (filter composition audit), orchestrated by `pipeline.py`. See also `docs/structure.md`. Pipeline step ↔ sc-best-practices chapter sections: [SC_BEST_PRACTICES_MAP.md](SC_BEST_PRACTICES_MAP.md).
 
 ## Matrix layers
 
@@ -19,6 +19,7 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | Stage | Kind | Input matrix / labels | Output | Changes inference scope? | Caveats |
 | --- | --- | --- | --- | --- | --- |
 | Load + guide annotate | descriptive | DRAGEN MEX + assignments | `guide_id`, `gene_target`, `perturbation` | No | Composition already reflects DRAGEN calling |
+| Guide reassignment (optional) | QC / optional filtering | CRISPR count matrix + DRAGEN calls | comparison CSV; optional override | **Yes** if `apply_*` | Default `off`; CatchR / Cell Ranger FB not installed |
 | QC (MAD + min cells/gene) | filtering | raw `X` | filtered AnnData + QC log | **Yes** — drops cells/genes | Alters sample composition by library size / MT / sparsity |
 | Singlet filter | filtering | `num_features` | singlet cells | **Yes** — drops 0/≥2 guide cells | Can deplete rare guides or doublets carrying real biology |
 | Normalize / log1p | transform | `layers['counts']` → `X` | log-norm expression | No (representation) | Downstream on `X` is not count-scale |
@@ -27,13 +28,13 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | Leiden | descriptive | neighbor graph | `obs['leiden']` | No | Cluster labels ≠ perturbation classes |
 | Cell annotation | descriptive | log-norm scores / markers | phase, cell_state, … | No (unless you later filter on them) | Cell-line “states”, not tissue taxonomy |
 | Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size |
-| Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object | **Yes** | Changes composition vs pre-Mixscape path |
-| E-distance / E-test | inferential (effect size) | `X_pca` (source tagged in report) | `edistance.csv`, `etest.csv`, `distances.csv`, optional `distance_mmd.csv` | Uses current cell set | Embedding choice changes ranks; `low_power` when `n_cells < etest_power_min_cells`; secondary metrics may skip (`missing_jax` / `failed`) |
-| DE (Wilcoxon) | exploratory / inferential* | log-norm `X` | `de_*.csv` | Uses `de_group` definition | Cell-level p-values ≠ replicate inference |
-| DE (PyDESeq2) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | Uses `de_group` + replicates | Requires `replicate_col` with ≥2 levels |
+| Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object (default inferential subset) | **Yes** | Before/after in `mixscape_ko_filter` + `tables/mixscape_ko_filter_composition.csv` |
+| E-distance / E-test | inferential (effect size) | `X_pca` from `X_pert` when Mixscape ran | `edistance.csv`, `etest.csv`, `distances.csv`, optional `distance_mmd.csv` | Uses KO+NT set | Embedding choice changes ranks; bootstrap CI `edistance_ci_low`/`edistance_ci_high` (`n_bootstrap`, default 100); `low_power` when `n_cells < etest_power_min_cells`; secondary metrics may skip (`missing_jax` / `failed`) |
+| DE (Wilcoxon) | exploratory / inferential* | log-norm `X` | `de_*.csv` | Uses `de_group` definition | Cell-level p-values ≠ replicate inference; **covariates not modeled**; `evidence_level=exploratory` |
+| DE (PyDESeq2) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | Uses `de_group` + replicates + optional covariates | Requires `replicate_col` with ≥2 levels; design in `report.de.design_formula`; `evidence_level=inferential` |
 | Perturbation clustering | descriptive | mean `X_pca` per gene_target | `perturbation_clusters.csv` | Uses current cell set | Pathway-like grouping, not proof of mechanism |
 
-\*Wilcoxon is exploratory when there is no biological replicate column.
+\*Wilcoxon is exploratory when there is no biological replicate column. Machine-readable `evidence_level` is on each DE CSV row, `report.json` → `de` / `experimental_design`, and per-perturbation summaries.
 
 ## Pre- vs post-Mixscape paths
 
@@ -44,7 +45,9 @@ When Mixscape **runs successfully**:
 | `pre_mixscape` | All cells after QC/singlet (includes NP) | `X_pca` from log-norm HVG | `tables/pre_mixscape/` |
 | `post_mixscape` | `mixscape_class_global` ∈ {control, KO} | `X_pca` recomputed from `layers['X_pert']` | `tables/post_mixscape/` and primary `tables/edistance.csv` |
 
-DE contrasts use Mixscape labels (`mixscape_class`) when Mixscape succeeds — **downstream DE depends on that classification**.
+DE contrasts use Mixscape labels (`mixscape_class`) when Mixscape succeeds — **downstream DE depends on that classification** (KO class vs control; NP cells are not in KO contrasts). The KO+NT filtered object is the default E-distance / clustering subset; composition before vs after NP removal is recorded under `mixscape.ko_filter`.
+
+**Perturbation embedding:** `layers['X_pert']` is the pipeline’s built-in Mixscape signature (see `report.perturbation_embedding`). SCEPTRE / MIMOSCA / PerturbNet are external advanced options — see [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md).
 
 When Mixscape is **skipped** or fails, `report.json` records an explicit status object (never a missing key or bare `null`):
 

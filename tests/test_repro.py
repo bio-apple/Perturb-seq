@@ -14,6 +14,7 @@ from perturbseq.repro import (
     deep_merge,
     load_yaml_config,
     sha256_file,
+    sha256_params,
     sha256_paths,
 )
 
@@ -67,6 +68,14 @@ def test_load_yaml_config_and_pipeline_mapping(tmp_path: Path):
     assert pc.control_patterns == ("^nt$", "^negctrl")
 
 
+def test_sha256_params_stable():
+    a = sha256_params({"n_mads": 5.0, "b": [1, 2]})
+    b = sha256_params({"b": [1, 2], "n_mads": 5.0})
+    assert a == b
+    assert len(a) == 64
+    assert sha256_params({"n_mads": 9.0}) != a
+
+
 def test_run_tracker_status_resume_and_invalidate(tmp_path: Path):
     out = tmp_path / "results"
     tracker = RunTracker(out, resume=False, seed=0)
@@ -85,6 +94,8 @@ def test_run_tracker_status_resume_and_invalidate(tmp_path: Path):
     status = tracker.load_status(stage)
     assert status is not None
     assert status["status"] == "success"
+    assert status["params_hash"] == sha256_params(params)
+    assert status["input_checksums"] == inputs
     assert status["output_checksums"]["out"] == sha256_file(artifact)
     assert (out / "run_manifest.json").is_file()
     assert (out / "run.log").is_file()
@@ -95,6 +106,23 @@ def test_run_tracker_status_resume_and_invalidate(tmp_path: Path):
     assert resumed.should_skip(stage, params={"n_mads": 9.0}, input_checksums=inputs) is False
     assert resumed.load_status(stage) is None
     assert resumed.load_status(STAGE_ORDER[1]) is None
+
+
+def test_resume_invalidates_on_input_checksum_change(tmp_path: Path):
+    out = tmp_path / "results"
+    tracker = RunTracker(out, resume=False, seed=0)
+    stage = STAGE_ORDER[0]
+    params = {"x": 1}
+    inputs = {"in": "hash1"}
+    payload = tracker.begin_stage(stage, inputs=inputs, params=params)
+    ckpt = tracker.checkpoint_path(stage)
+    ckpt.write_bytes(b"fake")
+    tracker.finish_stage(stage, payload, status="success", outputs={"adata": str(ckpt)})
+
+    resumed = RunTracker(out, resume=True, seed=0)
+    assert resumed.should_skip(stage, params=params, input_checksums=inputs)
+    assert resumed.should_skip(stage, params=params, input_checksums={"in": "hash2"}) is False
+    assert resumed.load_status(stage) is None
 
 
 def test_resume_skips_when_outputs_present(tmp_path: Path):
@@ -162,3 +190,42 @@ def test_resume_skips_completed_stages_on_demo(tmp_path: Path):
     assert "Resuming: skip stage 2_preprocessing_qc" in log
     status5 = json.loads((out / "stages" / "5_report" / "status.json").read_text())
     assert status5["status"] == "success"
+    assert "params_hash" in status5
+    assert status5["input_checksums"]
+    manifest = json.loads((out / "run_manifest.json").read_text())
+    assert "params_hash" in manifest
+
+
+def test_resume_invalidates_on_param_change_demo(tmp_path: Path):
+    """Changing a stage param with --resume must not silently reuse that stage."""
+    from perturbseq.cli import main
+
+    demo = tmp_path / "demo"
+    out = tmp_path / "results"
+    assert main(["write-demo", "--output-dir", str(demo)]) == 0
+    base = [
+        "run",
+        "--input-dir",
+        str(demo),
+        "--output-dir",
+        str(out),
+        "--sample-id",
+        "sample1",
+        "--skip-mixscape",
+        "--skip-distance",
+        "--n-perms",
+        "10",
+        "--n-mads",
+        "5",
+    ]
+    assert main(base) == 0
+    status2 = json.loads((out / "stages" / "2_preprocessing_qc" / "status.json").read_text())
+    old_hash = status2["params_hash"]
+
+    assert main([*base[:-1], "8", "--resume"]) == 0
+    log = (out / "run.log").read_text()
+    assert "Resuming: skip stage 1_input_validation" in log
+    assert "inputs/params changed; invalidating from here" in log or "START stage=2_preprocessing_qc" in log
+    status2b = json.loads((out / "stages" / "2_preprocessing_qc" / "status.json").read_text())
+    assert status2b["params_hash"] != old_hash
+    assert status2b["status"] == "success"

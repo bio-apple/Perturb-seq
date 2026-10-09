@@ -1,4 +1,10 @@
-"""Normalization, PCA, neighbors, UMAP, and Leiden for visualization / downstream analysis."""
+"""Domain: normalize / HVG / PCA / neighbors / UMAP / Leiden.
+
+Owns: RNA matrix preprocessing for visualization and shared embeddings.
+Does NOT own: guide annotation, cell QC filters, Mixscape, DE, or pipeline orchestration
+(``guides``, ``qc``, ``stages.preprocessing_qc``, ``pipeline``).
+Prefer this module over the compat alias ``preprocess``.
+"""
 
 from __future__ import annotations
 
