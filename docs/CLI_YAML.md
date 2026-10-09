@@ -106,9 +106,13 @@ These do **not** use `configs/default.yaml` / `PipelineConfig`.
 | `--h5ad` | required |
 | `--output-dir` | required |
 | `--control` | `NT` |
-| `--min-cells` | `10` |
+| `--min-cells` | `10` (guide-qc cell filter; **not** YAML gene-filter `min_cells`) |
 | `--min-median-umi` | `5.0` |
 | `--min-detection-rate` | `0.5` |
+| `--guide-merge` | `none` \| `equal` \| `umi` \| `confidence` \| `umi_confidence` |
+| `--perturbation-type` | `KO` (on-target direction: KO/KD/CRISPRi ↓, CRISPRa ↑) |
+| `--on-target-lfc-cutoff` | `0.25` |
+| `--on-target-min-fail-guides` | `2` → gene `potential_low_efficiency` |
 
 ## Example: same config two ways
 

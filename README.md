@@ -36,8 +36,8 @@ DRAGEN MEX + guide assignment
   → Mixscape: KO/NP; optional KO+NT subset                 [filtering/classification]
   → E-distance / E-test (pre/post Mixscape)                [inferential]
   → DE: prefer pseudobulk + PyDESeq2 (bio reps → inferential; else exploratory); Wilcoxon only if <2 pseudobulk units
-  → perturbation space (`--perturbation-space`: pca_silhouette default | kmeans | lr_classifier)
-  → Guide QC: assignment / target effect / cytotoxicity consistency
+  → perturbation space (`--perturbation-space`: pca_silhouette | kmeans | lr_classifier)
+  → Guide QC + report plots (guide-consistency / target-validation PNGs)
 ```
 
 Controls default to patterns like `NegCtrl*`, `NT`/`NTC`, `non-targeting` → `NT`. Override with `--control-patterns`.
@@ -107,35 +107,32 @@ python -m perturbseq run \
 
 Real data: `--input-dir data/raw --output-dir results/sample1 --sample-id sample1 --control NT`.
 
-Useful flags: `--config`, `--resume`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--perturbation-aware-qc` (fit MAD on NT only — preferred for Perturb-seq), `--replicate-col`, `--de-prefer-pseudobulk true|false`, `--pseudo-replicates N` (exploratory single-sample PyDESeq2), `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode auto|skip|force|subset`, `--mixscape-targets` / `--mixscape-top-n` (subset Mixscape), `--perturbation-type KO|KD` (KD/CRISPRi: Mixscape assumptions weaker — see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)), `--perturbation-space pca_silhouette|kmeans|lr_classifier` (default pca_silhouette), `--guide-reassign off|compare|apply_max|apply_gmm` (optional tertiary vs DRAGEN), `--de-covariates true|false|phase,pct_counts_mt,log_n_counts` (PyDESeq2 design; Wilcoxon ignores).
+Useful flags (full map: [CLI_YAML.md](docs/CLI_YAML.md)): `--config`, `--resume`, `--dry-run`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--perturbation-aware-qc`, `--replicate-col`, `--de-prefer-pseudobulk`, `--pseudo-replicates`, `--n-bootstrap` (E-distance CI; `0` = skip), `--etest-power-min-cells`, `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode` / `--mixscape-targets` / `--mixscape-top-n`, `--perturbation-type`, `--perturbation-space`, `--guide-merge`, `--on-target-lfc-cutoff` / `--on-target-min-fail-guides`, `--guide-reassign`, `--de-covariates`, `--report-plot-top-n`. KD/CRISPRi caveats: [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md).
 
-Standalone: `annotate`, `guide-qc`, `report` (rebuild HTML/JSON without re-running analysis).
+Standalone: `annotate`, `guide-qc`, `report` (rebuild HTML/JSON + optional report PNGs without re-running analysis).
 
 ## Outputs
 
 ```
 results/sample1/
   sample1.tertiary.h5ad
-  report.json / report.html
+  report.json / report.html          # verdict + per-perturbation cards; evidence_level on DE
   run_manifest.json / run.log
-  stages/<stage>/status.json (+ optional adata checkpoints)
-  figures/
+  stages/<stage>/status.json         # inputs/params_hash for --resume
+  figures/                           # QC, UMAP, E-distance, volcano, guide_consistency_*, target_validation_*
   tables/
     composition_audit.csv
-    qc_filter_by_guide.csv   # per-guide / gene_target QC removal (+ cytotoxicity flags)
+    qc_filter_by_guide.csv
     edistance.csv, etest.csv, distances.csv, optional distance_mmd.csv, de_*.csv
     guide_qc.csv, gene_guide_consistency.csv, qc_warnings.csv
-    gene_guide_weighted.csv   # when guide_merge ≠ none
+    gene_guide_weighted.csv          # when guide_merge ≠ none
+    perturbation_clusters.csv        # (+ optional perturbation_space_embeddings.csv)
     pre_mixscape/ / post_mixscape/   # if Mixscape ran
 ```
 
-Stages: `1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`.
+Stages: `1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`. Book-chapter map: [SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md). Matrix layers / pre–post Mixscape: [ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md).
 
-Which stage maps to which book section (Mixscape, pseudobulk DE, E-distance, …) — and what is pipeline-specific: **[docs/SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md)**.
-
-Key `obs` columns: `guide_id`, `gene_target`, `perturbation`, `num_features`, `guide_umi`, `mixscape_class*`. Raw UMI in `layers['counts']`; `X` is log-norm. UMAP/Leiden describe structure only.
-
-Guide QC: assignment / transcriptional effect / cytotoxicity layers in `guide_qc.csv`; multi-guide consistency in `gene_guide_consistency.csv`; warnings in `qc_warnings.csv`. These map onto each perturbation card in `report.html` (QC status, interpretations, top warnings). Optional `guide_merge: none|equal|umi|confidence|umi_confidence` (YAML / `--guide-merge`, default `none`) adds a descriptive weighted gene-level summary without dropping per-guide rows or clearing inconsistency flags. Optional `guide_reassign` compares DRAGEN calls to max-UMI / lightweight GMM (`tables/guide_reassignment_comparison.csv`); default remains DRAGEN. Mixscape `layers['X_pert']` is the built-in perturbation signature for E-distance; SCEPTRE / MIMOSCA / PerturbNet are documented external options only ([STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md)).
+Key `obs`: `guide_id`, `gene_target`, `perturbation`, `num_features`, `guide_umi`, `mixscape_class*`. `layers['counts']` = raw UMI; `X` = log-norm. Guide QC layers + on-target / `potential_low_efficiency` / optional `guide_merge` / `guide_reassign`: see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md) (not re-expanded here).
 
 ## 常见坑 / Common pitfalls
 

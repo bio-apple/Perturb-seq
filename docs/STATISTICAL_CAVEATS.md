@@ -38,6 +38,8 @@ E-distance quantifies multivariate shift (typically in PCA space) vs control; E-
 
 **Sample size / power.** Peidli et al. show E-test power is unstable at small per-group *n*; prefer roughly **≥50–100 cells per perturbation** for reporting significance, with **~200** more stable. This pipeline keeps computing distances for groups above `min_cells_per_pert`, but marks E-test rows with `low_power: true` when `n_cells < etest_power_min_cells` (default 50). Use `significant_adj_reported` (not raw `significant_adj`) for claims — low-power hits are never silently reported as significant.
 
+**Bootstrap CI.** With `n_bootstrap` (default 100; `0` = skip), `edistance.csv` / `etest.csv` gain percentile `edistance_ci_low` / `edistance_ci_high` (cell resampling). HTML effect cards prefer this CI when present.
+
 **Multi-metric sensitivity.** Alongside `edistance.csv`, the pipeline may write `distance_mmd.csv` / combined `distances.csv` (and attempt Wasserstein if OTT-JAX is installed). Skipped secondary metrics are recorded with `skipped` + `reason` (e.g. `missing_jax`).
 
 - Peidli et al., *Nature Methods* (2024): scPerturb / E-distance — [doi:10.1038/s41592-024-02296-5](https://doi.org/10.1038/s41592-024-02296-5)

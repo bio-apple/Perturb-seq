@@ -34,6 +34,8 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | DE (PyDESeq2, bio reps) | inferential | `layers['counts']` pseudobulk | `de_*.csv` | `de_group` + `replicate_col` + optional covariates | `replicate_col` ≥2 levels; `method=pydeseq2_pseudobulk`; `evidence_level=inferential` |
 | DE (PyDESeq2, no bio reps) | exploratory | `layers['counts']` pseudobulk | `de_*.csv` | `de_group` + `sample_id` or technical pseudo-reps | `method=pydeseq2_pseudobulk_no_bio_reps`; not a substitute for bio reps (Squair 2021) |
 | Perturbation clustering | descriptive | method-dependent (`perturbation_space`: mean `X_pca` / KMeans / LR coeffs) | `perturbation_clusters.csv`, optional `perturbation_space_embeddings.csv` | Uses current cell set; method in provenance | Pathway-like grouping, not proof of mechanism |
+| Guide QC | descriptive / QC flags | log-norm `X` + obs labels (+ optional `qc_filter_by_guide`) | `guide_qc.csv`, `gene_guide_consistency.csv`, `qc_warnings.csv` | No cell drop by itself | On-target proxy / `potential_low_efficiency` ≠ “no phenotype”; optional `guide_merge` is review-only |
+| Report plots | visualization | ranked perturbations + expression h5ad | `figures/guide_consistency_*.png`, `figures/target_validation_*.png` | No | Capped by `report_plot_top_n` (default 15); rebuild via `perturbseq report` |
 
 \*Only true multi-rep `replicate_col` yields `evidence_level=inferential`. No-bio-rep pseudobulk and Wilcoxon stay `exploratory`. Machine-readable `evidence_level` is on each DE CSV row, `report.json` → `de` / `experimental_design`, and per-perturbation summaries.
 

@@ -62,12 +62,16 @@ python -m perturbseq run \
 | `control: NT` | YAML / `--control` | Demo NegCtrl guides map to `NT` via `control_patterns` |
 | `singlet_only: true` | (omit `--keep-multiplets`) | Cleaner assignment for a first run |
 | `n_mads: 5` | YAML | Adaptive QC; demo is tiny so few cells drop |
+| `de_prefer_pseudobulk: true` | YAML | Prefer PyDESeq2 when ≥2 `sample_id` or `--pseudo-replicates`; single-sample demo → Wilcoxon fallback |
 | `n_jobs: 1` | YAML | Reproducible sequential DE / E-test |
 | `random_state: 0` | YAML | Stable PCA / neighbors / UMAP |
 | Mixscape on | (omit `--skip-mixscape`) | Demo has few targets (&lt; `mixscape_max_targets`) so Mixscape runs |
 | `n_perms: 200` | YAML | E-test permutations; raise for publication runs |
+| `n_bootstrap: 100` | YAML / `--n-bootstrap` | E-distance percentile CI (`0` = skip) |
 | `etest_power_min_cells: 50` | YAML / `--etest-power-min-cells` | Below → `low_power`; Peidli ~50–100 safer, ~200 more stable |
 | `secondary_distance_metrics` | YAML / CLI | Default `mmd,wasserstein`; skip gracefully if JAX missing |
+| `perturbation_space` | `pca_silhouette` | Descriptive clusters; also `kmeans` / `lr_classifier` |
+| `report_plot_top_n: 15` | YAML | Cap guide-consistency / target-validation PNGs |
 
 Faster smoke test (skip Mixscape + distance):
 
@@ -105,13 +109,13 @@ results/demo/
 
 **Suggested order:**
 
-1. **`run_manifest.json` / `run.log`** — Did every stage succeed? Check versions and checksums.
+1. **`run_manifest.json` / `run.log`** — Did every stage succeed? Check versions and checksums (`params_hash` for `--resume`).
 2. **`tables/composition_audit.csv`** — How many cells remain after QC / singlet / Mixscape filters.
-3. **`tables/edistance.csv`** / **`distances.csv`** (and `pre_mixscape/` / `post_mixscape/` if Mixscape ran) — Effect sizes vs NT (+ secondary metrics if available).
+3. **`tables/edistance.csv`** / **`distances.csv`** (and `pre_mixscape/` / `post_mixscape/` if Mixscape ran) — Effect sizes vs NT (+ bootstrap CI columns when `n_bootstrap` &gt; 0).
 4. **`tables/etest.csv`** — Permutation p-values / padj; check `low_power` and `significant_adj_reported`.
-5. **`tables/de_*.csv`** — Without replicates, expect exploratory Wilcoxon (see caveats).
+5. **`tables/de_*.csv`** — Check `evidence_level` / method: single-sample demo → exploratory Wilcoxon; ≥2 samples or `--pseudo-replicates` → exploratory PyDESeq2; true bio reps → inferential (see caveats).
 6. **`tables/guide_qc.csv`**, **`gene_guide_consistency.csv`**, **`qc_warnings.csv`** — Guide-level QC. Optional **`gene_guide_weighted.csv`** when `guide_merge` ≠ `none`.
-7. **`figures/`** — QC violin/scatter, UMAP (viz only), volcano, E-distance plots.
+7. **`figures/`** — QC, UMAP (viz only), volcano, E-distance, plus `guide_consistency_*` / `target_validation_*` report PNGs.
 8. **`sample1.tertiary.h5ad`** — `obs`: `guide_id`, `gene_target`, `perturbation`, `mixscape_class*`; `layers['counts']` raw; `X` log-norm.
 
 Quick Python peek:
@@ -173,7 +177,7 @@ Full text + literature: **[STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md)**.
 | **Multi-guide inconsistency** | Same gene, different guides → discordant directions (assignment, UMI, incomplete edit, off-target, cytotoxicity) | Inspect `gene_guide_consistency.csv` / `qc_warnings.csv`; do **not** pool inconsistent guides into one “gene KO” claim |
 | **Low on-target / multi-guide fail** | ≥2 adequate guides fail target log2FC in expected direction (`potential_low_efficiency`) | Flag low-efficiency guides; do **not** conclude “no phenotype” for the gene |
 | **Mixscape labels many NP** | Targeting barcode but transcriptome still resembles NT; pool-dependent; **not** proof the guide failed | Read composition audit; NP ≠ proven biological null |
-| **No FDR claims without replicates** | Cells ≠ biological replicates; no `replicate_col` → exploratory Wilcoxon only | Hypothesis ranking only; ≥2 true replicates → pseudobulk + PyDESeq2 |
+| **No FDR claims without replicates** | Cells ≠ biological replicates; no-bio-rep DE (exploratory PyDESeq2 or Wilcoxon fallback) is not population FDR | Hypothesis ranking only; ≥2 true replicates → `evidence_level=inferential` |
 | **UMAP / Leiden as effect** | Global structure ≠ perturbation evidence | Prefer E-distance / E-test (+ replicate-aware DE) |
 | **Perturbation-space clusters as mechanism** | `pca_silhouette` / `kmeans` / `lr_classifier` are descriptive embeddings | Compare methods via `--perturbation-space`; do not equate co-cluster with shared pathway |
 | **Filtering changes composition** | MAD QC, singlet, Mixscape KO+NT drop cells | Compare `tables/composition_audit.csv`; prefer `--perturbation-aware-qc` so strong phenotypes do not set MAD cutoffs; check `qc_filter_by_guide.csv` / `cytotoxicity_qc_depletion` |

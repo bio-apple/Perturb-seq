@@ -6,10 +6,10 @@
 | --- | --- | --- | --- |
 | 1 Input & validation | DRAGEN MEX、guide 参考、assignments | `stages/input_validation.py` | `io.py` |
 | 2 Preprocessing & QC | guide 归属、细胞/样本 QC、归一化降维 | `stages/preprocessing_qc.py` | `guides.py`, `qc.py`, `preprocessing.py`, `composition.py` |
-| 3a Perturbation modeling | Mixscape、E-distance、guide consistency | `stages/perturbation_modeling.py` | `perturbation.py` (+ `guide_qc.py`) |
+| 3a Perturbation modeling | Mixscape、E-distance、perturbation-space、guide consistency | `stages/perturbation_modeling.py` | `perturbation.py` (+ `guide_qc.py`) |
 | 3b Statistical inference | pseudobulk DE、FDR、设计检查 | `stages/statistical_inference.py` | `statistics.py` |
 | 4 Robustness | 敏感性、效应一致性、confidence flags | `stages/robustness.py` | `robustness.py` |
-| 5 Report | H5AD / CSV / JSON / HTML / provenance | `stages/report.py` | `report.py` |
+| 5 Report | H5AD / CSV / JSON / HTML / provenance / report PNGs | `stages/report.py` | `report.py`, `report_plots.py` |
 
 分层：`pipeline.py` 只做编排 + checkpoint/`--resume`；`stages/` 调用领域模块，不把算法塞进编排器。
 
