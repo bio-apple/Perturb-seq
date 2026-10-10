@@ -18,7 +18,7 @@ For matrix layers, pre/post-Mixscape paths, and which steps change inference sco
 | **2** — `normalize_total` + `log1p`, keep `layers['counts']`; HVG / PCA / neighbors | Expression representation + embedding for downstream tools | Prep shown inside [Identifying perturbed cells](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) and [Comparing perturbations at scale](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-3) | Same scanpy pattern the chapter uses before Mixscape and before E-distance. Not itself evidence of a KO effect. |
 | **2** — UMAP / Leiden | Structure visualization / descriptive clusters | *not claimed as perturbation evidence* (chapter focus is Mixscape / E-distance / DE / clustering of perturbations) | Aligns with book takeaways: do not treat global UMAP separation as KO proof. See [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md). |
 | **2** — Cell cycle / state annotation | Descriptive labels on cells | *pipeline-specific / not in chapter* | Optional; not used as default perturbation evidence. |
-| **3a_perturbation_modeling** — Mixscape (`X_pert`, KO/NP) | Identify cells where the perturbation “worked” | [Identifying perturbed cells](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) | Direct match (`pertpy.tl.Mixscape`). NP ≠ proven failed edit. Optional KO+NT subset mirrors chapter’s focus on perturbed vs control. |
+| **3a_perturbation_modeling** — Mixscape (`X_pert`, KO/NP) | Identify cells where the perturbation “worked” | [Identifying perturbed cells](https://www.sc-best-practices.org/conditions/perturbation-modeling/#conditions-perturbation-modeling-key-takeaway-2) | Direct match (`pertpy.tl.Mixscape`). NP ≠ proven failed edit. Optional KO+NT subset mirrors chapter’s focus on perturbed vs control. Seurat vignette parity: [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md). |
 | **3a** — E-distance / E-test (+ CI / power) | Quantify and test transcriptome shift vs control | [Effect size](https://www.sc-best-practices.org/conditions/perturbation-modeling/#effect-size) (under Comparing perturbations at scale) | Direct match (`pertpy.tl.Distance` / `DistanceTest` on `X_pca`). Pre/post-Mixscape embeddings; `n_bootstrap` → `edistance_ci_*`; `etest_power_min_cells` → `low_power` / `significant_adj_reported`. |
 | **3a** — Perturbation-space clustering (`--perturbation-space`) | Group perturbations with similar effects | [Perturbations with similar effects](https://www.sc-best-practices.org/conditions/perturbation-modeling/#perturbations-with-similar-effects) | Same goal. Methods: `pca_silhouette` (default; mean PCA + Leiden), `kmeans`, `lr_classifier`. Descriptive only — see [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md). |
 | **3a** — Guide QC / multi-guide consistency / on-target proxy | Per-guide assignment, target effect, cytotoxicity; gene-level agreement | *pipeline-specific / not in chapter* | `guide_qc.csv` / `gene_guide_consistency.csv` / `potential_low_efficiency`; HTML cards + optional report PNGs. |
@@ -45,3 +45,25 @@ For matrix layers, pre/post-Mixscape paths, and which steps change inference sco
 ## Honest boundary
 
 This pipeline is **aligned with** the chapter’s path (assign guides → identify perturbed cells → DE on pseudobulks → E-distance / cluster similar perturbations), not a line-by-line reproduction. DRAGEN ingest, default GMM assignment, MAD/singlet QC, guide-level QC, robustness flags, and the HTML/JSON report are **pipeline-specific**. Unseen-perturbation prediction is **intentionally omitted**.
+
+## Tertiary module coverage checklist
+
+Single status table for the biologist-facing modules (DRAGEN inputs → scanpy/pertpy tertiary; ICM walkthrough-style deliverables). Status: **done** / **partial** / **gap**. Seurat is **not** the default runtime — see [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md).
+
+External refs:
+
+- [DRAGEN v4.5 CRISPR mode](https://help.dragen.illumina.com/dragen-v4.5/product-guides/dragen-v4.5/dragen-single-cell-pipeline/dragen-scrna-illumina#crispr-mode) — secondary inputs (`*.filtered.*.gz`, `feature_barcode_reference.csv`, `positive_cell_guide_assignments.csv`)
+- [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/)
+- [Illumina Connected Multiomics Perturb-seq walkthrough](https://help.multiomics.illumina.com/icm/analyses/walkthroughs/perturb-seq)
+
+| Module | Recommended outputs | Priority | Status | Pipeline artifacts |
+| --- | --- | --- | --- | --- |
+| 细胞 QC | QC violin, scatter, before/after cell counts | 必做 | **done** | `figures/qc_violin.png`, `qc_scatter_*.png`, `qc_histograms.png`, `qc_cell_counts.png` + `tables/qc_cell_counts.csv` |
+| gRNA QC | guide cell-count barplot, guides-per-cell dist, assignment summary | 必做 | **done** | `figures/guide_cell_counts.png`, `guide_composition.png` (bar labels), `tables/guide_assignment_summary.csv` (+ `guide_qc.csv`) |
+| UMAP / clustering | cluster UMAP, marker table, cell-state annotation | 必做 | **done** | `figures/umap.png`, `umap_cell_annotation.png`, `tables/cluster_markers.csv`, `cell_annotations.csv` |
+| Perturbation 映射 | UMAP by guide, target gene, NTC | 必做 | **done** | `figures/umap_perturbation.png` (`guide_id` / `gene_target` / `is_ntc`) |
+| 细胞组成变化 | per-perturbation proportions/counts in clusters | 推荐 | **done** | `tables/composition_by_perturbation.csv`, `figures/composition_by_perturbation.png` (+ stage `composition_audit.csv`) |
+| 差异表达 | DEG vs NTC per perturbation, volcano, heatmap | when suitable control | **done** | `tables/de_*.csv`, `figures/volcano_*.png`, `figures/de_heatmap.png` (skipped if no contrasts) |
+| 通路分析 | GO/GSEA, enrichment plots | when reliable DEG/ranking | **gap** | Not run by default; DE gene lists in HTML/CSV only. Optional external enrichment on `de_*.csv` |
+
+HTML embedding: all `figures/*.png` are linked from `report.html`; per-perturbation cards prefer `umap_perturbation.png`, volcano, and shared `de_heatmap.png` when present.

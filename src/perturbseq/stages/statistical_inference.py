@@ -14,7 +14,7 @@ import pandas as pd
 from anndata import AnnData
 
 from perturbseq._deps import warn_if_pertpy_missing
-from perturbseq.plots import plot_volcano
+from perturbseq.plots import plot_de_heatmap, plot_volcano
 from perturbseq.report import completed_status, skipped_status
 from perturbseq.stages._helpers import _ko_label, _mark_stage
 from perturbseq.statistics import (
@@ -137,6 +137,9 @@ def stage_statistical_inference(
                 contrast_evidence[str(group)] = str(table["evidence_level"].iloc[0])
         if de_tables:
             pd.concat(de_tables, ignore_index=True).to_csv(tables / "de_top50_concat.csv", index=False)
+        if contrast_tables:
+            if plot_de_heatmap(contrast_tables, figures):
+                report["steps"].append("de_heatmap")
         report["n_de_contrasts"] = len(de_tables)
         report["steps"].append("de")
         de_detail = design.get("note")

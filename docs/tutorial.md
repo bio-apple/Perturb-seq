@@ -10,7 +10,7 @@ jupyter notebook docs/tutorial.ipynb
 # or: jupyter lab docs/tutorial.ipynb
 ```
 
-Related: [CLI ↔ YAML](CLI_YAML.md) · [Statistical caveats](STATISTICAL_CAVEATS.md) · [Step dependencies](ANALYSIS_DEPENDENCIES.md)
+Related: [CLI ↔ YAML](CLI_YAML.md) · [Statistical caveats](STATISTICAL_CAVEATS.md) · [Step dependencies](ANALYSIS_DEPENDENCIES.md) · [Mixscape ↔ Seurat vignette](MIXSCAPE_SEURAT_MAP.md)
 
 ## Motivation
 
@@ -72,6 +72,7 @@ python -m perturbseq run \
 | `secondary_distance_metrics` | YAML / CLI | Default `mmd,wasserstein`; skip gracefully if JAX missing |
 | `perturbation_space` | `pca_silhouette` | Descriptive clusters; also `kmeans` / `lr_classifier` |
 | `report_plot_top_n: 15` | YAML | Cap guide-consistency / target-validation PNGs |
+| `sample_type: cell_line` | YAML / `--sample-type` | Homogeneous lines → skip full cell annotation (UMAP/Leiden still run). Use `primary`/`mixed` or `--run-cell-annotation` when tissue labels matter |
 
 Faster smoke test (skip Mixscape + distance):
 
@@ -144,11 +145,12 @@ python -m perturbseq report --output-dir results/demo
 ## Step 5 — Optional follow-ons
 
 ```bash
-# Cell-cycle / state annotation only
+# Cell-cycle / state annotation only (pipeline skips this by default for sample_type=cell_line)
 python -m perturbseq annotate \
   --h5ad results/demo/sample1.tertiary.h5ad \
   --output-dir results/demo \
   --inplace
+# Or force during run: --run-cell-annotation / --sample-type primary
 
 # Guide QC only
 python -m perturbseq guide-qc \
@@ -159,7 +161,7 @@ python -m perturbseq guide-qc \
 
 ## Optional — public dataset (Papalexi 2021)
 
-Needs **network** (first download) and `pertpy`. Not DRAGEN MEX — useful for comparing with Mixscape literature. Full interactive cell: [tutorial.ipynb](tutorial.ipynb).
+Needs **network** (first download) and `pertpy`. Not DRAGEN MEX — useful for comparing with Mixscape literature and the [Seurat Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette) (step map: [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md)). Full interactive cell: [tutorial.ipynb](tutorial.ipynb).
 
 ```python
 # optional

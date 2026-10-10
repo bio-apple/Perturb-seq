@@ -25,6 +25,8 @@ Mixscape classifies cells that received a targeting guide but still resemble con
 - Large libraries: default **auto** skip when `#targets > mixscape_max_targets` unless `--force-mixscape` / `mixscape_mode=force` — genome-scale Mixscape is expensive and pool-dependent. Recorded as `report.json` → `mixscape.reason = "too_many_targets"` with `n_targets`, `mixscape_max_targets`, and a rough `estimate` (`approx_work_units` ∝ O(n_cells × n_targets), not a benchmark).
 - Partial runs: `mixscape_mode=subset` with `--mixscape-targets GENE1,GENE2` and/or `--mixscape-top-n` (top E-distance genes after the cheap pre-Mixscape ranking). Results cover **only** control + selected targets — do not generalize Mixscape labels to the rest of the library. Per-batch / replicate splitting still uses `replicate_col` → Mixscape `split_by`.
 
+**Canonical Seurat vignette** (CalcPerturbSig / RunMixscape / MixscapeLDA ↔ our steps): [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md) → [satijalab.org Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette).
+
 ### CRISPRi/a / knockdown (`perturbation_type=KD`)
 
 Mixscape was developed and validated primarily in a **CRISPR KO** setting (binary-ish transcriptomic shift vs NT). For **knockdown / CRISPRi/a** (`--perturbation-type KD` or similar), assumptions are **weaker**: partial repression produces graded effects, so NP vs perturbed labels are less decisive. Prefer E-distance, target-gene knockdown, and multi-guide consistency; treat Mixscape classes as exploratory filters. The HTML report surfaces this under **Statistical caveats** when `perturbation_type` is KD-like.
@@ -98,7 +100,7 @@ When `de_covariates: true` (default), available obs columns among `phase`, `pct_
 
 | Method | Role | In this repo |
 | --- | --- | --- |
-| Mixscape `layers['X_pert']` | Perturbation signature; KO/NP; post-Mixscape E-distance PCA | **Implemented** (pertpy) |
+| Mixscape `layers['X_pert']` | Perturbation signature; KO/NP; post-Mixscape E-distance PCA | **Implemented** (pertpy); Seurat vignette map: [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md) |
 | SCEPTRE | Causal / resampling inference for CRISPR screens | Documented only — R/Bioconductor ecosystem |
 | MIMOSCA | Covariate-aware linear perturbation model | Documented only — optional external |
 | PerturbNet / deep autoencoders | Learned low-dim phenotype embeddings | Documented only — do **not** pull heavy DL stacks into the default path |

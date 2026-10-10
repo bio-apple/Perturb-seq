@@ -25,7 +25,7 @@ from perturbseq.perturbation import (
     run_mixscape,
     select_mixscape_targets_from_edistance,
 )
-from perturbseq.plots import plot_guide_qc, plot_umap
+from perturbseq.plots import plot_guide_qc, plot_mixscape_lda, plot_umap
 from perturbseq.report import completed_status, mixscape_kd_caveat, skipped_status
 from perturbseq.stages._helpers import (
     _compute_secondary_distances,
@@ -266,6 +266,8 @@ def stage_perturbation_modeling(
             analysis_source = mixscape_adata
             global_counts = mixscape_adata.obs["mixscape_class_global"].value_counts().to_dict()
             report["mixscape_global"] = global_counts
+            mixscape_meta = dict(mixscape_adata.uns.get("_perturbseq_mixscape") or {})
+            lda_ok = bool(mixscape_meta.get("lda")) and "mixscape_lda" in mixscape_adata.uns
             subset_detail = ""
             if mixscape_selected is not None:
                 subset_detail = (
@@ -285,12 +287,29 @@ def stage_perturbation_modeling(
                 subset=bool(mixscape_selected),
                 selected_targets=list(mixscape_selected) if mixscape_selected else None,
                 estimate=mixscape_estimate if mixscape_selected else None,
+                lda=lda_ok,
+                mixscale=bool(mixscape_meta.get("mixscale")),
+                # KO / NP / control labels (Seurat mixscape_class.global analogue)
+                class_global_labels=sorted(str(k) for k in global_counts),
             )
             plot_umap(
                 mixscape_adata,
                 figures / "mixscape",
                 color=["mixscape_class_global", "perturbation"],
             )
+            if lda_ok:
+                plotted = plot_mixscape_lda(
+                    mixscape_adata,
+                    figures / "mixscape",
+                    control=config.control,
+                    perturbation_type=config.perturbation_type,
+                )
+                if not plotted:
+                    warnings.warn(
+                        "Mixscape LDA embedding present but lda_umap.png was not written",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             report["steps"].append("mixscape")
             append_composition_audit(composition_rows, mixscape_adata, "after_mixscape_classify")
         except ImportError as exc:

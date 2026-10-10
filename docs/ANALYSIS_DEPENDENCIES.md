@@ -2,7 +2,7 @@
 
 This document separates **descriptive** structure discovery from steps that **filter cells** or change **inference scope**. Global HVG / PCA / neighbors / Leiden / UMAP are **not** perturbation-effect evidence by default.
 
-Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape/E-distance), `statistics.py` (DE), `composition.py` (filter composition audit), orchestrated by `pipeline.py`. See also `docs/structure.md`. Pipeline step ↔ sc-best-practices chapter sections: [SC_BEST_PRACTICES_MAP.md](SC_BEST_PRACTICES_MAP.md).
+Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape/E-distance), `statistics.py` (DE), `composition.py` (filter composition audit + cluster×perturbation), orchestrated by `pipeline.py`. See also `docs/structure.md`. Pipeline step ↔ sc-best-practices chapter sections + biologist module checklist (DRAGEN / ICM / sc-best-practices): [SC_BEST_PRACTICES_MAP.md](SC_BEST_PRACTICES_MAP.md#tertiary-module-coverage-checklist).
 
 ## Matrix layers
 
@@ -26,8 +26,8 @@ Module map: `preprocessing.py` (normalize/PCA/UMAP), `perturbation.py` (Mixscape
 | HVG / PCA / neighbors | descriptive | log-norm `X` (HVG) | `X_pca`, graph | No for perturbation claims | Global structure; confounded by cell cycle, ambient, guide load |
 | UMAP | descriptive (viz) | neighbor graph | `X_umap` | No | **Do not** treat separation as KO evidence |
 | Leiden | descriptive | neighbor graph | `obs['leiden']` | No | Cluster labels ≠ perturbation classes |
-| Cell annotation | descriptive | log-norm scores / markers | phase, cell_state, … | No (unless you later filter on them) | Cell-line “states”, not tissue taxonomy |
-| Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size |
+| Cell annotation | descriptive | log-norm scores / markers | phase, cell_state, … | No (unless you later filter on them) | Gated by `sample_type` (default `cell_line` → skip); cell-line “states”, not tissue taxonomy |
+| Mixscape | filtering + classification | signature on expression | `mixscape_class*`, `X_pert`; optional `uns['mixscape_lda']` | **Yes** — NP vs KO changes who counts as perturbed | NP ≠ proven null; depends on NT pool size; Seurat vignette map: [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md) |
 | Post-Mixscape KO+NT subset | filtering | `mixscape_class_global` | analysis object (default inferential subset) | **Yes** | Before/after in `mixscape_ko_filter` + `tables/mixscape_ko_filter_composition.csv` |
 | E-distance / E-test | inferential (effect size) | `X_pca` from `X_pert` when Mixscape ran | `edistance.csv`, `etest.csv`, `distances.csv`, optional `distance_mmd.csv` | Uses KO+NT set | Embedding choice changes ranks; bootstrap CI `edistance_ci_low`/`edistance_ci_high` (`n_bootstrap`, default 100); `low_power` when `n_cells < etest_power_min_cells`; secondary metrics may skip (`missing_jax` / `failed`) |
 | DE (Wilcoxon fallback) | exploratory | log-norm `X` | `de_*.csv` | Uses `de_group` | Only when &lt;2 pseudobulk units; cell-level p-values inflate significance; **covariates not modeled**; `evidence_level=exploratory` |
@@ -50,7 +50,7 @@ When Mixscape **runs successfully**:
 
 DE contrasts use Mixscape labels (`mixscape_class`) when Mixscape succeeds — **downstream DE depends on that classification** (KO class vs control; NP cells are not in KO contrasts). The KO+NT filtered object is the default E-distance / clustering subset; composition before vs after NP removal is recorded under `mixscape.ko_filter`.
 
-**Perturbation embedding:** `layers['X_pert']` is the pipeline’s built-in Mixscape signature (see `report.perturbation_embedding`). SCEPTRE / MIMOSCA / PerturbNet are external advanced options — see [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md).
+**Perturbation embedding:** `layers['X_pert']` is the pipeline’s built-in Mixscape signature (see `report.perturbation_embedding`). Optional LDA (`Mixscape.lda` → `uns['mixscape_lda']`, `report.mixscape.lda`) matches the Seurat vignette’s MixscapeLDA viz path — not the primary E-distance embedding. Seurat step map: [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md). SCEPTRE / MIMOSCA / PerturbNet are external advanced options — see [STATISTICAL_CAVEATS.md](STATISTICAL_CAVEATS.md).
 
 When Mixscape is **skipped** or fails, `report.json` records an explicit status object (never a missing key or bare `null`):
 

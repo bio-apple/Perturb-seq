@@ -2,9 +2,9 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Tertiary analysis on **DRAGEN scRNA CRISPR / Perturb-seq secondary outputs**, using **scanpy + pertpy**. Aligned with [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/), [pertpy](https://pertpy.scverse.org/en/latest/index.html) ([Heumos et al. 2026](https://www.nature.com/articles/s41592-025-02909-7)), and the [Illumina Connected Multiomics Perturb-seq walkthrough](https://help.multiomics.illumina.com/icm/analyses/walkthroughs/perturb-seq).
+Tertiary analysis on **DRAGEN scRNA CRISPR / Perturb-seq secondary outputs**, using **scanpy + pertpy** (default Python stack). The [Seurat Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette) is conceptual parity / an optional R path — see [MIXSCAPE_SEURAT_MAP.md](docs/MIXSCAPE_SEURAT_MAP.md). Aligned with [sc-best-practices · perturbation modeling](https://www.sc-best-practices.org/conditions/perturbation-modeling/), [pertpy](https://pertpy.scverse.org/en/latest/index.html) ([Heumos et al. 2026](https://www.nature.com/articles/s41592-025-02909-7)), and the [Illumina Connected Multiomics Perturb-seq walkthrough](https://help.multiomics.illumina.com/icm/analyses/walkthroughs/perturb-seq).
 
-**Docs:** [tutorial notebook](docs/tutorial.ipynb) · [tutorial.md](docs/tutorial.md) · [CLI ↔ YAML](docs/CLI_YAML.md) · [Statistical caveats](docs/STATISTICAL_CAVEATS.md) · [Step dependencies](docs/ANALYSIS_DEPENDENCIES.md) · [sc-best-practices map](docs/SC_BEST_PRACTICES_MAP.md)
+**Docs:** [tutorial notebook](docs/tutorial.ipynb) · [tutorial.md](docs/tutorial.md) · [CLI ↔ YAML](docs/CLI_YAML.md) · [Statistical caveats](docs/STATISTICAL_CAVEATS.md) · [Step dependencies](docs/ANALYSIS_DEPENDENCIES.md) · [sc-best-practices map + module checklist](docs/SC_BEST_PRACTICES_MAP.md#tertiary-module-coverage-checklist) · [Mixscape ↔ Seurat vignette](docs/MIXSCAPE_SEURAT_MAP.md)
 
 > Chinese readers: [README.zh-CN.md](README.zh-CN.md) covers the same install / run / outputs / caveats in 中文 (full detail). This English file is the maintainable primary README for packaging (`pyproject.toml` → `readme`).
 
@@ -32,7 +32,7 @@ DRAGEN MEX + guide assignment
   → default: keep num_features == 1 singlets               [filtering]
   → normalize / log1p (keep layers['counts']) + HVG/PCA/Leiden  [descriptive]
   → UMAP                                                   [visualization only]
-  → cell annotation: cell cycle + state scores             [descriptive]
+  → cell annotation: cell cycle + state scores             [descriptive; skipped by default for sample_type=cell_line]
   → Mixscape: KO/NP; optional KO+NT subset                 [filtering/classification]
   → E-distance / E-test (pre/post Mixscape)                [inferential]
   → DE: prefer pseudobulk + PyDESeq2 (bio reps → inferential; else exploratory); Wilcoxon only if <2 pseudobulk units
@@ -107,7 +107,7 @@ python -m perturbseq run \
 
 Real data: `--input-dir data/raw --output-dir results/sample1 --sample-id sample1 --control NT`.
 
-Useful flags (full map: [CLI_YAML.md](docs/CLI_YAML.md)): `--config`, `--resume`, `--dry-run`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--perturbation-aware-qc`, `--replicate-col`, `--de-prefer-pseudobulk`, `--pseudo-replicates`, `--n-bootstrap` (E-distance CI; `0` = skip), `--etest-power-min-cells`, `--skip-mixscape` / `--skip-distance` / `--skip-de` / `--skip-cell-annotation`, `--mixscape-mode` / `--mixscape-targets` / `--mixscape-top-n`, `--perturbation-type`, `--perturbation-space`, `--guide-merge`, `--on-target-lfc-cutoff` / `--on-target-min-fail-guides`, `--guide-reassign`, `--de-covariates`, `--report-plot-top-n`. KD/CRISPRi caveats: [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md).
+Useful flags (full map: [CLI_YAML.md](docs/CLI_YAML.md)): `--config`, `--resume`, `--dry-run`, `--random-state`, `--n-jobs`, `--keep-multiplets`, `--perturbation-aware-qc`, `--replicate-col`, `--de-prefer-pseudobulk`, `--pseudo-replicates`, `--n-bootstrap` (E-distance CI; `0` = skip), `--etest-power-min-cells`, `--sample-type` (`cell_line` default → skip full cell annotation; `primary`/`mixed` → run; override with `--skip-cell-annotation` / `--run-cell-annotation`), `--skip-mixscape` / `--skip-distance` / `--skip-de`, `--mixscape-mode` / `--mixscape-targets` / `--mixscape-top-n`, `--perturbation-type`, `--perturbation-space`, `--guide-merge`, `--on-target-lfc-cutoff` / `--on-target-min-fail-guides`, `--guide-reassign`, `--de-covariates`, `--report-plot-top-n`. KD/CRISPRi caveats: [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md).
 
 Standalone: `annotate`, `guide-qc`, `report` (rebuild HTML/JSON + optional report PNGs without re-running analysis).
 
@@ -119,9 +119,12 @@ results/sample1/
   report.json / report.html          # verdict + per-perturbation cards; evidence_level on DE
   run_manifest.json / run.log
   stages/<stage>/status.json         # inputs/params_hash for --resume
-  figures/                           # QC, UMAP, E-distance, volcano, guide_consistency_*, target_validation_*
+  figures/                           # qc_violin/scatter/cell_counts, guide_*, umap*, composition_*, volcano_*, de_heatmap, …
   tables/
     composition_audit.csv
+    composition_by_perturbation.csv  # cluster × gene_target counts/fractions
+    guide_assignment_summary.csv
+    qc_cell_counts.csv
     qc_filter_by_guide.csv
     edistance.csv, etest.csv, distances.csv, optional distance_mmd.csv, de_*.csv
     guide_qc.csv, gene_guide_consistency.csv, qc_warnings.csv
@@ -130,7 +133,7 @@ results/sample1/
     pre_mixscape/ / post_mixscape/   # if Mixscape ran
 ```
 
-Stages: `1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`. Book-chapter map: [SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md). Matrix layers / pre–post Mixscape: [ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md).
+Stages: `1_input_validation` → `2_preprocessing_qc` → `3a_perturbation_modeling` → `3b_statistical_inference` → `4_robustness` → `5_report`. Module checklist + book-chapter map: [SC_BEST_PRACTICES_MAP.md](docs/SC_BEST_PRACTICES_MAP.md#tertiary-module-coverage-checklist). Matrix layers / pre–post Mixscape: [ANALYSIS_DEPENDENCIES.md](docs/ANALYSIS_DEPENDENCIES.md).
 
 Key `obs`: `guide_id`, `gene_target`, `perturbation`, `num_features`, `guide_umi`, `mixscape_class*`. `layers['counts']` = raw UMI; `X` = log-norm. Guide QC layers + on-target / `potential_low_efficiency` / optional `guide_merge` / `guide_reassign`: see [STATISTICAL_CAVEATS](docs/STATISTICAL_CAVEATS.md) (not re-expanded here).
 
@@ -153,7 +156,7 @@ Full discussion + citations: **[docs/STATISTICAL_CAVEATS.md](docs/STATISTICAL_CA
 | Step | Choice | Not default |
 | --- | --- | --- |
 | Guide assignment | DRAGEN GMM | Re-calling (e.g. crispat) |
-| Non-perturbed cells | Mixscape (Papalexi 2021; stronger for KO than KD/CRISPRi) | Treat all targeting cells as KO |
+| Non-perturbed cells | Mixscape (Papalexi 2021; stronger for KO than KD/CRISPRi); [Seurat vignette map](docs/MIXSCAPE_SEURAT_MAP.md) | Treat all targeting cells as KO |
 | Effect size | E-distance / E-test (Peidli 2024) | UMAP separation alone |
 | DE | Pseudobulk + PyDESeq2 first (bio reps → inferential; else exploratory); Wilcoxon only as fallback | Silent cell-level Wilcoxon as “the” DE / population FDR |
 | Unseen perturbation prediction | Not a default step | scGen / foundation models as primary |

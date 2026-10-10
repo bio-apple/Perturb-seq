@@ -13,7 +13,7 @@
 
 分层：`pipeline.py` 只做编排 + checkpoint/`--resume`；`stages/` 调用领域模块，不把算法塞进编排器。
 
-步骤依赖（描述性 vs 推断性、矩阵层、pre/post Mixscape）：见 [ANALYSIS_DEPENDENCIES.md](ANALYSIS_DEPENDENCIES.md)。与 sc-best-practices 章节对照：见 [SC_BEST_PRACTICES_MAP.md](SC_BEST_PRACTICES_MAP.md)。
+步骤依赖（描述性 vs 推断性、矩阵层、pre/post Mixscape）：见 [ANALYSIS_DEPENDENCIES.md](ANALYSIS_DEPENDENCIES.md)。与 sc-best-practices 章节对照：见 [SC_BEST_PRACTICES_MAP.md](SC_BEST_PRACTICES_MAP.md)。生物模块覆盖清单（细胞 QC / gRNA QC / UMAP / 扰动映射 / 组成 / DE / 通路）：见同文档 [§ Tertiary module coverage](SC_BEST_PRACTICES_MAP.md#tertiary-module-coverage-checklist)。与 Seurat Mixscape vignette 对照（默认 Python；Seurat 为可选 R）：见 [MIXSCAPE_SEURAT_MAP.md](MIXSCAPE_SEURAT_MAP.md)。
 
 `pipeline.run_pipeline` 按 1→2→(3a then 3b)→4→5 编排。3a 与 3b 在概念上并行；进程内因 DE 可用 E-distance 排序而先跑建模。
 

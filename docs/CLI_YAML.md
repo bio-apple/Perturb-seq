@@ -32,7 +32,8 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `de_top_n` | `--de-top-n` | int |
 | `report_plot_top_n` | `--report-plot-top-n` | int; default 15; cap guide-consistency / target-validation PNGs |
 | `n_jobs` | `--n-jobs` | int; `1` = sequential, `-1` = all CPUs (DE / E-test outer loops) |
-| `skip_cell_annotation` | `--skip-cell-annotation` | bool / `store_true` |
+| `sample_type` | `--sample-type` | `cell_line` (default) \| `primary` \| `mixed` \| `unknown` — annotation policy (see below) |
+| `skip_cell_annotation` | `--skip-cell-annotation` / `--run-cell-annotation` | `null` = auto from `sample_type`; CLI `--skip-…` → `true`; `--run-…` → `false` (override wins) |
 | `skip_distance` | `--skip-distance` | bool / `store_true` |
 | `skip_de` | `--skip-de` | bool / `store_true` |
 | `perturbation_type` | `--perturbation-type` | string; Mixscape label e.g. `KO` / `KD` |
@@ -51,6 +52,19 @@ Sources of truth: `configs/default.yaml`, `PipelineConfig` in `src/perturbseq/pi
 | `de_covariates` | `--de-covariates` | `true` / `false` / YAML list / CLI comma-separated obs cols |
 
 Unknown YAML keys are stored on `PipelineConfig.extra` (not validated as pipeline fields).
+
+### Cell annotation vs `sample_type`
+
+Full cell-cycle / state annotation (`cell_annotation` stage) is optional. **Leiden / UMAP always run.**
+
+| `sample_type` | Annotation (when `skip_cell_annotation` is `null`) |
+| --- | --- |
+| `cell_line` | **skip** (homogeneous lines; cluster labels from Leiden remain) |
+| `primary` | **run** |
+| `mixed` | **run** |
+| `unknown` | **skip** + note (Perturb-seq demos are usually cell-line-like) |
+
+Explicit `--skip-cell-annotation` / `--run-cell-annotation` (or YAML `skip_cell_annotation: true|false`) **always** overrides `sample_type`. Decision is recorded in `report.json` → `cell_annotation.reason`, `skipped_stages`, and `matrix_provenance.cell_annotation_decision`.
 
 ## `run` — CLI-only (not PipelineConfig / not in default.yaml)
 

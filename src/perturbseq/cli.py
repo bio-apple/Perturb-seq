@@ -7,6 +7,7 @@ from pathlib import Path
 
 from anndata import read_h5ad
 
+from perturbseq.annotation_policy import SAMPLE_TYPES
 from perturbseq.cell_annotation import annotate_cells, annotation_summary, write_annotation_tables
 from perturbseq.demo import write_demo_dragen
 from perturbseq.guide_qc import GUIDE_MERGE_MODES, run_guide_qc, write_guide_qc_tables
@@ -116,7 +117,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Parallel workers for per-group DE / E-test (default 1; -1 = all CPUs)",
     )
-    run.add_argument("--skip-cell-annotation", action="store_true")
+    run.add_argument(
+        "--sample-type",
+        default=None,
+        choices=list(SAMPLE_TYPES),
+        help=(
+            "Sample biology for annotation policy: cell_line (default; skip full annotation), "
+            "primary/mixed (run), unknown (skip with note). "
+            "Overridden by --skip-cell-annotation / --run-cell-annotation. "
+            "Clustering/UMAP always run."
+        ),
+    )
+    ann_grp = run.add_mutually_exclusive_group()
+    ann_grp.add_argument(
+        "--skip-cell-annotation",
+        action="store_true",
+        help="Force skip cell-cycle / state annotation (overrides --sample-type)",
+    )
+    ann_grp.add_argument(
+        "--run-cell-annotation",
+        action="store_true",
+        help="Force run cell-cycle / state annotation (overrides --sample-type)",
+    )
     run.add_argument("--skip-distance", action="store_true")
     run.add_argument("--skip-de", action="store_true")
     run.add_argument("--perturbation-type", default=None, help="Mixscape label, e.g. KO / KD / perturbation")
@@ -377,8 +399,12 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         data["skip_mixscape"] = True
     if args.force_mixscape:
         data["force_mixscape"] = True
+    if getattr(args, "sample_type", None) is not None:
+        data["sample_type"] = args.sample_type
     if args.skip_cell_annotation:
         data["skip_cell_annotation"] = True
+    elif getattr(args, "run_cell_annotation", False):
+        data["skip_cell_annotation"] = False
     if args.skip_distance:
         data["skip_distance"] = True
     if args.skip_de:

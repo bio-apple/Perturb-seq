@@ -12,11 +12,27 @@ from typing import TYPE_CHECKING
 import pandas as pd
 from anndata import AnnData
 
+from perturbseq.annotation_policy import resolve_cell_annotation_decision
 from perturbseq.cell_annotation import annotate_cells, annotation_summary, write_annotation_tables
-from perturbseq.composition import append_composition_audit
+from perturbseq.composition import (
+    append_composition_audit,
+    composition_by_perturbation,
+    guide_assignment_summary,
+    write_composition_by_perturbation,
+    write_guide_assignment_summary,
+)
 from perturbseq.guide_reassignment import run_guide_reassignment
 from perturbseq.guides import annotate_guides, filter_singlets
-from perturbseq.plots import plot_cell_annotation, plot_guide_composition, plot_qc, plot_umap
+from perturbseq.plots import (
+    plot_cell_annotation,
+    plot_composition_by_cluster,
+    plot_guide_cell_counts,
+    plot_guide_composition,
+    plot_perturbation_umap,
+    plot_qc,
+    plot_qc_cell_counts,
+    plot_umap,
+)
 from perturbseq.preprocessing import preprocess_rna
 from perturbseq.qc import add_qc_metrics, filter_cells, sample_qc_summary, write_qc_filter_by_guide
 from perturbseq.report import completed_status, skipped_status
@@ -38,14 +54,22 @@ def stage_preprocessing_qc(
     assignments = rna.uns.pop("_perturbseq_assignments")
     feature_ref = rna.uns.pop("_perturbseq_feature_ref")
     crispr = rna.uns.pop("_perturbseq_crispr", None)
+    tables = config.output_dir / "tables"
+    tables.mkdir(parents=True, exist_ok=True)
     rna = annotate_guides(rna, assignments, feature_ref, config.control_patterns)
     rna = add_qc_metrics(rna)
     plot_qc(rna, figures)
     plot_guide_composition(rna, figures)
+    plot_guide_cell_counts(rna, figures)
+    assign_summary = guide_assignment_summary(rna, control=config.control)
+    assign_path = tables / "guide_assignment_summary.csv"
+    write_guide_assignment_summary(assign_summary, assign_path)
+    report["guide_assignment_summary"] = str(assign_path)
     report["guide_counts"] = rna.obs["num_features"].value_counts().sort_index().to_dict()
     report["gene_target_counts"] = rna.obs["gene_target"].value_counts().to_dict()
     report["sample_qc"] = sample_qc_summary(rna)
     append_composition_audit(composition_rows, rna, "loaded")
+    n_loaded = int(rna.n_obs)
 
     aware = bool(getattr(config, "perturbation_aware_qc", False))
     rna, qc_log = filter_cells(
@@ -56,7 +80,6 @@ def stage_preprocessing_qc(
         control=config.control,
     )
     by_guide = qc_log.pop("qc_filter_by_guide", None)
-    tables = config.output_dir / "tables"
     if isinstance(by_guide, pd.DataFrame) and not by_guide.empty:
         filter_path = tables / "qc_filter_by_guide.csv"
         write_qc_filter_by_guide(by_guide, filter_path)
@@ -95,6 +118,17 @@ def stage_preprocessing_qc(
             f"Singlet filter removed {report['n_removed_nonsinglet']} cells (num_features != 1)."
         )
     append_composition_audit(composition_rows, rna, "after_singlet")
+    cell_count_rows = pd.DataFrame(
+        [
+            {"stage": "loaded", "n_cells": n_loaded},
+            {"stage": "after_qc", "n_cells": int(qc_log.get("n_cells_after_qc", n_before_singlet))},
+            {"stage": "after_singlet", "n_cells": int(rna.n_obs)},
+        ]
+    )
+    cell_count_path = tables / "qc_cell_counts.csv"
+    cell_count_rows.to_csv(cell_count_path, index=False)
+    report["qc_cell_counts"] = str(cell_count_path)
+    plot_qc_cell_counts(cell_count_rows, figures)
 
     # Optional tertiary guide reassignment (compare / apply) after singlet filter.
     if getattr(config, "guide_reassign", "off") and config.guide_reassign != "off":
@@ -162,22 +196,58 @@ def stage_preprocessing_qc(
     if rna.obs["gene_target"].nunique() <= 40:
         umap_color.insert(1, "gene_target")
     plot_umap(rna, figures, color=umap_color)
+    plot_perturbation_umap(rna, figures, control=config.control)
     report["steps"].append("umap")
     append_composition_audit(composition_rows, rna, "after_preprocess")
 
-    if not config.skip_cell_annotation:
+    ann_decision = resolve_cell_annotation_decision(
+        config.sample_type,
+        skip_cell_annotation=config.skip_cell_annotation,
+    )
+    report.setdefault("matrix_provenance", {})["cell_annotation_decision"] = {
+        "sample_type": ann_decision["sample_type"],
+        "skip": ann_decision["skip"],
+        "reason": ann_decision["reason"],
+        "source": ann_decision["source"],
+    }
+    if not ann_decision["skip"]:
         print("Annotating cell cycle / cell states", flush=True)
         rna, markers = annotate_cells(rna)
-        write_annotation_tables(rna, markers, config.output_dir / "tables")
+        write_annotation_tables(rna, markers, tables)
         plot_cell_annotation(rna, figures)
-        report["cell_annotation"] = completed_status(**annotation_summary(rna))
+        report["cell_annotation"] = completed_status(
+            **annotation_summary(rna),
+            sample_type=ann_decision["sample_type"],
+            decision_reason=ann_decision["reason"],
+        )
         report["steps"].append("cell_annotation")
         append_composition_audit(composition_rows, rna, "after_cell_annotation")
     else:
+        print(f"Skipping cell annotation ({ann_decision['reason']})", flush=True)
         report["cell_annotation"] = skipped_status(
-            "user_skip",
-            detail="Cell annotation skipped (--skip-cell-annotation).",
+            ann_decision["reason"],
+            detail=ann_decision["detail"],
+            sample_type=ann_decision["sample_type"],
+            source=ann_decision["source"],
         )
+        skipped = list(report.get("skipped_stages") or [])
+        skipped.append(
+            {
+                "stage": "cell_annotation",
+                "reason": ann_decision["reason"],
+                "sample_type": ann_decision["sample_type"],
+            }
+        )
+        report["skipped_stages"] = skipped
+
+    # Cluster × perturbation composition (推荐) once Leiden exists.
+    if "leiden" in rna.obs:
+        comp = composition_by_perturbation(rna, cluster_key="leiden", perturbation_key="gene_target")
+        comp_path = tables / "composition_by_perturbation.csv"
+        write_composition_by_perturbation(comp, comp_path)
+        report["composition_by_perturbation"] = str(comp_path)
+        plot_composition_by_cluster(comp, figures)
+        report["steps"].append("composition_by_perturbation")
 
     _mark_stage(report, "2_preprocessing_qc")
     return rna

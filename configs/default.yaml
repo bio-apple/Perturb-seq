@@ -37,7 +37,14 @@ replicate_col: null
 # Optional stages: false = run when deps available. Mixscape auto-skips on
 # genome-scale libraries (see mixscape_max_targets) to avoid OOM / long runtime.
 skip_mixscape: false
-skip_cell_annotation: false
+# Sample biology → cell annotation policy (Leiden/UMAP always run):
+#   cell_line (default) → skip full cell-cycle/state annotation
+#   primary / mixed     → run annotation
+#   unknown             → skip with note (Perturb-seq demos are usually cell lines)
+# Explicit override (wins over sample_type): skip_cell_annotation true|false,
+# or CLI --skip-cell-annotation / --run-cell-annotation. null = use sample_type.
+sample_type: cell_line
+skip_cell_annotation: null
 skip_distance: false
 skip_de: false
 

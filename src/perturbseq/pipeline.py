@@ -26,6 +26,7 @@ from typing import Any
 import pandas as pd
 from anndata import AnnData, read_h5ad
 
+from perturbseq.annotation_policy import SAMPLE_TYPES, resolve_cell_annotation_decision
 from perturbseq.guide_reassignment import GUIDE_REASSIGN_MODES
 from perturbseq.guides import DEFAULT_CONTROL_PATTERNS
 from perturbseq.io import validate_sample_inputs, write_h5ad
@@ -78,7 +79,10 @@ class PipelineConfig:
     control: str = "NT"
     replicate_col: str | None = None
     skip_mixscape: bool = False
-    skip_cell_annotation: bool = False
+    # None = decide from sample_type; True/False = explicit --skip/--run-cell-annotation.
+    skip_cell_annotation: bool | None = None
+    # cell_line (default) → skip annotation; primary/mixed → run; unknown → skip + note.
+    sample_type: str = "cell_line"
     skip_distance: bool = False
     skip_de: bool = False
     n_perms: int = 200
@@ -135,10 +139,14 @@ def dry_run_plan(config: PipelineConfig) -> dict[str, Any]:
     """Validate inputs and return planned stages + resolved params (no analysis)."""
     files = validate_sample_inputs(config.input_dir, config.sample_id)
     stages: list[dict[str, Any]] = []
+    ann_decision = resolve_cell_annotation_decision(
+        config.sample_type,
+        skip_cell_annotation=config.skip_cell_annotation,
+    )
     for name in PIPELINE_STAGES:
         notes: list[str] = []
-        if name == "2_preprocessing_qc" and config.skip_cell_annotation:
-            notes.append("skip cell_annotation")
+        if name == "2_preprocessing_qc" and ann_decision["skip"]:
+            notes.append(f"skip cell_annotation ({ann_decision['reason']})")
         if name == "3a_perturbation_modeling":
             if config.skip_mixscape:
                 notes.append("skip mixscape")
@@ -200,6 +208,25 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
                 kwargs[key] = n if n >= 2 else None
         elif key == "mixscape_mode" and value is not None:
             kwargs[key] = str(value).strip().lower()
+        elif key == "sample_type" and value is not None:
+            kwargs[key] = str(value).strip().lower()
+        elif key == "skip_cell_annotation":
+            if value is None or value == "":
+                kwargs[key] = None
+            elif isinstance(value, bool):
+                kwargs[key] = value
+            else:
+                low = str(value).strip().lower()
+                if low in {"true", "yes", "1"}:
+                    kwargs[key] = True
+                elif low in {"false", "no", "0"}:
+                    kwargs[key] = False
+                elif low in {"null", "none", "auto", ""}:
+                    kwargs[key] = None
+                else:
+                    raise ValueError(
+                        f"skip_cell_annotation must be true/false/null, got {value!r}"
+                    )
         elif key == "perturbation_space" and value is not None:
             kwargs[key] = str(value).strip().lower()
         elif key == "guide_reassign" and value is not None:
@@ -232,6 +259,11 @@ def pipeline_config_from_mapping(data: dict[str, Any]) -> PipelineConfig:
         if mode not in allowed:
             raise ValueError(f"mixscape_mode must be one of {sorted(allowed)}, got {kwargs['mixscape_mode']!r}")
         kwargs["mixscape_mode"] = mode
+    if "sample_type" in kwargs and kwargs["sample_type"] is not None:
+        st = str(kwargs["sample_type"]).lower()
+        if st not in SAMPLE_TYPES:
+            raise ValueError(f"sample_type must be one of {SAMPLE_TYPES}, got {kwargs['sample_type']!r}")
+        kwargs["sample_type"] = st
     if "perturbation_space" in kwargs and kwargs["perturbation_space"] is not None:
         space = str(kwargs["perturbation_space"]).lower()
         if space not in PERTURBATION_SPACE_METHODS:
@@ -271,6 +303,7 @@ def _stage_params(config: PipelineConfig, stage: str) -> dict[str, Any]:
             "n_top_genes": config.n_top_genes,
             "n_pcs": config.n_pcs,
             "leiden_resolution": config.leiden_resolution,
+            "sample_type": config.sample_type,
             "skip_cell_annotation": config.skip_cell_annotation,
             "control_patterns": list(config.control_patterns),
             "guide_reassign": config.guide_reassign,

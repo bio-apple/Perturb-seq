@@ -364,6 +364,19 @@ def _composition_for_pert(
     cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if composition is not None and not composition.empty:
+        # Long-form cluster × perturbation table (composition_by_perturbation.csv).
+        if {"cluster", "perturbation", "n_cells"}.issubset(composition.columns):
+            sub = composition[composition["perturbation"].astype(str) == str(pert)]
+            if not sub.empty:
+                cluster_counts = {
+                    str(r["cluster"]): int(r["n_cells"])
+                    for _, r in sub.sort_values("n_cells", ascending=False).iterrows()
+                }
+                return {
+                    "source": "composition_by_perturbation",
+                    "n_cells": int(sub["n_cells"].sum()),
+                    "leiden_counts": dict(list(cluster_counts.items())[:12]),
+                }
         row = _row_lookup(composition, "gene_target", pert) or _row_lookup(composition, "perturbation", pert)
         if row is not None:
             return {
@@ -808,6 +821,7 @@ def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str 
     out: dict[str, str | None] = {
         "volcano": None,
         "umap": None,
+        "heatmap": None,
         "edistance": None,
         "guide_consistency": None,
         "target_validation": None,
@@ -825,10 +839,12 @@ def _resolve_pert_figures(figures_dir: Path | None, pert: str) -> dict[str, str 
         if candidate.exists():
             out["volcano"] = f"figures/{candidate.name}"
             break
-    for name in ("umap.png", "umap_cell_annotation.png"):
+    for name in ("umap_perturbation.png", "umap.png", "umap_cell_annotation.png"):
         if (figures_dir / name).exists():
             out["umap"] = f"figures/{name}"
             break
+    if (figures_dir / "de_heatmap.png").exists():
+        out["heatmap"] = "figures/de_heatmap.png"
     if (figures_dir / "edistance.png").exists():
         out["edistance"] = "figures/edistance.png"
     if (figures_dir / "perturbation_effect_summary.png").exists():
@@ -1218,6 +1234,7 @@ def render_html_report(
         thumbs = "".join(
             [
                 _fig_thumb(figs.get("volcano"), f"Volcano {s['perturbation']}", max_width=280),
+                _fig_thumb(figs.get("heatmap"), "DE heatmap", max_width=220),
                 _fig_thumb(figs.get("guide_consistency"), "Guide consistency", max_width=220),
                 _fig_thumb(figs.get("target_validation"), "Target validation", max_width=220),
                 _fig_thumb(figs.get("umap"), "UMAP (viz only)", max_width=180),

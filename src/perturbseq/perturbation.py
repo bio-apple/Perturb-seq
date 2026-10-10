@@ -221,7 +221,13 @@ def run_mixscape(
     n_neighbors: int = 20,
     perturbation_type: str = "KO",
 ) -> AnnData:
-    """Run pertpy Mixscape (signature → KO/NP). Requires ``pertpy``."""
+    """Run pertpy Mixscape (signature → KO/NP; optional LDA). Requires ``pertpy``.
+
+    Maps to the Seurat Mixscape vignette
+    (CalcPerturbSig / RunMixscape / MixscapeLDA) via pertpy — see
+    ``docs/MIXSCAPE_SEURAT_MAP.md``. Writes ``adata.uns['_perturbseq_mixscape']``
+    with best-effort ``lda`` / ``mixscale`` flags.
+    """
     pt = require_pertpy()
     if control not in set(adata.obs["perturbation"].astype(str)) and control not in set(
         adata.obs["gene_target"].astype(str)
@@ -246,15 +252,30 @@ def run_mixscape(
         layer="X_pert",
         perturbation_type=perturbation_type,
     )
+    lda_ok = False
     try:
-        mixscape.lda(adata, pert_key="gene_target", control=control, layer="X_pert")
+        mixscape.lda(
+            adata,
+            pert_key="gene_target",
+            control=control,
+            layer="X_pert",
+            perturbation_type=perturbation_type,
+        )
+        lda_ok = "mixscape_lda" in adata.uns
     except Exception as exc:  # noqa: BLE001
         warnings.warn(f"Mixscape LDA skipped: {exc}", stacklevel=2)
+    mixscale_ok = False
     try:
         mixscale = pt.tl.Mixscale()
         mixscale.mixscale(adata, "gene_target", control, layer="X_pert")
+        mixscale_ok = True
     except Exception as exc:  # noqa: BLE001
         warnings.warn(f"Mixscale skipped: {exc}", stacklevel=2)
+    adata.uns["_perturbseq_mixscape"] = {
+        "lda": bool(lda_ok),
+        "mixscale": bool(mixscale_ok),
+        "perturbation_type": str(perturbation_type),
+    }
     return adata
 
 
