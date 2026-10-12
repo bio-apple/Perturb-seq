@@ -1,172 +1,180 @@
+"""Load one DRAGEN sample without holding the unfiltered matrix."""
+
 from __future__ import annotations
 
+import csv
+import gzip
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-import scanpy as sc
 from anndata import AnnData
 from scipy import sparse
 
-SAMPLE_FILES = {
-    "matrix": "{sample}.scRNA.filtered.matrix.mtx.gz",
-    "barcodes": "{sample}.scRNA.filtered.barcodes.tsv.gz",
-    "features": "{sample}.scRNA.filtered.features.tsv.gz",
-    "feature_ref": "{sample}.scRNA.feature_barcode_reference.csv",
-    "assignments": "{sample}.scRNA.positive_cell_guide_assignments.csv",
-}
-
-CRISPR_FEATURE_TOKENS = ("crispr", "guide")
+GEX_TYPE = "Gene Expression"
 
 
-def resolve_sample_files(input_dir: Path, sample_id: str) -> dict[str, Path]:
-    files = {key: input_dir / name.format(sample=sample_id) for key, name in SAMPLE_FILES.items()}
-    missing = [str(path) for path in files.values() if not path.exists()]
+def sample_paths(input_dir: Path, sample: str) -> dict[str, Path]:
+    prefix = input_dir / f"{sample}.scRNA"
+    paths = {
+        "matrix": Path(f"{prefix}.filtered.matrix.mtx.gz"),
+        "barcodes": Path(f"{prefix}.filtered.barcodes.tsv.gz"),
+        "features": Path(f"{prefix}.filtered.features.tsv.gz"),
+        "reference": Path(f"{prefix}.feature_barcode_reference.csv"),
+        "assignments": Path(f"{prefix}.positive_cell_guide_assignments.csv"),
+    }
+    missing = [str(path) for path in paths.values() if not path.exists()]
     if missing:
-        raise FileNotFoundError(
-            "Missing DRAGEN files:\n"
-            + "\n".join(missing)
-            + f"\n\nCheck --input-dir ({input_dir}) and --sample-id ({sample_id!r}).\n"
-            "Suggested commands:\n"
-            f"  python -m perturbseq write-demo --output-dir {input_dir}\n"
-            "  python -m perturbseq run --input-dir <dir> --output-dir <out> --sample-id <id> --dry-run"
-        )
-    return files
+        raise FileNotFoundError("Missing DRAGEN outputs:\n" + "\n".join(missing))
+    return paths
 
 
-def _read_table(path: Path, **kwargs) -> pd.DataFrame:
-    return pd.read_csv(path, **kwargs)
-
-
-def read_barcodes(path: Path) -> pd.Index:
-    table = _read_table(path, sep="\t", header=None, compression="infer")
-    barcodes = table.iloc[:, 0].astype(str)
-    if barcodes.duplicated().any():
-        raise ValueError(f"Duplicate barcodes in {path}")
-    return pd.Index(barcodes, name="cell_barcode")
-
-
-def read_features(path: Path) -> pd.DataFrame:
-    table = _read_table(path, sep="\t", header=None, compression="infer")
-    n_cols = table.shape[1]
-    if n_cols == 1:
-        table.columns = ["gene_ids"]
-        table["gene_symbols"] = table["gene_ids"]
-        table["feature_types"] = "Gene Expression"
-    elif n_cols == 2:
-        table.columns = ["gene_ids", "gene_symbols"]
-        table["feature_types"] = "Gene Expression"
-    else:
-        table = table.iloc[:, :3].copy()
-        table.columns = ["gene_ids", "gene_symbols", "feature_types"]
-    table["gene_ids"] = table["gene_ids"].astype(str)
-    table["gene_symbols"] = table["gene_symbols"].astype(str)
-    table["feature_types"] = table["feature_types"].astype(str)
+def read_reference(path: Path) -> pd.DataFrame:
+    table = pd.read_csv(path, dtype=str, keep_default_na=False)
+    required = {"id", "name"}
+    missing = required - set(table.columns)
+    if missing:
+        raise ValueError(f"Feature reference is missing columns: {sorted(missing)}")
     return table
 
 
-def read_feature_reference(path: Path) -> pd.DataFrame:
-    ref = _read_table(path)
-    ref.columns = [str(col).strip() for col in ref.columns]
-    required = {"id", "name"}
-    missing = required.difference(ref.columns)
+def read_assignments(path: Path) -> pd.DataFrame:
+    table = pd.read_csv(
+        path,
+        dtype={"cell_barcode": str, "num_features": int, "feature_call": str, "num_transcripts": str},
+        keep_default_na=False,
+    )
+    expected = {"cell_barcode", "num_features", "feature_call", "num_transcripts"}
+    missing = expected - set(table.columns)
     if missing:
-        raise ValueError(f"{path} is missing columns {sorted(missing)}")
-    ref["id"] = ref["id"].astype(str)
-    ref["name"] = ref["name"].astype(str)
-    return ref
+        raise ValueError(f"Guide assignments are missing columns: {sorted(missing)}")
+    if table["cell_barcode"].duplicated().any():
+        raise ValueError("Guide assignments contain duplicate cell barcodes")
+    return table
 
 
-def read_guide_assignments(path: Path) -> pd.DataFrame:
-    assignments = _read_table(path)
-    assignments.columns = [str(col).strip() for col in assignments.columns]
-    rename = {col: col.lower().replace(" ", "_") for col in assignments.columns}
-    assignments = assignments.rename(columns=rename)
-    required = {"cell_barcode", "num_features", "feature_call", "num_transcripts"}
-    missing = required.difference(assignments.columns)
-    if missing:
-        raise ValueError(
-            f"Guide assignment column mismatch in {path}: missing {sorted(missing)}. "
-            f"Found columns: {list(assignments.columns)}. "
-            "Expected DRAGEN positive_cell_guide_assignments.csv with: "
-            "cell_barcode, num_features, feature_call, num_transcripts.\n"
-            "Suggested commands:\n"
-            f'  python -c "import pandas as pd; print(list(pd.read_csv({str(path)!r}, nrows=0).columns))"\n'
-            "  python -m perturbseq write-demo --output-dir data/demo  # reference schema"
+def read_features(path: Path) -> pd.DataFrame:
+    rows: list[list[str]] = []
+    with gzip.open(path, "rt") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                parts = parts + [""] * (3 - len(parts))
+            rows.append(parts[:3])
+    return pd.DataFrame(rows, columns=["gene_id", "gene_symbol", "feature_type"])
+
+
+def read_barcodes(path: Path) -> pd.Index:
+    with gzip.open(path, "rt") as handle:
+        values = [line.strip() for line in handle if line.strip()]
+    return pd.Index(values, name="cell_barcode")
+
+
+def _stream_gex(
+    matrix_path: Path,
+    *,
+    gene_keep: np.ndarray,
+    cell_keep: np.ndarray,
+    gene_out: np.ndarray,
+    cell_out: np.ndarray,
+) -> sparse.csr_matrix:
+    """Stream a MatrixMarket file and keep selected gene rows and cell columns."""
+    n_genes = int(gene_keep.sum())
+    n_cells = int(cell_keep.sum())
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[np.ndarray] = []
+    chunk_rows: list[int] = []
+    chunk_cols: list[int] = []
+    chunk_data: list[float] = []
+    seen = 0
+
+    def flush() -> None:
+        if not chunk_data:
+            return
+        rows.append(np.asarray(chunk_rows, dtype=np.int32))
+        cols.append(np.asarray(chunk_cols, dtype=np.int32))
+        data.append(np.asarray(chunk_data, dtype=np.float32))
+        chunk_rows.clear()
+        chunk_cols.clear()
+        chunk_data.clear()
+
+    with gzip.open(matrix_path, "rt") as handle:
+        n_declared: int | None = None
+        for line in handle:
+            if line.startswith("%"):
+                continue
+            parts = line.split()
+            if n_declared is None:
+                n_declared = int(parts[2])
+                continue
+            gene_i = int(parts[0]) - 1
+            cell_i = int(parts[1]) - 1
+            if gene_keep[gene_i] and cell_keep[cell_i]:
+                chunk_rows.append(int(gene_out[gene_i]))
+                chunk_cols.append(int(cell_out[cell_i]))
+                chunk_data.append(float(parts[2]))
+                if len(chunk_data) >= 2_000_000:
+                    flush()
+            seen += 1
+            if seen % 50_000_000 == 0:
+                print(f"  matrix entries read: {seen:,}", flush=True)
+    flush()
+    if not data:
+        return sparse.csr_matrix((n_genes, n_cells), dtype=np.float32)
+    matrix = sparse.coo_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n_genes, n_cells),
+        dtype=np.float32,
+    )
+    return matrix.tocsr()
+
+
+def load_analysis_matrix(input_dir: Path, sample: str, assignments: pd.DataFrame) -> tuple[AnnData, pd.DataFrame]:
+    """Expression matrix for Passing cells that also appear in the filtered matrix."""
+    paths = sample_paths(input_dir, sample)
+    features = read_features(paths["features"])
+    barcodes = read_barcodes(paths["barcodes"])
+    wanted = pd.Index(assignments["cell_barcode"])
+    present = wanted.isin(barcodes)
+    if not bool(present.all()):
+        print(
+            f"  assignment barcodes missing from the matrix: {int((~present).sum()):,}",
+            flush=True,
         )
-    assignments["cell_barcode"] = assignments["cell_barcode"].astype(str)
-    assignments["num_features"] = pd.to_numeric(assignments["num_features"], errors="coerce").fillna(0).astype(int)
-    assignments["feature_call"] = assignments["feature_call"].fillna("").astype(str)
-    assignments["num_transcripts"] = assignments["num_transcripts"].fillna("").astype(str)
-    if assignments["cell_barcode"].duplicated().any():
-        raise ValueError(f"Duplicate cell_barcode values in {path}")
-    return assignments.set_index("cell_barcode")
+    gex = (features["feature_type"] == GEX_TYPE).to_numpy()
+    gene_ids = features.loc[gex, "gene_id"].astype(str)
+    symbols = features.loc[gex, "gene_symbol"].astype(str)
+    # Map original row index -> compact GEX row.
+    gene_out = np.full(features.shape[0], -1, dtype=np.int32)
+    gene_out[np.flatnonzero(gex)] = np.arange(int(gex.sum()), dtype=np.int32)
 
+    in_matrix = np.asarray(barcodes.isin(wanted))
+    cell_out = np.full(len(barcodes), -1, dtype=np.int32)
+    kept_barcodes = barcodes[in_matrix]
+    # Preserve assignment order for the cells we keep.
+    order = pd.Index(kept_barcodes).get_indexer(wanted[np.asarray(present)])
+    # cell_out is indexed by original barcode position.
+    original_positions = np.flatnonzero(in_matrix)
+    # Rebuild in assignment order: position original_positions[order[k]] gets column k.
+    cell_out[original_positions[order]] = np.arange(int(present.sum()), dtype=np.int32)
 
-def is_crispr_feature(feature_type: str) -> bool:
-    token = str(feature_type).lower()
-    return any(part in token for part in CRISPR_FEATURE_TOKENS)
-
-
-def load_filtered_mex(matrix_path: Path, barcodes_path: Path, features_path: Path) -> AnnData:
-    """Load DRAGEN filtered MEX as cells x features.
-
-    DRAGEN writes 10x-style sparse MTX (features x barcodes) plus prefixed filenames,
-    so this does not use ``scanpy.read_10x_mtx``.
-    """
-    matrix = sc.read_mtx(matrix_path)
-    x = matrix.X.tocsr() if sparse.issparse(matrix.X) else sparse.csr_matrix(matrix.X)
-    barcodes = read_barcodes(barcodes_path)
-    features = read_features(features_path)
-    if x.shape[0] == len(features) and x.shape[1] == len(barcodes):
-        x = x.T.tocsr()
-    elif not (x.shape[0] == len(barcodes) and x.shape[1] == len(features)):
-        raise ValueError(
-            f"Matrix shape {tuple(x.shape)} does not match "
-            f"{len(features)} features x {len(barcodes)} barcodes"
-        )
-    var = features.copy()
-    var.index = pd.Index(var["gene_symbols"].astype(str), name=None)
-    adata = AnnData(X=x, obs=pd.DataFrame(index=barcodes), var=var)
+    print(
+        f"  streaming gene expression for {int(present.sum()):,} cells and {int(gex.sum()):,} genes",
+        flush=True,
+    )
+    matrix = _stream_gex(
+        paths["matrix"],
+        gene_keep=gex,
+        cell_keep=in_matrix,
+        gene_out=gene_out,
+        cell_out=cell_out,
+    ).T.tocsr()
+    # Columns were written in assignment order of barcodes that exist.
+    ordered_barcodes = wanted[present]
+    var = pd.DataFrame({"gene_id": gene_ids.to_numpy(), "gene_symbol": symbols.to_numpy()})
+    var.index = pd.Index(symbols.to_numpy())
+    obs = pd.DataFrame(index=pd.Index(ordered_barcodes, name="cell_barcode"))
+    adata = AnnData(X=matrix, obs=obs, var=var)
     adata.var_names_make_unique()
-    return adata
-
-
-def split_gene_and_crispr(adata: AnnData) -> tuple[AnnData, AnnData]:
-    types = adata.var["feature_types"].astype(str)
-    crispr_mask = types.map(is_crispr_feature).to_numpy()
-    if crispr_mask.any() and (~crispr_mask).any():
-        rna = adata[:, ~crispr_mask].copy()
-        crispr = adata[:, crispr_mask].copy()
-    elif crispr_mask.any():
-        raise ValueError("Matrix contains only CRISPR features; gene expression is required")
-    else:
-        rna = adata.copy()
-        crispr = adata[:, 0:0].copy()
-    rna.var["feature_types"] = "Gene Expression"
-    return rna, crispr
-
-
-def validate_sample_inputs(input_dir: Path, sample_id: str) -> dict[str, Path]:
-    """Stage-1 validation: required DRAGEN MEX + guide reference + assignments exist."""
-    return resolve_sample_files(input_dir, sample_id)
-
-
-def load_dragen_sample(input_dir: Path, sample_id: str) -> tuple[AnnData, AnnData, pd.DataFrame, pd.DataFrame]:
-    files = validate_sample_inputs(input_dir, sample_id)
-    combined = load_filtered_mex(files["matrix"], files["barcodes"], files["features"])
-    rna, crispr = split_gene_and_crispr(combined)
-    rna.obs["sample_id"] = sample_id
-    if crispr.n_obs:
-        crispr.obs["sample_id"] = sample_id
-    assignments = read_guide_assignments(files["assignments"])
-    feature_ref = read_feature_reference(files["feature_ref"])
-    return rna, crispr, assignments, feature_ref
-
-
-def write_h5ad(adata: AnnData, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if adata.var.index.name and adata.var.index.name in adata.var.columns:
-        adata.var.index.name = None
-    if adata.obs.index.name and adata.obs.index.name in adata.obs.columns:
-        adata.obs.index.name = None
-    adata.write_h5ad(path)
+    return adata, assignments.loc[np.asarray(present)].reset_index(drop=True)

@@ -1,6 +1,3 @@
-"""Tertiary Perturb-seq analysis from DRAGEN CRISPR-mode outputs."""
+"""Tertiary analysis of one DRAGEN scRNA CRISPR sample."""
 
-from perturbseq.pipeline import PIPELINE_STAGES, PipelineConfig, run_pipeline
-
-__all__ = ["PIPELINE_STAGES", "PipelineConfig", "run_pipeline"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

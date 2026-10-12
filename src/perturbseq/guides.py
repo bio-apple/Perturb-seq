@@ -1,101 +1,55 @@
-"""Guide parsing, NT/control identification, and guide-level QC.
-
-Guide assignment / parsing lives here. Guide-level efficacy QC is implemented in
-``guide_qc`` and re-exported for a single import surface.
-"""
+"""Guide call parsing. Counts follow num_features, not the number of '|' characters."""
 
 from __future__ import annotations
 
-import re
-
 import numpy as np
 import pandas as pd
-from anndata import AnnData
 
-from perturbseq.guide_qc import (
-    GUIDE_MERGE_MODES,
-    compute_gene_guide_consistency,
-    compute_guide_metrics,
-    compute_weighted_guide_summary,
-    run_guide_qc,
-    summarize_guide_qc,
-    write_guide_qc_tables,
-)
-
-DEFAULT_CONTROL_PATTERNS = (
-    r"^nt$",
-    r"^ntc$",
-    r"^nt_",
-    r"^negctrl",
-    r"^neg_ctrl",
-    r"non[-_ ]?targeting",
-    r"^control$",
-    r"^ctrl$",
-)
-
-_GUIDE_INDEX_SUFFIX = re.compile(r"^([A-Za-z0-9.-]+)_\d+$")
+NT_PATTERNS = ("negctrl", "non-targeting", "nontargeting", "ntc")
+INTRON_PATTERN = "intronctrl"
+NT_CLASS = "非靶向对照"
+PERT_CLASS = "受扰动细胞"
+INTRON_CLASS = "内含子对照"
+CONTROL_KEY = "NT"
+TARGET_COLUMNS = ("target_gene_id", "target_gene_name")
+MIN_CONTROL_CELLS = 20
+MIN_PERTURBATION_CELLS = 10
 
 
-def _matches_control(value: str, patterns: tuple[str, ...]) -> bool:
-    text = str(value).strip().lower()
-    if not text:
-        return False
-    return any(re.search(pattern, text) for pattern in patterns)
+def has_target_columns(reference: pd.DataFrame) -> bool:
+    return set(TARGET_COLUMNS).issubset(reference.columns)
 
 
-def parse_gene_target(feature_name: str, control_patterns: tuple[str, ...] = DEFAULT_CONTROL_PATTERNS) -> str:
-    name = str(feature_name).strip()
-    if not name or name.lower() in {"nan", "none"}:
-        return "unassigned"
-    if _matches_control(name, control_patterns):
-        return "NT"
-    if re.search(r"\|design_\d+$", name, flags=re.IGNORECASE):
-        return name.split("|", 1)[0]
-    if "/" in name:
-        return name.split("/", 1)[0]
-    match = _GUIDE_INDEX_SUFFIX.match(name)
-    if match:
-        gene = match.group(1)
-        return "NT" if _matches_control(gene, control_patterns) else gene
-    return name
+def _hit(value: str, pattern: str) -> bool:
+    return pattern in value.lower()
 
 
-def _guide_umi_total(num_transcripts: str) -> int:
-    if not num_transcripts:
-        return 0
-    values = []
-    for token in str(num_transcripts).split("|"):
-        token = token.strip()
-        if not token:
-            continue
-        values.append(int(float(token)))
-    return int(sum(values))
+def is_nontargeting(feature_call: str) -> bool:
+    return any(_hit(feature_call, pattern) for pattern in NT_PATTERNS)
 
 
-def split_feature_calls(feature_call: str, known_names: set[str] | None = None) -> list[str]:
-    """Split DRAGEN feature_call values.
+def is_intron(feature_call: str) -> bool:
+    return _hit(feature_call, INTRON_PATTERN)
 
-    Guide *names* may themselves contain ``|`` (e.g. ``NEK4|design_3``), so a naive
-    split is wrong. Prefer longest-prefix matches against the feature reference.
+
+def segment_feature_call(feature_call: str, names_longest_first: list[str]) -> list[str]:
+    """Split a DRAGEN feature_call into reference `name`s.
+
+    Guide names themselves may contain '|', and '|' is also the separator
+    between guides. Match the longest reference name first.
     """
-    call = str(feature_call).strip()
-    if not call:
+    if feature_call == "":
         return []
-    known = {str(name) for name in (known_names or set()) if str(name)}
-    if call in known:
-        return [call]
-    if not known:
-        if re.search(r"\|design_\d+(\||$)", call, flags=re.IGNORECASE):
-            return re.findall(r"(?:Non-Targeting_Control|[A-Za-z0-9.-]+\|design_\d+)", call)
-        return [token for token in call.split("|") if token]
-    names = sorted(known, key=len, reverse=True)
-    remaining = call
     parts: list[str] = []
+    remaining = feature_call
     while remaining:
         if remaining.startswith("|"):
             remaining = remaining[1:]
             continue
-        match = next((name for name in names if remaining == name or remaining.startswith(name + "|")), None)
+        match = next(
+            (name for name in names_longest_first if remaining == name or remaining.startswith(name + "|")),
+            None,
+        )
         if match is None:
             parts.append(remaining)
             break
@@ -104,79 +58,253 @@ def split_feature_calls(feature_call: str, known_names: set[str] | None = None) 
     return parts
 
 
-def build_feature_target_map(
-    feature_ref: pd.DataFrame,
-    control_patterns: tuple[str, ...] = DEFAULT_CONTROL_PATTERNS,
-) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    gene_col = next(
-        (col for col in ("target_gene", "gene_target", "gene", "target_gene_name") if col in feature_ref.columns),
-        None,
+def _lookup_tables(reference: pd.DataFrame) -> tuple[dict[str, int], dict[str, int], list[str]]:
+    id_row = {str(row.id): i for i, row in enumerate(reference.itertuples(index=False))}
+    name_row: dict[str, int] = {}
+    for i, name in enumerate(reference["name"].astype(str)):
+        # Shared names (the non-targeting guides) carry the same empty target.
+        name_row.setdefault(name, i)
+    names = sorted(set(reference["name"].astype(str)), key=len, reverse=True)
+    return id_row, name_row, names
+
+
+def _target_from_row(reference: pd.DataFrame, row_index: int, modeling: bool) -> tuple[str, str]:
+    if not modeling:
+        return "", ""
+    gene_id = str(reference.iloc[row_index]["target_gene_id"]).strip()
+    gene_name = str(reference.iloc[row_index]["target_gene_name"]).strip()
+    if gene_id == "" or gene_name == "":
+        return "", ""
+    return gene_id, gene_name
+
+
+def annotate_assignments(assignments: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
+    """Attach guide name, class, and target gene to every assignment row."""
+    modeling = has_target_columns(reference)
+    id_row, name_row, names = _lookup_tables(reference)
+    records: list[dict[str, object]] = []
+    for row in assignments.itertuples(index=False):
+        call = str(row.feature_call)
+        parts = segment_feature_call(call, names)
+        transcripts = _transcripts(str(row.num_transcripts), len(parts))
+        guide = parts[0] if int(row.num_features) == 1 and parts else ""
+        row_index = None
+        if guide:
+            row_index = id_row.get(guide)
+            if row_index is None:
+                row_index = name_row.get(guide)
+        gene_id, gene_name = ("", "")
+        if row_index is not None:
+            gene_id, gene_name = _target_from_row(reference, row_index, modeling)
+        icm = ""
+        perturbation = ""
+        if int(row.num_features) == 1 and guide:
+            if is_nontargeting(call):
+                icm = NT_CLASS
+                perturbation = CONTROL_KEY
+                gene_id, gene_name = "", ""
+            elif is_intron(call):
+                icm = INTRON_CLASS
+                gene_id, gene_name = "", ""
+            else:
+                icm = PERT_CLASS
+                perturbation = gene_name
+        records.append(
+            {
+                "cell_barcode": row.cell_barcode,
+                "num_features": int(row.num_features),
+                "feature_call": call,
+                "guide": guide,
+                "guide_parts": parts,
+                "guide_transcripts": transcripts,
+                "target_gene_id": gene_id,
+                "target_gene_name": gene_name,
+                "icm_class": icm,
+                "perturbation": perturbation,
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def _transcripts(raw: str, n_parts: int) -> list[float]:
+    if raw == "" or n_parts == 0:
+        return []
+    fields = raw.split("|")
+    values = [float(field) if field else 0.0 for field in fields]
+    if len(values) != n_parts:
+        return values
+    return values
+
+
+def guide_target_mapping(reference: pd.DataFrame) -> pd.DataFrame:
+    """One reference row per guide. A target gene requires both columns to be non-empty."""
+    modeling = has_target_columns(reference)
+    rows = []
+    for record in reference.itertuples(index=False):
+        gene_id = ""
+        gene_name = ""
+        if modeling:
+            gene_id = str(record.target_gene_id).strip()
+            gene_name = str(record.target_gene_name).strip()
+            if gene_id == "" or gene_name == "":
+                gene_id, gene_name = "", ""
+        rows.append(
+            {
+                "guide_id": str(record.id),
+                "guide": str(record.name),
+                "target_gene_id": gene_id,
+                "target_gene_name": gene_name,
+            }
+        )
+    return pd.DataFrame(rows, columns=["guide_id", "guide", "target_gene_id", "target_gene_name"])
+
+
+def unmatched_records(
+    annotated: pd.DataFrame,
+    reference: pd.DataFrame,
+    matrix_barcodes: pd.Index,
+) -> pd.DataFrame:
+    """Barcodes and guides that do not meet on both sides of the sample."""
+    columns = ["record_type", "cell_barcode", "guide_id", "guide", "detail"]
+    rows: list[dict[str, str]] = []
+    assigned = set(annotated["cell_barcode"].astype(str))
+    matrix = [str(barcode) for barcode in matrix_barcodes]
+    matrix_set = set(matrix)
+    for barcode in matrix:
+        if barcode not in assigned:
+            rows.append(
+                {
+                    "record_type": "barcode_not_in_assignment",
+                    "cell_barcode": barcode,
+                    "guide_id": "",
+                    "guide": "",
+                    "detail": "filtered matrix barcode has no assignment row",
+                }
+            )
+    for barcode in annotated["cell_barcode"].astype(str):
+        if barcode not in matrix_set:
+            rows.append(
+                {
+                    "record_type": "barcode_not_in_matrix",
+                    "cell_barcode": barcode,
+                    "guide_id": "",
+                    "guide": "",
+                    "detail": "assignment barcode is absent from the filtered matrix",
+                }
+            )
+    known = set(reference["id"].astype(str)) | set(reference["name"].astype(str))
+    seen: set[str] = set()
+    for record in annotated.itertuples(index=False):
+        parts = [str(part) for part in record.guide_parts]
+        seen.update(parts)
+        for part in parts:
+            if part not in known:
+                rows.append(
+                    {
+                        "record_type": "guide_not_in_reference",
+                        "cell_barcode": str(record.cell_barcode),
+                        "guide_id": "",
+                        "guide": part,
+                        "detail": "feature_call fragment matched neither id nor name",
+                    }
+                )
+        n_called = int(record.num_features)
+        if (n_called == 0 and str(record.feature_call)) or (n_called > 0 and len(parts) != n_called):
+            rows.append(
+                {
+                    "record_type": "guide_not_in_reference",
+                    "cell_barcode": str(record.cell_barcode),
+                    "guide_id": "",
+                    "guide": str(record.feature_call),
+                    "detail": f"segmented {len(parts)} names but num_features is {n_called}",
+                }
+            )
+    for record in reference.itertuples(index=False):
+        guide_id = str(record.id)
+        guide = str(record.name)
+        if guide_id not in seen and guide not in seen:
+            rows.append(
+                {
+                    "record_type": "guide_not_in_assignment",
+                    "cell_barcode": "",
+                    "guide_id": guide_id,
+                    "guide": guide,
+                    "detail": "reference guide was not called in any passing cell",
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def assignment_summary(
+    annotated: pd.DataFrame,
+    reference: pd.DataFrame,
+    unmatched: pd.DataFrame,
+    matrix_barcodes: pd.Index,
+) -> pd.DataFrame:
+    """Cell classes from num_features, plus counts of unmatched records."""
+    known = set(reference["id"].astype(str)) | set(reference["name"].astype(str))
+    classes = [_assignment_class(record, known) for record in annotated.itertuples(index=False)]
+    counts = pd.Series(classes).value_counts()
+    assigned = set(annotated["cell_barcode"].astype(str))
+    matrix_set = {str(barcode) for barcode in matrix_barcodes}
+    unmatched_counts = unmatched["record_type"].value_counts() if len(unmatched) else pd.Series(dtype=int)
+    items = [
+        ("no_guide", int(counts.get("no_guide", 0)), "cells"),
+        ("single_guide", int(counts.get("single_guide", 0)), "cells"),
+        ("multiple_guides", int(counts.get("multiple_guides", 0)), "cells"),
+        ("ambiguous", int(counts.get("ambiguous", 0)), "cells"),
+        ("passing_cells", int(len(annotated)), "cells"),
+        ("analysis_cells", int(len(assigned & matrix_set)), "cells"),
+        ("barcode_not_in_assignment", int(unmatched_counts.get("barcode_not_in_assignment", 0)), "records"),
+        ("barcode_not_in_matrix", int(unmatched_counts.get("barcode_not_in_matrix", 0)), "records"),
+        ("guide_not_in_reference", int(unmatched_counts.get("guide_not_in_reference", 0)), "records"),
+        ("guide_not_in_assignment", int(unmatched_counts.get("guide_not_in_assignment", 0)), "records"),
+    ]
+    return pd.DataFrame(items, columns=["item", "n", "unit"])
+
+
+def _assignment_class(record, known: set[str]) -> str:
+    parts = [str(part) for part in record.guide_parts]
+    n_called = int(record.num_features)
+    unmatched = any(part not in known for part in parts) or len(parts) != n_called
+    if n_called == 0:
+        return "ambiguous" if str(record.feature_call) else "no_guide"
+    if unmatched:
+        return "ambiguous"
+    if n_called == 1:
+        return "single_guide"
+    return "multiple_guides"
+
+
+def guide_frequency(annotated: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """num_features histogram, and per-guide cell counts plus transcript sums.
+
+    The same guide name contributes at most one cell. Transcript counts of
+    repeated names in that cell are still added.
+    """
+    n_features = (
+        annotated["num_features"]
+        .value_counts()
+        .rename_axis("num_features")
+        .reset_index(name="n_cells")
+        .sort_values("num_features")
     )
-    for _, row in feature_ref.iterrows():
-        names = {str(row["id"]), str(row["name"])}
-        if gene_col and pd.notna(row[gene_col]) and str(row[gene_col]).strip():
-            target = str(row[gene_col]).strip()
-            if _matches_control(target, control_patterns):
-                target = "NT"
-        else:
-            target = parse_gene_target(row["name"], control_patterns)
-        for name in names:
-            mapping[name] = target
-    return mapping
+    cells: dict[str, int] = {}
+    transcripts: dict[str, float] = {}
+    for parts, weights in zip(annotated["guide_parts"], annotated["guide_transcripts"], strict=True):
+        paired = list(zip(parts, weights, strict=False))
+        for name in dict.fromkeys(name for name, _weight in paired):
+            cells[name] = cells.get(name, 0) + 1
+            transcripts[name] = transcripts.get(name, 0.0) + sum(weight for guide, weight in paired if guide == name)
+    frequency = pd.DataFrame(
+        {
+            "guide": list(cells),
+            "n_cells": [cells[name] for name in cells],
+            "transcript_sum": [transcripts.get(name, 0.0) for name in cells],
+        }
+    ).sort_values(["transcript_sum", "n_cells"], ascending=False)
+    return n_features, frequency
 
 
-def annotate_guides(
-    adata: AnnData,
-    assignments: pd.DataFrame,
-    feature_ref: pd.DataFrame,
-    control_patterns: tuple[str, ...] = DEFAULT_CONTROL_PATTERNS,
-) -> AnnData:
-    """Join DRAGEN guide calls onto gene-expression cells."""
-    mapping = build_feature_target_map(feature_ref, control_patterns)
-    known_names = set(mapping)
-    joined = adata.obs.join(assignments, how="left")
-    joined["num_features"] = joined["num_features"].fillna(0).astype(int)
-    joined["feature_call"] = joined["feature_call"].fillna("")
-    joined["num_transcripts"] = joined["num_transcripts"].fillna("")
-    split_calls = [split_feature_calls(call, known_names) for call in joined["feature_call"]]
-    joined["guide_id"] = [guides[0] if guides else "" for guides in split_calls]
-    joined["guide_umi"] = joined["num_transcripts"].map(_guide_umi_total)
-    targets = []
-    for guides in split_calls:
-        if not guides:
-            targets.append("unassigned")
-            continue
-        gene_targets = [mapping.get(guide, parse_gene_target(guide, control_patterns)) for guide in guides]
-        unique = list(dict.fromkeys(gene_targets))
-        targets.append("|".join(unique) if unique else "unassigned")
-    joined["gene_target"] = targets
-    joined.loc[joined["num_features"] == 0, "gene_target"] = "unassigned"
-    nt_mask = joined["gene_target"].map(lambda value: _matches_control(value, control_patterns) or value == "NT")
-    joined["perturbation"] = np.where(joined["gene_target"].eq("unassigned"), "unassigned", "perturbed")
-    joined.loc[nt_mask, ["gene_target", "perturbation"]] = ["NT", "NT"]
-    adata.obs = joined
-    return adata
-
-
-def filter_singlets(adata: AnnData, singlet_only: bool = True) -> AnnData:
-    if not singlet_only:
-        return adata
-    return adata[adata.obs["num_features"] == 1].copy()
-
-
-__all__ = [
-    "DEFAULT_CONTROL_PATTERNS",
-    "GUIDE_MERGE_MODES",
-    "annotate_guides",
-    "build_feature_target_map",
-    "compute_gene_guide_consistency",
-    "compute_guide_metrics",
-    "compute_weighted_guide_summary",
-    "filter_singlets",
-    "parse_gene_target",
-    "run_guide_qc",
-    "split_feature_calls",
-    "summarize_guide_qc",
-    "write_guide_qc_tables",
-]
+def singlet_mask(annotated: pd.DataFrame) -> np.ndarray:
+    return annotated["num_features"].to_numpy() == 1
