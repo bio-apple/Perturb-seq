@@ -81,7 +81,9 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "leiden_resolution": float(settings["leiden_resolution"]),
         "note": (
             "Library-size normalization and log1p use all genes; "
-            "PCA, neighbors, Leiden and UMAP use the top highly variable genes."
+            "PCA, neighbors, Leiden and UMAP use the top highly variable genes. "
+            "HVG scale is gene-wise across all analysis cells, not relative to "
+            "NT/zero_guide. Perturbation assessment uses Mixscape X_pert instead."
         ),
     }
     assign_cell_type(adata, config)

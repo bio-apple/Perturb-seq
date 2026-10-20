@@ -20,11 +20,10 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
-from perturbseq.assign import STATUS_TARGET, capture_library_correlation, control_cell_mask
+from perturbseq.assign import STATUS_TARGET, control_cell_mask
 from perturbseq.config import ZERO_GUIDE_LABEL
 
 TEMPORARY_CONTROL_QC_NAME = "temporary_control_qc"
-GRNA_CAPTURE_FIGURE = "grna_capture_vs_library_size"
 ZERO_GUIDE_QC_GROUP = "zero-guide cells（临时对照）"
 TARGETING_QC_GROUP = "targeting"
 _TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
@@ -34,56 +33,73 @@ _QC_FIGURES = frozenset(
     {
         "qc_violin",
         "qc_scatter",
-        GRNA_CAPTURE_FIGURE,
         TEMPORARY_CONTROL_QC_NAME,
         "guides_per_cell",
         "assignment_status_bar",
-        "cells_per_guide_bar",
         "cells_per_target_bar",
-        "multi_guide_composition_bar",
         "target_cell_counts",
-        "cell_filter_waterfall",
         "variable_features",
         "pca_elbow",
         "pca_scatter",
     }
 )
-# Gene-level perturbation figures. Descriptive log2FC lives here too; titles say it is not inference.
-_DGE_FIGURES = frozenset(
+# Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
+_MIXSCAPE_FIGURES = frozenset(
     {
         "target_de_counts",
         "target_in_de_gene_counts",
         "target_in_de",
-        "volcano",
         "mixscape_fraction_bar",
         "mixscape_target_panels",
-        "mixscale_score_ridge",
-        "mixscale_scatter",
         "mixscape_class_global_bar",
+    }
+)
+_MIXSCALE_FIGURES = frozenset({"mixscale_score_ridge", "mixscale_scatter"})
+# Descriptive CPM log2FC and related non-Mixscape/Mixscale DE products.
+_DESCRIPTIVE_FIGURES = frozenset(
+    {
+        "volcano",
+        "target_effect_forest",
         "de_gene_heatmap",
         "target_expression_effect",
         "guide_consistency",
         "pseudobulk_library_size",
         "pseudobulk_pca",
-        "perturbation_summary",
     }
 )
-_DGE_SECTIONS = frozenset({"mixscape", "mixscale", "target_in_de", "dge"})
 # Pairwise guide-pseudobulk distances. The E-test scatter is written separately.
 _DISTANCE_FIGURES = frozenset({"perturbation_distance_heatmap", "perturbation_embedding"})
 
 
 def _output_bucket(name: str, section: str) -> str:
-    # Signature UMAPs are saved with section "mixscape"; the image still goes to UMAP/.
+    # Signature UMAPs may pass section "mixscape"; the image still goes to UMAP/.
     if name.startswith("umap_"):
         return "umap"
     if name in _DISTANCE_FIGURES:
         return "edistance"
-    if section in _DGE_SECTIONS or name in _DGE_FIGURES or name.endswith("_mixscape_2x2"):
-        return "dge"
+    if (
+        section in {"mixscape", "target_in_de"}
+        or name in _MIXSCAPE_FIGURES
+        or name.endswith("_mixscape_2x2")
+    ):
+        return "mixscape"
+    if section == "mixscale" or name in _MIXSCALE_FIGURES:
+        return "mixscale"
+    if section in {"de", "dge"} or name in _DESCRIPTIVE_FIGURES:
+        return "descriptive"
     if name in _QC_FIGURES:
         return "qc"
     return "main"
+
+
+def _dge_bucket_root(output_dir: Path, bucket: str) -> Path:
+    if bucket == "mixscape":
+        return output_dir / "DGE" / "Mixscape"
+    if bucket == "mixscale":
+        return output_dir / "DGE" / "mixscale"
+    if bucket == "descriptive":
+        return output_dir / "DGE" / "descriptive"
+    raise ValueError(f"不是 DGE 子桶: {bucket}")
 
 
 class FigureStore:
@@ -109,8 +125,11 @@ class FigureStore:
             return self.output_dir / "UMAP" / "figures"
         if bucket == "qc":
             return self.output_dir / "qc" / "figures"
-        if bucket == "dge":
-            return self.output_dir / "DGE" / "figures" / (section or "plot")
+        if bucket in {"mixscape", "mixscale", "descriptive"}:
+            figures = _dge_bucket_root(self.output_dir, bucket) / "figures"
+            if bucket == "mixscape" and section == "target_in_de":
+                return figures / "target_in_de"
+            return figures
         if bucket == "edistance":
             return self.output_dir / "E-distance" / "figures"
         return self.output_dir / "figures" / section
@@ -121,8 +140,8 @@ class FigureStore:
             return self.output_dir / "UMAP" / "tables"
         if bucket == "qc":
             return self.output_dir / "qc" / "tables"
-        if bucket == "dge":
-            return self.output_dir / "DGE" / "plot_data"
+        if bucket in {"mixscape", "mixscale", "descriptive"}:
+            return _dge_bucket_root(self.output_dir, bucket) / "plot_data"
         if bucket == "edistance":
             return self.output_dir / "E-distance" / "tables"
         return self.plot_data
@@ -157,8 +176,7 @@ class FigureStore:
             data_path = str(data_folder / f"{name}.tsv")
             data.to_csv(data_path, sep="\t", index=False)
         bucket = _output_bucket(name, section)
-        if bucket == "umap":
-            self._retire_old_umap(name)
+        self._retire_legacy_plot(name, section, bucket)
         self.manifest.append(
             {
                 "plot_name": name,
@@ -172,20 +190,17 @@ class FigureStore:
             }
         )
 
-    def skip(self, name: str, reason: str) -> None:
-        data_folder = self.data_dir(name)
+    def skip(self, name: str, reason: str, section: str = "") -> None:
+        data_folder = self.data_dir(name, section)
         data_folder.mkdir(parents=True, exist_ok=True)
         skipped = data_folder / f"{name}.skipped.txt"
         skipped.write_text(reason.strip() + "\n")
-        if name.startswith("umap_"):
-            for folder in (self.plot_data, self.output_dir / "DGE" / "plot_data"):
-                stale = folder / f"{name}.skipped.txt"
-                if stale != skipped and stale.is_file():
-                    stale.unlink()
+        bucket = _output_bucket(name, section)
+        self._retire_legacy_plot(name, section, bucket)
         self.manifest.append(
             {
                 "plot_name": name,
-                "branch": "UMAP" if name.startswith("umap_") else "",
+                "branch": "UMAP" if bucket == "umap" else section,
                 "status": "skipped",
                 "reason": reason.strip(),
                 "data_path": str(skipped),
@@ -194,8 +209,8 @@ class FigureStore:
             }
         )
 
-    def _retire_old_umap(self, name: str) -> None:
-        """Remove a UMAP product left under the pre-UMAP figure or table paths."""
+    def _retire_legacy_plot(self, name: str, section: str, bucket: str) -> None:
+        """Remove products left under pre-bucket figure or table paths."""
         relatives = [
             Path("figures") / "plot" / f"{name}.png",
             Path("figures") / "plot" / f"{name}.txt",
@@ -206,17 +221,48 @@ class FigureStore:
             Path("figures") / "mixscape" / f"{name}.png",
             Path("figures") / "mixscape" / f"{name}.txt",
             Path("figures") / "mixscape" / f"{name}.pdf",
+            Path("figures") / "mixscale" / f"{name}.png",
+            Path("figures") / "de" / f"{name}.png",
+            Path("figures") / "summary" / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.txt",
             Path("DGE") / "figures" / "mixscape" / f"{name}.pdf",
-            Path("plot_data") / f"{name}.tsv",
-            Path("plot_data") / f"{name}.skipped.txt",
+            Path("DGE") / "figures" / "mixscale" / f"{name}.png",
+            Path("DGE") / "figures" / "mixscale" / f"{name}.txt",
+            Path("DGE") / "figures" / "mixscale" / f"{name}.pdf",
+            Path("DGE") / "figures" / "de" / f"{name}.png",
+            Path("DGE") / "figures" / "plot" / f"{name}.png",
+            Path("DGE") / "figures" / "target_in_de" / f"{name}.png",
+            Path("DGE") / "figures" / "summary" / f"{name}.png",
             Path("DGE") / "plot_data" / f"{name}.tsv",
             Path("DGE") / "plot_data" / f"{name}.skipped.txt",
+            Path("plot_data") / f"{name}.tsv",
+            Path("plot_data") / f"{name}.skipped.txt",
         ]
+        if section and section not in {"", "plot"}:
+            relatives.extend(
+                [
+                    Path("DGE") / "figures" / section / f"{name}.png",
+                    Path("DGE") / "figures" / section / f"{name}.txt",
+                    Path("DGE") / "figures" / section / f"{name}.pdf",
+                ]
+            )
+        if bucket == "mixscape":
+            relatives.extend(
+                [
+                    Path("DGE") / "mixscape" / "figures" / f"{name}.png",
+                    Path("DGE") / "mixscape" / "plot_data" / f"{name}.tsv",
+                    Path("DGE") / "mixscape" / "plot_data" / f"{name}.skipped.txt",
+                ]
+            )
+        keep = {
+            self.figure_dir(name, section) / f"{name}.png",
+            self.data_dir(name, section) / f"{name}.tsv",
+            self.data_dir(name, section) / f"{name}.skipped.txt",
+        }
         for relative in relatives:
             stale = self.output_dir / relative
-            if stale.is_file():
+            if stale.is_file() and stale not in keep:
                 stale.unlink()
 
     def write_manifest(self, path: Path) -> None:
@@ -395,27 +441,6 @@ def draw_guides_per_cell(store: FigureStore, n_guides: pd.Series) -> None:
     )
 
 
-def draw_cells_per_guide(store: FigureStore, guides: pd.DataFrame, min_cells: int) -> None:
-    if guides.empty:
-        store.skip("cells_per_guide_bar", "no_guides")
-        return
-    top_n = int(store.plotting["top_n_guides"])
-    shown = guides.sort_values("n_cells", ascending=False).head(top_n)
-    figure, axis = store._figure(height=max(6, 0.28 * len(shown)))
-    axis.barh(shown["guide_name"].astype(str), shown["n_cells"], color=store.palette("targeting"))
-    axis.axvline(min_cells, color=store.palette("low_power"), linestyle="--")
-    axis.set_xlabel("cells")
-    axis.invert_yaxis()
-    _label_count_bars(axis, shown["n_cells"], horizontal=True)
-    store.save(
-        figure,
-        "cells_per_guide_bar",
-        "qc",
-        guides,
-        f"top {top_n} guides by cell count; line is min_cells_per_guide",
-    )
-
-
 def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: int) -> None:
     if targets.empty:
         store.skip("cells_per_target_bar", "no_targets")
@@ -437,22 +462,6 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
         "qc",
         targets,
         "cells per target; line is min_cells_per_target",
-    )
-
-
-def draw_multi_composition(store: FigureStore, composition: pd.DataFrame) -> None:
-    if composition.empty or int(composition["n_cells"].sum()) == 0:
-        store.skip("multi_guide_composition_bar", "no_multi_guide_cells")
-        return
-    figure, axis = store._figure()
-    axis.bar(
-        composition["composition"], composition["n_cells"], color=store.palette("multi_excluded")
-    )
-    axis.tick_params(axis="x", rotation=30)
-    axis.set_ylabel("cells")
-    _label_count_bars(axis, composition["n_cells"])
-    store.save(
-        figure, "multi_guide_composition_bar", "qc", composition, "multi-guide cell composition"
     )
 
 
@@ -921,7 +930,9 @@ def _cluster_mean_expression(adata: AnnData) -> pd.DataFrame:
     return pd.DataFrame(np.vstack(rows), index=_cluster_order(clusters), columns=names).T
 
 
-def _run_singler(profiles: pd.DataFrame, reference: SingleRReference, organism: str) -> pd.DataFrame:
+def _run_singler(
+    profiles: pd.DataFrame, reference: SingleRReference, organism: str
+) -> pd.DataFrame:
     rscript = shutil.which("Rscript")
     if rscript is None:
         raise ValueError("没有找到 Rscript，无法运行 SingleR。")
@@ -949,14 +960,19 @@ def _run_singler(profiles: pd.DataFrame, reference: SingleRReference, organism: 
             matrix = np.asarray(reference.matrix, dtype=float)
             if matrix.ndim != 2:
                 raise ValueError("参考矩阵必须是基因×样本。")
-            if len(reference.features) != matrix.shape[0] or len(reference.labels) != matrix.shape[1]:
+            if (
+                len(reference.features) != matrix.shape[0]
+                or len(reference.labels) != matrix.shape[1]
+            ):
                 raise ValueError("参考矩阵和基因或标签长度不一致。")
             ref_path = root / "reference.tsv"
             pd.DataFrame(matrix, index=list(reference.features)).reset_index(names="gene").to_csv(
                 ref_path, sep="\t", index=False
             )
             label_path = root / "reference_labels.tsv"
-            pd.DataFrame({"label": list(reference.labels)}).to_csv(label_path, sep="\t", index=False)
+            pd.DataFrame({"label": list(reference.labels)}).to_csv(
+                label_path, sep="\t", index=False
+            )
             command.extend(
                 [
                     "--reference-matrix",
@@ -1081,9 +1097,7 @@ def draw_qc_scatter(
     scaled_all, note = percent_mt_values(metrics)
     scaled = scaled_all.loc[shown.index]
     figure, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].scatter(
-        shown["total_counts"], scaled, s=8, linewidths=0, c="#4C78A8", rasterized=True
-    )
+    axes[0].scatter(shown["total_counts"], scaled, s=8, linewidths=0, c="#4C78A8", rasterized=True)
     axes[0].set_xlabel("nCount_RNA")
     axes[0].set_ylabel("percent.mt")
     axes[1].scatter(
@@ -1102,158 +1116,6 @@ def draw_qc_scatter(
         "qc",
         shown,
         f"FeatureScatter nCount vs percent.mt ({note}) and nFeature; {population}; seed={seed}",
-    )
-
-
-def draw_grna_capture_library(
-    store: FigureStore,
-    ledger: pd.DataFrame,
-    *,
-    correlation: pd.DataFrame | None = None,
-    low_library_rule: dict[str, Any] | None = None,
-    seed: int = 0,
-) -> None:
-    """Scatter library size against gRNA capture efficiency and mark cells with no guide."""
-    name = GRNA_CAPTURE_FIGURE
-    needed = {"total_counts", "grna_capture_efficiency"}
-    if ledger.empty or not needed.issubset(ledger.columns):
-        store.skip(name, "missing_fields")
-        return
-    if "n_guides" not in ledger.columns and "assignment_status" not in ledger.columns:
-        store.skip(name, "missing_fields")
-        return
-    detected = _guide_detected(ledger)
-    frame = ledger.copy()
-    frame["total_counts"] = pd.to_numeric(frame["total_counts"], errors="coerce")
-    frame["grna_capture_efficiency"] = pd.to_numeric(
-        frame["grna_capture_efficiency"], errors="coerce"
-    )
-    finite = np.asarray(
-        np.isfinite(frame["total_counts"]) & np.isfinite(frame["grna_capture_efficiency"]),
-        dtype=bool,
-    )
-    frame = frame.loc[finite].copy()
-    detected = detected[finite]
-    if frame.empty:
-        store.skip(name, "no_finite_points")
-        return
-    limit = int(store.plotting.get("scatter_max_points", 50000))
-    if len(frame) > limit:
-        chosen = frame.sample(limit, random_state=seed).index
-        detected = detected[frame.index.get_indexer(chosen)]
-        frame = frame.loc[chosen]
-    if correlation is None or correlation.empty:
-        correlation = capture_library_correlation(ledger)
-    rule = low_library_rule or {}
-    figure, axis = store._figure(width=8, height=6)
-    _scatter_guide_groups(axis, frame, detected)
-    threshold = rule.get("min_total_counts")
-    if rule.get("applied") and threshold is not None and np.isfinite(float(threshold)):
-        axis.axvline(
-            float(threshold),
-            color="#E45756",
-            linestyle="--",
-            linewidth=1,
-            label="low_library_no_guide",
-        )
-    axis.set_xlabel("文库大小 (total_counts)")
-    axis.set_ylabel("gRNA 捕获效率")
-    axis.set_title(_capture_title(correlation, rule))
-    axis.legend(frameon=False, fontsize=8)
-    columns = [
-        column
-        for column in (
-            "cell_barcode",
-            "total_counts",
-            "grna_capture_efficiency",
-            "guide_umi_total",
-            "n_guides",
-            "assignment_status",
-        )
-        if column in frame.columns
-    ]
-    plotted = frame[columns].copy()
-    plotted["guide_detected"] = detected
-    store.save(
-        figure,
-        name,
-        "qc",
-        plotted,
-        (
-            "gRNA capture efficiency = guide UMI sum / total_counts; "
-            "cells before QC pass; no-guide cells marked; "
-            "Spearman p stays in the QC table"
-        ),
-    )
-
-
-def _guide_detected(ledger: pd.DataFrame) -> np.ndarray:
-    if "n_guides" in ledger.columns:
-        guides = pd.to_numeric(ledger["n_guides"], errors="coerce").fillna(0)
-        return (guides >= 1).to_numpy()
-    return ~ledger["assignment_status"].astype(str).eq("no_guide").to_numpy()
-
-
-def _scatter_guide_groups(axis: Axes, frame: pd.DataFrame, detected: np.ndarray) -> None:
-    library = frame["total_counts"].to_numpy(dtype=float)
-    efficiency = frame["grna_capture_efficiency"].to_numpy(dtype=float)
-    if np.any(detected):
-        axis.scatter(
-            library[detected],
-            efficiency[detected],
-            s=8,
-            linewidths=0,
-            c="#1F77B4",
-            rasterized=True,
-            label="检测到 guide",
-        )
-    missed = ~detected
-    if np.any(missed):
-        axis.scatter(
-            library[missed],
-            efficiency[missed],
-            s=16,
-            c="#E45756",
-            marker="x",
-            linewidths=0.6,
-            rasterized=True,
-            label="未检测到 guide",
-        )
-
-
-def _capture_title(correlation: pd.DataFrame, rule: dict[str, Any]) -> str:
-    lines = ["gRNA 捕获效率与文库大小的关系"]
-    if correlation.empty:
-        lines.append("Spearman 未计算")
-    else:
-        row = correlation.iloc[0]
-        if str(row.get("status", "")) == "computed":
-            lines.append(
-                f"Spearman r={float(row['spearman_r']):.3f}，"
-                f"n={int(row['n_cells'])}，p={float(row['spearman_pvalue']):.3g}"
-            )
-        else:
-            lines.append(f"Spearman 未计算：{row.get('reason', 'skipped')}")
-    if rule.get("applied") and rule.get("min_total_counts") is not None:
-        lines.append(
-            f"low_library_no_guide 下限 {float(rule['min_total_counts']):g}（median_mad）"
-        )
-    elif rule.get("reason"):
-        lines.append(f"low_library_no_guide 未执行：{rule['reason']}")
-    return "\n".join(lines)
-
-
-def draw_waterfall(store: FigureStore, waterfall: pd.DataFrame) -> None:
-    if waterfall.empty:
-        store.skip("cell_filter_waterfall", "missing_fields")
-        return
-    figure, axis = store._figure()
-    axis.bar(waterfall["step"], waterfall["n_cells"], color=store.palette("targeting"))
-    _label_count_bars(axis, waterfall["n_cells"])
-    axis.tick_params(axis="x", rotation=45)
-    axis.set_ylabel("cells remaining")
-    store.save(
-        figure, "cell_filter_waterfall", "qc", waterfall, "exclusive filters from cell_status"
     )
 
 
@@ -1662,6 +1524,48 @@ def draw_pca_elbow(store: FigureStore, adata: AnnData) -> None:
     store.save(figure, "pca_elbow", "embedding", table, "ElbowPlot of PCA variance ratio")
 
 
+def _pca_display_limits(
+    x: np.ndarray, y: np.ndarray, *, low: float = 0.5, high: float = 99.5, pad: float = 0.05
+) -> tuple[tuple[float, float], tuple[float, float], int]:
+    """Percentile window for display only; does not alter stored PCA coordinates."""
+    x_lo, x_hi = np.percentile(x, [low, high])
+    y_lo, y_hi = np.percentile(y, [low, high])
+    x_span = max(float(x_hi - x_lo), 1e-9)
+    y_span = max(float(y_hi - y_lo), 1e-9)
+    xlim = (float(x_lo - pad * x_span), float(x_hi + pad * x_span))
+    ylim = (float(y_lo - pad * y_span), float(y_hi + pad * y_span))
+    n_out = int(
+        ((x < xlim[0]) | (x > xlim[1]) | (y < ylim[0]) | (y > ylim[1])).sum()
+    )
+    return xlim, ylim, n_out
+
+
+def _place_compact_legend(axis: Axes, *, title: str, n_categories: int) -> None:
+    """Put a multi-column legend below the axes so it does not cover ticks or data."""
+    legend = axis.get_legend()
+    if legend is None:
+        return
+    handles, labels = axis.get_legend_handles_labels()
+    legend.remove()
+    ncol = min(8, max(1, n_categories))
+    axis.legend(
+        handles,
+        labels,
+        title=title,
+        frameon=False,
+        fontsize=6,
+        title_fontsize=7,
+        markerscale=0.65,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=ncol,
+        borderaxespad=0.0,
+        columnspacing=0.8,
+        handletextpad=0.3,
+        labelspacing=0.25,
+    )
+
+
 def draw_pca_scatter(store: FigureStore, adata: AnnData) -> None:
     """PC1 vs PC2. Leiden is used when it exists; cell type is not invented."""
     if "X_pca" not in adata.obsm or adata.obsm["X_pca"].shape[1] < 2:
@@ -1673,16 +1577,63 @@ def draw_pca_scatter(store: FigureStore, adata: AnnData) -> None:
         return
     table = pd.DataFrame({"PC1": coordinates[:, 0], "PC2": coordinates[:, 1]})
     figure, axis = store._figure()
+    figure.perturbseq_manual_layout = True
     if "leiden" in adata.obs:
-        table["leiden"] = adata.obs["leiden"].astype(str).to_numpy()
-        sns.scatterplot(data=table, x="PC1", y="PC2", hue="leiden", s=8, linewidth=0, ax=axis)
+        labels = adata.obs["leiden"].astype(str)
+        table["leiden"] = labels.to_numpy()
+        # Prefer numeric Leiden order when labels are cluster indices.
+        try:
+            hue_order = sorted(labels.unique(), key=lambda value: int(value))
+        except ValueError:
+            hue_order = sorted(labels.unique())
+        sns.scatterplot(
+            data=table,
+            x="PC1",
+            y="PC2",
+            hue="leiden",
+            hue_order=hue_order,
+            s=6,
+            alpha=0.45,
+            linewidth=0,
+            ax=axis,
+            rasterized=True,
+        )
+        _place_compact_legend(axis, title="leiden", n_categories=len(hue_order))
         note = "colored by Leiden"
     else:
-        axis.scatter(table["PC1"], table["PC2"], s=8, c="#4C78A8", linewidths=0)
+        axis.scatter(
+            table["PC1"],
+            table["PC2"],
+            s=6,
+            c="#4C78A8",
+            alpha=0.45,
+            linewidths=0,
+            rasterized=True,
+        )
         note = "uncolored; no invented cell type"
+    xlim, ylim, n_outliers = _pca_display_limits(table["PC1"].to_numpy(), table["PC2"].to_numpy())
+    axis.set_xlim(*xlim)
+    axis.set_ylim(*ylim)
+    if n_outliers > 0:
+        axis.text(
+            0.02,
+            0.98,
+            f"{n_outliers} points outside 0.5–99.5% display window",
+            transform=axis.transAxes,
+            fontsize=7,
+            va="top",
+            ha="left",
+        )
     axis.set_xlabel("PC1")
     axis.set_ylabel("PC2")
-    store.save(figure, "pca_scatter", "embedding", table, f"DimPlot PCA; {note}")
+    store.save(
+        figure,
+        "pca_scatter",
+        "embedding",
+        table,
+        f"DimPlot PCA; {note}; display axes 0.5–99.5% (X_pca unchanged); "
+        f"{n_outliers} points outside window",
+    )
 
 
 _GLOBAL_COLORS = {
@@ -1838,9 +1789,7 @@ def mixscape_heatmap_cell_order(
     nt_index = np.asarray(nt_index)
     ko_index = np.asarray(ko_index)
     columns = np.concatenate([np_index, nt_index, ko_index])
-    labels = (
-        ["NP"] * int(np_index.size) + ["NT"] * int(nt_index.size) + ["KO"] * int(ko_index.size)
-    )
+    labels = ["NP"] * int(np_index.size) + ["NT"] * int(nt_index.size) + ["KO"] * int(ko_index.size)
     return columns, labels
 
 
@@ -1963,9 +1912,7 @@ def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label:
     status = _status_labels(adata.obs["mixscape_status"])
     targets = adata.obs["target_gene"].astype(str)
     probability = adata.obs["mixscape_class_p"].astype(float)
-    control_name = (
-        "zero-guide cells" if (status == "zero_guide").any() else "NT"
-    )
+    control_name = "zero-guide cells" if (status == "zero_guide").any() else "NT"
     groups = {
         control_name: probability[status.isin(["nt", "zero_guide"])],
         f"{target} NP": probability[(targets == target) & (status == "non_perturbed")],
@@ -2195,7 +2142,7 @@ def target_in_de_table(adata: AnnData, *, control: str) -> pd.DataFrame:
 def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> pd.DataFrame:
     """Copy 2x2 figures whose target symbol is in that target's DE list.
 
-    Every passing target stays in ``DGE/figures/mixscape``. This folder is the subset.
+    Every passing target stays in ``DGE/Mixscape/figures``. This folder is the subset.
     """
     table = target_in_de_table(adata, control=control)
     data = store.data_dir("target_in_de", "target_in_de")
@@ -2228,9 +2175,7 @@ def analysis_target_genes(adata: AnnData, control: str) -> list[str]:
     return sorted(names)
 
 
-def target_de_count_table(
-    adata: AnnData, *, control: str, min_de_genes: int = 5
-) -> pd.DataFrame:
+def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5) -> pd.DataFrame:
     """Three counts: all targets, targets with enough DE genes, targets inside their DE list."""
     targets = analysis_target_genes(adata, control)
     target_set = set(targets)
@@ -2240,9 +2185,7 @@ def target_de_count_table(
     if isinstance(gate, pd.DataFrame) and not gate.empty and "passed" in gate.columns:
         enough = gate["passed"].astype(bool) & (gate["n_de_genes"].astype(int) >= int(min_de_genes))
         with_de = [
-            gene
-            for gene in gate.loc[enough, "target_gene"].astype(str)
-            if gene in target_set
+            gene for gene in gate.loc[enough, "target_gene"].astype(str) if gene in target_set
         ]
     symbol_col = "gene"
     if isinstance(genes, pd.DataFrame) and "gene_symbol" in genes.columns:

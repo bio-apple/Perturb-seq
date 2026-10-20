@@ -187,12 +187,10 @@ def load_sample(
         matrix_barcodes=set(barcodes.astype(str)),
     )
     if only_matrix:
-        annotated = pd.concat(
-            [annotated, _no_guide_rows(only_matrix)], ignore_index=True
-        )
-    keep_status = annotated["assignment_status"].isin(
-        [STATUS_SINGLE_TARGET, STATUS_SINGLE_NT]
-    ) & (annotated["n_targets"].astype(int) == int(targets_per_cell))
+        annotated = pd.concat([annotated, _no_guide_rows(only_matrix)], ignore_index=True)
+    keep_status = annotated["assignment_status"].isin([STATUS_SINGLE_TARGET, STATUS_SINGLE_NT]) & (
+        annotated["n_targets"].astype(int) == int(targets_per_cell)
+    )
     zero_guide = annotated["assignment_status"].eq(STATUS_NO_GUIDE) & annotated["n_guides"].astype(
         int
     ).eq(0)

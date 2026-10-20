@@ -13,17 +13,15 @@ from anndata import AnnData
 
 from perturbseq.config import control_spec, expected_expression, mito_prefix
 from perturbseq.distance_tests import refresh_edistance_figure
-from perturbseq.perturb_effect import perturbation_type
+from perturbseq.mixscape import perturbation_type
 from perturbseq.plotting import (
     FigureStore,
     draw_assignment_status,
-    draw_cells_per_guide,
     draw_cells_per_target,
     draw_cluster_annotation,
     draw_descriptive_heatmap,
     draw_distance_embedding,
     draw_distance_heatmap,
-    draw_grna_capture_library,
     draw_guide_consistency,
     draw_guides_per_cell,
     draw_library_size,
@@ -33,7 +31,6 @@ from perturbseq.plotting import (
     draw_mixscape_class_global_umap,
     draw_mixscape_fraction,
     draw_mixscape_target_panels,
-    draw_multi_composition,
     draw_pca_elbow,
     draw_pca_scatter,
     draw_pseudobulk_pca,
@@ -46,7 +43,6 @@ from perturbseq.plotting import (
     draw_temporary_control_qc,
     draw_umap,
     draw_variable_features,
-    draw_waterfall,
     remove_temporary_control_qc,
 )
 
@@ -61,26 +57,12 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
     if not cell_status.empty and "assignment_status" in cell_status.columns:
         draw_assignment_status(store, cell_status["assignment_status"])
         draw_guides_per_cell(store, cell_status["n_guides"])
-        stages = _read(output_dir / "filter_stage_counts.tsv")
-        draw_waterfall(
-            store,
-            pd.DataFrame(
-                {
-                    "step": stages["stage"],
-                    "n_cells": stages["n_after"],
-                    "removed": stages["n_newly_excluded"],
-                }
-            ),
-        )
     else:
-        for name in ("assignment_status_bar", "guides_per_cell", "cell_filter_waterfall"):
+        for name in ("assignment_status_bar", "guides_per_cell"):
             store.skip(name, "missing_fields")
     qc_tables = output_dir / "qc" / "tables"
-    guides = _read(qc_tables / "cells_per_guide.tsv")
     targets = _read(qc_tables / "cells_per_target.tsv")
-    draw_cells_per_guide(store, guides, int(config["qc"]["min_cells_per_guide"]))
     draw_cells_per_target(store, targets, int(config["qc"]["min_cells_per_target"]))
-    draw_multi_composition(store, _read(tables / "multi_guide_composition.tsv"))
     qc_table, qc_note = _qc_population(cell_status, adata)
     if qc_table.empty:
         store.skip("qc_violin", "missing_fields")
@@ -88,13 +70,6 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
     else:
         draw_qc_violin(store, qc_table, population=qc_note)
         draw_qc_scatter(store, qc_table, int(config["runtime"]["seed"]), population=qc_note)
-    draw_grna_capture_library(
-        store,
-        cell_status,
-        correlation=_read(qc_tables / "grna_capture_library_correlation.tsv"),
-        low_library_rule=_low_library_rule(output_dir / "tables" / "qc_thresholds.json"),
-        seed=int(config["runtime"]["seed"]),
-    )
     if control_spec(config)["temporary"]:
         draw_temporary_control_qc(store, cell_status)
     else:
@@ -152,11 +127,20 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
         store.skip("mixscale_scatter", "mixscale_not_run")
         store.skip("target_de_counts", "de_gate_not_run")
         store.skip("target_in_de_gene_counts", "de_gate_not_run")
-    mixscape_path = output_dir / "DGE" / "tables" / "mixscape_summary.tsv"
     draw_mixscape_fraction(
-        store, _read(mixscape_path if mixscape_path.exists() else tables / "mixscape_fraction.tsv")
+        store,
+        _read_first(
+            output_dir / "DGE" / "Mixscape" / "tables" / "mixscape_summary.tsv",
+            output_dir / "DGE" / "mixscape" / "tables" / "mixscape_summary.tsv",
+            output_dir / "DGE" / "tables" / "mixscape_summary.tsv",
+            tables / "mixscape_fraction.tsv",
+        ),
     )
-    direction = _read(output_dir / "target_expression_effect.tsv")
+    direction = _read_first(
+        output_dir / "DGE" / "descriptive" / "tables" / "target_expression_effect.tsv",
+        output_dir / "target_expression_effect.tsv",
+        tables / "target_expression.tsv",
+    )
     draw_target_expression(store, direction)
 
     store.skip("volcano", "inference_not_available")
@@ -169,12 +153,30 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
         pseudo_path = output_dir / "checkpoints" / "pseudobulk.h5ad"
     pca_table = _pseudobulk_matrix(pseudo_path)
     draw_pseudobulk_pca(store, pca_table, int(config["runtime"]["seed"]))
-    draw_descriptive_heatmap(store, _read(output_dir / "effect_main.tsv"))
-    guides = _read(output_dir / "guide_effects.tsv")
+    draw_descriptive_heatmap(
+        store,
+        _read_first(
+            output_dir / "DGE" / "descriptive" / "tables" / "effect_main.tsv",
+            output_dir / "effect_main.tsv",
+        ),
+    )
+    guides = _read_first(
+        output_dir / "DGE" / "descriptive" / "tables" / "guide_effects.tsv",
+        output_dir / "guide_effects.tsv",
+    )
     draw_guide_consistency(store, guides)
-    distance = _read_matrix(output_dir / "perturbation_distance.tsv")
+    distance = _read_matrix_first(
+        output_dir / "E-distance" / "tables" / "perturbation_distance.tsv",
+        output_dir / "perturbation_distance.tsv",
+    )
     draw_distance_heatmap(store, distance)
-    draw_distance_embedding(store, _read(output_dir / "perturbation_embedding.tsv"))
+    draw_distance_embedding(
+        store,
+        _read_first(
+            output_dir / "E-distance" / "tables" / "perturbation_embedding.tsv",
+            output_dir / "perturbation_embedding.tsv",
+        ),
+    )
     summary = _read(output_dir / "qc_summary.tsv")
     if not summary.empty:
         summary["n_significant_de_genes"] = pd.NA
@@ -187,16 +189,6 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
     store.write_manifest(output_dir / "plot_manifest.tsv")
     if adata is not None:
         adata.write_h5ad(output_dir / "adata_processed.h5ad", compression="lzf")
-
-
-def _low_library_rule(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    payload = json.loads(path.read_text())
-    rule = payload.get("low_library_no_guide", {})
-    if not isinstance(rule, dict):
-        return {}
-    return rule
 
 
 def _qc_population(cell_status: pd.DataFrame, adata: AnnData | None) -> tuple[pd.DataFrame, str]:
@@ -267,24 +259,17 @@ def _draw_cell_cycle(output_dir: Path, adata: AnnData | None, config: dict[str, 
 
 
 def _draw_cell_embeddings(store: FigureStore, adata: AnnData | None) -> None:
-    groupings = (
-        ("assignment_status", "umap_assignment"),
-        ("target_gene", "umap_target"),
-        ("perturbation_status", "umap_status"),
-        ("mixscape_class", "umap_mixscape_class"),
-        ("leiden", "umap_leiden"),
-    )
+    # Leiden is drawn in umap_cluster_annotation (left panel); do not duplicate.
+    _retire_removed_umaps(store)
     if adata is None or "X_umap" not in adata.obsm:
-        for _column, name in groupings:
-            store.skip(name, "missing_fields")
+        store.skip("umap_mixscape_class", "missing_fields")
         store.skip("umap_cell_type", "unstratified_cell_type")
         store.skip("umap_mixscape", "signature_umap_not_run")
         return
-    for column, name in groupings:
-        if column in adata.obs:
-            draw_umap(store, adata, column, name)
-        else:
-            store.skip(name, "missing_fields")
+    if "mixscape_class" in adata.obs:
+        draw_umap(store, adata, "mixscape_class", "umap_mixscape_class")
+    else:
+        store.skip("umap_mixscape_class", "missing_fields")
     scope = str(adata.uns.get("cell_type_scope", "unstratified"))
     labels = set(adata.obs["cell_type"].astype(str).unique()) if "cell_type" in adata.obs else set()
     if scope == "annotated" and labels - {"ALL", "nan", "None", "<NA>"}:
@@ -300,20 +285,51 @@ def _draw_cell_embeddings(store: FigureStore, adata: AnnData | None) -> None:
         store.skip("umap_mixscape", reason)
 
 
+def _retire_removed_umaps(store: FigureStore) -> None:
+    """Drop UMAPs retired from the report (Leiden / assignment / target / status)."""
+    names = ("umap_leiden", "umap_assignment", "umap_target", "umap_status")
+    relatives: list[Path] = []
+    for name in names:
+        relatives.extend(
+            (
+                Path("UMAP") / "figures" / f"{name}.png",
+                Path("UMAP") / "tables" / f"{name}.tsv",
+                Path("UMAP") / "tables" / f"{name}.skipped.txt",
+                Path("figures") / "plot" / f"{name}.png",
+                Path("figures") / "embedding" / f"{name}.png",
+                Path("plot_data") / f"{name}.tsv",
+                Path("plot_data") / f"{name}.skipped.txt",
+            )
+        )
+    for relative in relatives:
+        stale = store.output_dir / relative
+        if stale.is_file():
+            stale.unlink()
+
+
 def _build_summary(output_dir: Path, config: dict[str, Any]) -> pd.DataFrame:
     tables = output_dir / "tables"
     targets = _read(output_dir / "qc" / "tables" / "cells_per_target.tsv")
     if targets.empty:
         return pd.DataFrame()
     summary = targets.rename(columns={"n_cells": "n_cells"}).copy()
-    mix = _read(tables / "mixscape_fraction.tsv")
+    mix = _read_first(
+        output_dir / "DGE" / "Mixscape" / "tables" / "mixscape_summary.tsv",
+        output_dir / "DGE" / "mixscape" / "tables" / "mixscape_summary.tsv",
+        output_dir / "DGE" / "tables" / "mixscape_summary.tsv",
+        tables / "mixscape_fraction.tsv",
+    )
     if not mix.empty:
         summary = summary.merge(
             mix[["target_gene", "fraction_perturbed", "n_perturbed"]],
             on="target_gene",
             how="left",
         )
-    effects = _read(tables / "target_expression.tsv")
+    effects = _read_first(
+        output_dir / "DGE" / "descriptive" / "tables" / "target_expression_effect.tsv",
+        output_dir / "target_expression_effect.tsv",
+        tables / "target_expression.tsv",
+    )
     if not effects.empty and "effect_log1p" in effects.columns:
         summary = summary.merge(
             effects[["target_gene", "effect_log1p"]], on="target_gene", how="left"
@@ -362,10 +378,26 @@ def _read(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, sep="\t")
 
 
+def _read_first(*paths: Path) -> pd.DataFrame:
+    for path in paths:
+        frame = _read(path)
+        if not frame.empty or path.exists():
+            return frame
+    return pd.DataFrame()
+
+
 def _read_matrix(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     return pd.read_csv(path, sep="\t", index_col=0)
+
+
+def _read_matrix_first(*paths: Path) -> pd.DataFrame:
+    for path in paths:
+        frame = _read_matrix(path)
+        if not frame.empty or path.exists():
+            return frame
+    return pd.DataFrame()
 
 
 def _pseudobulk_matrix(path: Path) -> pd.DataFrame:

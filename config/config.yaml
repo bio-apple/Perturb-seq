@@ -27,7 +27,7 @@ preprocess:
   n_hvg: 2000
   n_pcs: 40
   n_neighbors: 15
-  leiden_resolution: 1.0
+  leiden_resolution: 0.5
 mixscape:
   enabled: true
   min_de_genes: 5
@@ -83,7 +83,6 @@ plotting:
   width: 8
   height: 6
   theme: whitegrid
-  top_n_guides: 20
   max_legend_categories: 20
   scatter_max_points: 50000
   volcano_lfc: 1.0

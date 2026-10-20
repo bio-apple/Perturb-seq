@@ -186,9 +186,13 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
     plt.close(figure)
     if path.stat().st_size <= 0:
         raise RuntimeError(f"图文件为空: {path}")
-    stale_txt = path.with_suffix(".txt")
-    if stale_txt.exists():
-        stale_txt.unlink()
+    for stale in (
+        path.with_suffix(".pdf"),
+        path.with_suffix(".txt"),
+        path.parent / f"{path.stem}.skipped.txt",
+    ):
+        if stale.exists():
+            stale.unlink()
 
 
 def _pca_view(
@@ -233,6 +237,8 @@ def _pca_view(
 
 def _load_de_gate(adata: AnnData, output_dir: Path) -> tuple[pd.DataFrame | None, str]:
     for relative in (
+        Path("DGE") / "Mixscape" / "tables" / "mixscape_de_gate.tsv",
+        Path("DGE") / "mixscape" / "tables" / "mixscape_de_gate.tsv",
         Path("DGE") / "tables" / "mixscape_de_gate.tsv",
         Path("tables") / "mixscape_de_gate.tsv",
     ):

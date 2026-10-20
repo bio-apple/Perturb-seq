@@ -55,20 +55,19 @@ from perturbseq.io import (
     read_features,
     read_reference,
 )
+from perturbseq.mixscale import run_mixscale
+from perturbseq.mixscape import mixscape_fraction, run_mixscape
 from perturbseq.perturb_effect import (
     descriptive_effects,
     guide_pseudobulk,
-    mixscape_fraction,
     perturbation_distance,
-    run_mixscale,
-    run_mixscape,
     target_direction_table,
     tutorial_differential_expression,
 )
 from perturbseq.preprocess import preprocess
 from perturbseq.report import write_report
 
-STEPS = ["io", "assign", "preprocess", "perturb", "report"]
+STEPS = ["io", "assign", "preprocess", "mixscape", "mixscale", "perturb", "report"]
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -98,16 +97,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--input-dir", required=True, help="五个 DRAGEN 输入文件所在目录")
     parser.add_argument("--output-dir", required=True, help="结果输出目录")
     parser.add_argument("--guide-separator", required=True, help="多条 guide 之间的分隔符，例如 |")
-    parser.add_argument("--nt-control", default="", help="设计好的非靶向对照名。不填则用 zero-guide 细胞")
-    parser.add_argument("--crispr-mode", default="CRISPR_KO", help="KO、i、a 或 other，缺省 CRISPR_KO")
-    parser.add_argument("--crispr-description", default=None, help="crispr-mode 为 other 时的文字说明")
+    parser.add_argument(
+        "--nt-control", default="", help="设计好的非靶向对照名。不填则用 zero-guide 细胞"
+    )
+    parser.add_argument(
+        "--crispr-mode", default="CRISPR_KO", help="KO、i、a 或 other，缺省 CRISPR_KO"
+    )
+    parser.add_argument(
+        "--crispr-description", default=None, help="crispr-mode 为 other 时的文字说明"
+    )
     parser.add_argument(
         "--expected-direction",
         default=None,
         help="other 模式的预期方向：down、up、bidirectional 或 unknown",
     )
     parser.add_argument("--batch-key", default=None, help="obs 里的批次列。不填则不做 Harmony")
-    parser.add_argument("--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL")
+    parser.add_argument(
+        "--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL"
+    )
     parser.add_argument("--min-umi", type=float, default=None)
     parser.add_argument("--max-umi", type=float, default=None)
     parser.add_argument(
@@ -236,8 +243,14 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             info["cell_cycle_status"] = state["adata"].uns.get("cell_cycle_status", "")
             info["cell_cycle_note"] = state["adata"].uns.get("cell_cycle_note", "")
             _write_h5ad(state["adata"], folder / "checkpoints" / "preprocess.h5ad")
-        elif step == "perturb":
+        elif step == "mixscape":
             state["adata"] = _require(state, folder, "preprocess")
+            state["adata"] = _step_mixscape(folder, config, state["adata"])
+        elif step == "mixscale":
+            state["adata"] = _require(state, folder, "mixscape")
+            state["adata"] = _step_mixscale(folder, config, state["adata"])
+        elif step == "perturb":
+            state["adata"] = _require(state, folder, "mixscale")
             state["adata"] = _step_perturb(folder, config, state["adata"])
         elif step == "report":
             state["adata"] = (
@@ -434,7 +447,9 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     eligible = set(
         updated.loc[updated["analysis_eligible"].astype(bool), "cell_barcode"].astype(str)
     )
-    control_ids = set(updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str))
+    control_ids = set(
+        updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str)
+    )
     adata = adata[adata.obs_names.astype(str).isin(eligible | control_ids)].copy()
     if control_ids:
         hit = np.isin(adata.obs_names.astype(str), list(control_ids))
@@ -484,59 +499,89 @@ def _resolve_species(config: dict[str, Any]) -> None:
     )
 
 
-def _step_perturb(folder: Path, config: dict[str, Any], adata):
+def _step_mixscape(folder: Path, config: dict[str, Any], adata):
+    """Independent Mixscape step: DE gate, X_pert signature, classification."""
     mixscape_on = config.get("mixscape", {}).get("enabled", True)
+    spec = control_spec(config)
+    if spec["temporary"]:
+        print(f"  temporary control warning: {spec['note']}", flush=True)
+    if not mixscape_on:
+        adata.obs["mixscape_status"] = "not_evaluated"
+        adata.obs["mixscape_class"] = "not_evaluated"
+        adata.obs["mixscape_class_raw"] = "not_evaluated"
+        _write_de_gate(folder, adata)
+        fractions = mixscape_fraction(adata)
+        fractions.to_csv(_mixscape_tables(folder) / "mixscape_summary.tsv", sep="\t", index=False)
+        _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
+        return adata
+    if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
+        "cell_type_key"
+    ):
+        print("  Mixscape scope: ALL cells, not stratified", flush=True)
+    try:
+        adata = run_mixscape(adata, config)
+        adata.obs["mixscape_class_raw"] = adata.obs["mixscape_class"].astype(str)
+        if "mixscape_class_p" in adata.obs:
+            adata.obs["mixscape_probability"] = adata.obs["mixscape_class_p"]
+        _write_de_gate(folder, adata)
+    except Exception as exc:
+        print(f"  Mixscape failed: {exc}", flush=True)
+        adata.obs["mixscape_status"] = "not_evaluated"
+        adata.obs["mixscape_class"] = "not_evaluated"
+        adata.obs["mixscape_class_raw"] = "not_evaluated"
+        adata.uns["mixscape_skip_reason"] = f"mixscape_failed:{exc}"
+        _write_de_gate(folder, adata)
+    fractions = mixscape_fraction(adata)
+    summary_path = _mixscape_tables(folder) / "mixscape_summary.tsv"
+    fractions.to_csv(summary_path, sep="\t", index=False)
+    for stale in (
+        folder / "DGE" / "tables" / "mixscape_summary.tsv",
+        folder / "DGE" / "mixscape" / "tables" / "mixscape_summary.tsv",
+        folder / "tables" / "mixscape_fraction.tsv",
+    ):
+        if stale.is_file() and stale != summary_path:
+            stale.unlink()
+    _refresh_mixscape_ledger(folder, adata)
+    _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
+    return adata
+
+
+def _step_mixscale(folder: Path, config: dict[str, Any], adata):
+    """Independent Mixscale step: own DE gate and mixscale_score on X_pert."""
+    if "X_pert" not in adata.layers:
+        print("  Mixscale skipped: missing X_pert (run mixscape first)", flush=True)
+        adata.uns["mixscale_status"] = "skipped:missing_X_pert"
+        _write_mixscale_gate(folder, adata)
+        _write_h5ad(adata, folder / "checkpoints" / "mixscale.h5ad")
+        return adata
+    try:
+        adata = run_mixscale(adata, config)
+    except Exception as mixscale_exc:
+        print(f"  Mixscale failed: {mixscale_exc}", flush=True)
+        adata.uns["mixscale_status"] = f"failed:{mixscale_exc}"
+    _write_mixscale_gate(folder, adata)
+    _write_h5ad(adata, folder / "checkpoints" / "mixscale.h5ad")
+    return adata
+
+
+def _step_perturb(folder: Path, config: dict[str, Any], adata):
+    """Descriptive effects, pseudobulk distances, and E-test (after Mixscape/Mixscale)."""
     comparisons = []
     spec = control_spec(config)
     if spec["temporary"]:
         print(f"  temporary control warning: {spec['note']}", flush=True)
-    if mixscape_on:
-        if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
-            "cell_type_key"
-        ):
-            print("  Mixscape scope: ALL cells, not stratified", flush=True)
-        try:
-            adata = run_mixscape(adata, config)
-            adata.obs["mixscape_class_raw"] = adata.obs["mixscape_class"].astype(str)
-            if "mixscape_class_p" in adata.obs:
-                adata.obs["mixscape_probability"] = adata.obs["mixscape_class_p"]
-            try:
-                adata = run_mixscale(adata, config)
-            except Exception as mixscale_exc:
-                print(f"  Mixscale failed: {mixscale_exc}", flush=True)
-                adata.uns["mixscale_status"] = f"failed:{mixscale_exc}"
-            _write_de_gate(folder, adata)
-        except Exception as exc:
-            print(f"  Mixscape failed: {exc}", flush=True)
-            adata.obs["mixscape_status"] = "not_evaluated"
-            adata.obs["mixscape_class"] = "not_evaluated"
-            comparisons.append(
-                {
-                    "branch": "sensitivity",
-                    "cell_type": "ALL",
-                    "target_gene": "",
-                    "module": "mixscape",
-                    "status": "skipped",
-                    "reason": "mixscape_failed",
-                    "n_cells": 0,
-                    "n_guides": 0,
-                    "biological_sample_count": 1,
-                }
-            )
-            _write_de_gate(folder, adata)
-    else:
+    if "mixscape_status" not in adata.obs:
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
-    fractions = mixscape_fraction(adata)
-    fractions.to_csv(_dge_tables(folder) / "mixscape_summary.tsv", sep="\t", index=False)
     main_effects, main_guides, main_status = descriptive_effects(adata, config, branch="main")
     sens_effects, sens_guides, sens_status = descriptive_effects(
         adata, config, branch="sensitivity"
     )
-    main_effects.to_csv(folder / "effect_main.tsv", sep="\t", index=False)
-    sens_effects.to_csv(folder / "effect_sensitivity.tsv", sep="\t", index=False)
+    descriptive = _descriptive_tables(folder)
+    main_effects.to_csv(descriptive / "effect_main.tsv", sep="\t", index=False)
+    sens_effects.to_csv(descriptive / "effect_sensitivity.tsv", sep="\t", index=False)
     guides = pd.concat([main_guides, sens_guides], ignore_index=True)
-    guides.to_csv(folder / "guide_effects.tsv", sep="\t", index=False)
+    guides.to_csv(descriptive / "guide_effects.tsv", sep="\t", index=False)
     direction = pd.concat(
         [
             target_direction_table(adata, config, branch="main"),
@@ -544,14 +589,25 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         ],
         ignore_index=True,
     )
-    direction.to_csv(folder / "target_expression_effect.tsv", sep="\t", index=False)
+    direction.to_csv(descriptive / "target_expression_effect.tsv", sep="\t", index=False)
     de_main, de_main_status = tutorial_differential_expression(adata, config, branch="main")
     de_sens, de_sens_status = tutorial_differential_expression(adata, config, branch="sensitivity")
     for branch_name, tables in (("main", de_main), ("sensitivity", de_sens)):
         for method, frame in tables.items():
-            frame.to_csv(
-                _dge_tables(folder) / f"de_{method}_{branch_name}.tsv", sep="\t", index=False
-            )
+            name = f"de_{method}_{branch_name}.tsv"
+            frame.to_csv(descriptive / name, sep="\t", index=False)
+            legacy = folder / "DGE" / "tables" / name
+            if legacy.is_file():
+                legacy.unlink()
+    for name in (
+        "effect_main.tsv",
+        "effect_sensitivity.tsv",
+        "guide_effects.tsv",
+        "target_expression_effect.tsv",
+    ):
+        legacy = folder / name
+        if legacy.is_file():
+            legacy.unlink()
     comparisons_table = pd.concat(
         [main_status, sens_status, de_main_status, de_sens_status, pd.DataFrame(comparisons)],
         ignore_index=True,
@@ -573,22 +629,28 @@ def _write_guide_distance(folder: Path, pseudobulk, config: dict[str, Any]) -> N
     Guides are not biological replicates, so a missing minimum is not filled in.
     The cell-level E-test is written later and is not this table.
     """
-    plot_data = folder / "plot_data"
+    tables = _edistance_tables(folder)
+    skip_path = tables / "perturbation_distance_heatmap.skipped.txt"
     if "min_guide_replicates" not in config.get("perturb", {}):
-        plot_data.mkdir(exist_ok=True)
-        (plot_data / "perturbation_distance_heatmap.skipped.txt").write_text(
-            "min_guide_replicates_not_set\n"
-        )
+        skip_path.write_text("min_guide_replicates_not_set\n")
+        _retire_legacy_distance_skip(folder)
         return
     distance, embedding = perturbation_distance(pseudobulk, config)
     if distance.empty:
-        plot_data.mkdir(exist_ok=True)
-        (plot_data / "perturbation_distance_heatmap.skipped.txt").write_text(
-            "insufficient_cells\n"
-        )
+        skip_path.write_text("insufficient_cells\n")
+        _retire_legacy_distance_skip(folder)
         return
-    distance.to_csv(folder / "perturbation_distance.tsv", sep="\t")
-    embedding.to_csv(folder / "perturbation_embedding.tsv", sep="\t", index=False)
+    if skip_path.exists():
+        skip_path.unlink()
+    distance.to_csv(tables / "perturbation_distance.tsv", sep="\t")
+    embedding.to_csv(tables / "perturbation_embedding.tsv", sep="\t", index=False)
+    for stale in (
+        folder / "perturbation_distance.tsv",
+        folder / "perturbation_embedding.tsv",
+        folder / "plot_data" / "perturbation_distance_heatmap.skipped.txt",
+    ):
+        if stale.is_file():
+            stale.unlink()
 
 
 def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
@@ -629,17 +691,56 @@ def _qc_tables(folder: Path) -> Path:
     return path
 
 
-def _dge_tables(folder: Path) -> Path:
-    path = folder / "DGE" / "tables"
+def _mixscape_tables(folder: Path) -> Path:
+    path = folder / "DGE" / "Mixscape" / "tables"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _mixscale_tables(folder: Path) -> Path:
+    path = folder / "DGE" / "mixscale" / "tables"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _descriptive_tables(folder: Path) -> Path:
+    path = folder / "DGE" / "descriptive" / "tables"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _edistance_tables(folder: Path) -> Path:
+    path = folder / "E-distance" / "tables"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _retire_legacy_distance_skip(folder: Path) -> None:
+    legacy = folder / "plot_data" / "perturbation_distance_heatmap.skipped.txt"
+    if legacy.is_file():
+        legacy.unlink()
 
 
 def _write_de_gate(folder: Path, adata) -> None:
     gate = adata.uns.get("mixscape_de_gate")
     if not isinstance(gate, pd.DataFrame):
         return
-    gate.to_csv(_dge_tables(folder) / "mixscape_de_gate.tsv", sep="\t", index=False)
+    path = _mixscape_tables(folder) / "mixscape_de_gate.tsv"
+    gate.to_csv(path, sep="\t", index=False)
+    for stale in (
+        folder / "DGE" / "tables" / "mixscape_de_gate.tsv",
+        folder / "tables" / "mixscape_de_gate.tsv",
+        folder / "DGE" / "mixscape" / "tables" / "mixscape_de_gate.tsv",
+    ):
+        if stale.is_file() and stale != path:
+            stale.unlink()
+
+
+def _write_mixscale_gate(folder: Path, adata) -> None:
+    gate = adata.uns.get("mixscale_de_gate")
+    if not isinstance(gate, pd.DataFrame):
+        return
+    gate.to_csv(_mixscale_tables(folder) / "mixscale_de_gate.tsv", sep="\t", index=False)
 
 
 def _write_resolved(folder: Path, config: dict[str, Any]) -> None:
@@ -855,14 +956,24 @@ def _load_resume(folder: Path, step: str):
     previous = {
         "assign": "io",
         "preprocess": "assign",
-        "perturb": "preprocess",
+        "mixscape": "preprocess",
+        "mixscale": "mixscape",
+        "perturb": "mixscale",
         "report": "perturb",
     }
     if step not in previous:
         return None
     path = folder / "checkpoints" / f"{previous[step]}.h5ad"
     fallback = {
-        "report": ["perturb.h5ad", "preprocess.h5ad", "assign.h5ad"],
+        "mixscale": ["mixscape.h5ad", "preprocess.h5ad"],
+        "perturb": ["mixscale.h5ad", "mixscape.h5ad", "preprocess.h5ad"],
+        "report": [
+            "perturb.h5ad",
+            "mixscale.h5ad",
+            "mixscape.h5ad",
+            "preprocess.h5ad",
+            "assign.h5ad",
+        ],
     }
     candidates = (
         [path]

@@ -13,8 +13,9 @@
 7. [Barcode](#barcode)
 8. [统计](#统计)
 9. [Mixscape 与 Mixscale](#mixscape-与-mixscale)
-10. [预处理与簇注释](#预处理与簇注释)
-11. [靶基因表达](#靶基因表达)
+10. [相对对照的标准化](#相对对照的标准化)
+11. [预处理与簇注释](#预处理与簇注释)
+12. [靶基因表达](#靶基因表达)
 
 ---
 
@@ -27,7 +28,7 @@
 | 参数 | 说明 |
 | --- | --- |
 | `--crispr-mode` | 默认 `CRISPR_KO`，也可 `i` / `a` / `other` |
-| `--steps` | 默认 `all`：`io` → `assign` → `preprocess` → `perturb` → `report` |
+| `--steps` | 默认 `all`：`io` → `assign` → `preprocess` → `mixscape` → `mixscale` → `perturb` → `report` |
 | `--resume` | 从上一 checkpoint 继续 |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
@@ -137,7 +138,6 @@
 
 - 效率 = CRISPR guide UMI 合计 / Gene Expression `total_counts`（guide UMI 为 0 则效率为 0）
 - Spearman（QC 前全部细胞）→ `qc/tables/grna_capture_library_correlation.tsv`（此 p 不进效应表）
-- 图：`qc/figures/grna_capture_vs_library_size.png`
 
 避免文库偏浅、未捕获 guide 的细胞被当作阴性对照：
 
@@ -203,10 +203,10 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 
 | 表 | 分支 |
 | --- | --- |
-| `effect_main.tsv` | 全部可分析细胞 |
-| `effect_sensitivity.tsv` | Mixscape `perturbed` + 同一批对照 |
+| `DGE/descriptive/tables/effect_main.tsv` | 全部可分析细胞 |
+| `DGE/descriptive/tables/effect_sensitivity.tsv` | Mixscape `perturbed` + 同一批对照 |
 
-`pvalue` / `fdr` / `ci_lower` / `ci_upper` 为 NA，`inference_status=not_run_single_sample_descriptive`。细胞水平 Wilcoxon、Mixscale、E-test 的 p 分别留在 `DGE/plot_data/`、`obs['mixscale_score']`、`E-distance/tables/edistance_etest.tsv`。
+`pvalue` / `fdr` / `ci_lower` / `ci_upper` 为 NA，`inference_status=not_run_single_sample_descriptive`。细胞水平 Wilcoxon、Mixscale、E-test 的 p 分别留在 `DGE/Mixscape/plot_data/`（2x2 火山）、`obs['mixscale_score']`、`E-distance/tables/edistance_etest.tsv`。
 
 ### Bootstrap 区间（描述性不确定性）
 
@@ -233,6 +233,8 @@ edgeR / PyDESeq2：`single_sample_de_not_estimable`，四张表只有表头。
 
 ## Mixscape 与 Mixscale
 
+流水线里是两个独立步骤（实现分别为 `perturbseq.mixscape` / `perturbseq.mixscale`），checkpoint 为 `mixscape.h5ad` → `mixscale.h5ad`。可单独重跑，例如 `--steps mixscape` 或 `--steps mixscale --resume`（Mixscale 需要上一拍的 `X_pert`）。之后的 `perturb` 只做描述性效应、伪批量距离与 E-test，不再内嵌这两步。
+
 Mixscape 是敏感性分支。标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`。未过 DE 门槛保持 `skipped_no_de_genes`。`mixscape_fraction` 分母为该靶全部靶向细胞。
 
 两套门槛分开读：
@@ -252,14 +254,35 @@ Mixscape 是敏感性分支。标签：`nt` / `perturbed` / `non_perturbed` / `a
 
 ---
 
+## 相对对照的标准化
+
+评估单基因扰动时，不能把「全细胞 HVG z-score」和「相对对照的扰动签名」混为一谈。本流水线按路径分开处理；**不再额外写一层「相对 NT 均值/标准差的全局基因 Z-score」**，以免和 Mixscape 的 `X_pert` 冲突。
+
+| 步骤 | 输入矩阵 | 相对对照？ | 口径 |
+| --- | --- | --- | --- |
+| 预处理 `X` | 原始 counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
+| 表达 PCA / 邻居 / Leiden / UMAP | HVG 切片上 `sc.pp.scale`（全分析细胞均值/标准差）→ PCA | 否 | 描述性表达空间；可被细胞周期、文库深度主导；**不用于**扰动分类或描述性 log2FC |
+| Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide` |
+| Mixscape `X_pert` | pertpy `perturbation_signature`：每个细胞减去 k 个最近对照邻域的平均表达（线性空间取均值再 `log1p`） | 是 | 对齐 Seurat `CalcPerturbSig`；签名在**未 scale 的 log1p** 上算 |
+| Mixscape 分类 GMM | `X_pert` 上 DE 基因，`scale=True` | 是（签名空间内再基因 scale） | 对齐 Seurat `RunMixscape` 使用 `scale.data`；不是相对池化 NT 的第二套全局 Z |
+| Mixscape signature UMAP | `X_pert` → PCA（`zero_center=True`，不基因 scale）→ UMAP | 是 | 对齐 vignette `ScaleData(do.scale=F, do.center=T)` + `RunPCA`/`RunUMAP`；坐标在 `X_umap_mixscape` |
+| Mixscale | `X_pert`，`scale=True`；投影相对对照分布 z-score，对照细胞分数为 0 | 是 | 连续扰动强度，不是编辑成功与否 |
+| 描述性效应 | 原始 counts 加总 → CPM log2FC vs 对照 | 是（比值） | `log2((CPM_t+α)/(CPM_c+α))`；**不是**基因级 Z-score |
+| E-distance | 预处理 `X_pca`（表达空间） | 对比组是对照，嵌入不是签名 | 对齐 pertpy Distance Tests；**不用** `X_pert` |
+| 热图着色 | 展示时对所选细胞做行 z-score | 仅作图 | 不改 `X` / `X_pert` |
+
+无设计 NT 时，上表「对照」一律为临时 `zero_guide`；图与 `temporary_control_warning` 会标明。不要把表达 UMAP/Leiden 当作「已相对对照标准化后的扰动结构」。
+
+---
+
 ## 预处理与簇注释
 
 PCA、邻居图、Leiden 聚类和 UMAP 都建立在 top `preprocess.n_hvg`（默认 **2000**）高变基因上。
 
 1. 从 `layers['counts']` 对**全部基因**做文库大小归一化（`normalize_target_sum`，默认 10000）→ `log1p`。完整矩阵留给后续效应表；`layers['counts']` 仍是原始计数。
 2. 高变基因：Seurat flavor，取 top 2000；去掉本物种线粒体前缀后用后面的非线粒体基因补满。
-3. 只在这 2000 个 HVG 上做 z-score，再算 PCA（`n_pcs` 默认 40）；`X` 保持全基因 log 归一化稀疏矩阵。
-4. 邻居图、UMAP、Leiden（igraph）都用这份 HVG-PCA（若跑了 Harmony 则用 `X_pca_harmony`）。
+3. 只在这 2000 个 HVG 上做 z-score（相对**全部分析细胞**，不是相对 NT/`zero_guide`），再算 PCA（`n_pcs` 默认 40）；`X` 保持全基因 log 归一化稀疏矩阵。
+4. 邻居图、UMAP、Leiden（igraph，`leiden_resolution` 默认 **0.5**）都用这份 HVG-PCA（若跑了 Harmony 则用 `X_pca_harmony`）。这是描述性表达嵌入，不是扰动签名空间。
 5. `--batch-key` 空 → 不跑 Harmony；有键且水平 < 2 → `not_run_fewer_than_two_batch_levels`。
 
 参数记在 `adata.uns['preprocess']`。

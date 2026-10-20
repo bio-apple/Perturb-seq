@@ -264,7 +264,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "width": None,
         "height": None,
         "theme": None,
-        "top_n_guides": None,
         "max_legend_categories": None,
         "scatter_max_points": None,
         "volcano_lfc": None,
@@ -708,7 +707,9 @@ def _require_mito_cutoff(qc: dict[str, Any]) -> None:
     """Drop cells with mito_frac ≥ max_mito_frac (default 0.2 = 20%)."""
     value = qc.get("max_mito_frac")
     if value is None or isinstance(value, bool) or not isinstance(value, int | float):
-        raise ConfigError("qc.max_mito_frac 必须是数值。默认 0.2（排除线粒体 reads ≥ 20% 的细胞）。")
+        raise ConfigError(
+            "qc.max_mito_frac 必须是数值。默认 0.2（排除线粒体 reads ≥ 20% 的细胞）。"
+        )
     if not 0 <= float(value) <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")
     qc["max_mito_frac"] = float(value)
@@ -784,5 +785,3 @@ def _optional_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
-
-

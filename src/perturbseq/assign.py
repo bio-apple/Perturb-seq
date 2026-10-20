@@ -756,7 +756,9 @@ def apply_eligibility(
             reasons.append(LOW_LIBRARY_NO_GUIDE)
         if record.assignment_status == STATUS_NO_GUIDE:
             reasons.append("no_guide")
-        if record.assignment_status == STATUS_MULTI or int(record.n_targets) > int(targets_per_cell):
+        if record.assignment_status == STATUS_MULTI or int(record.n_targets) > int(
+            targets_per_cell
+        ):
             reasons.append("multi_guide")
         if not bool(record.guide_umi_pass):
             reasons.append("low_guide_umi")
@@ -833,9 +835,7 @@ def disambiguate_shared_guides(
         for name in set(table.loc[table["shared_guide_name"], "guide_name"].astype(str))
     }
     id_to_column = {guide_id: index for index, guide_id in enumerate(crispr_ids)}
-    name_to_columns = {
-        name: np.flatnonzero(names == name) for name in set(names.tolist()) if name
-    }
+    name_to_columns = {name: np.flatnonzero(names == name) for name in set(names.tolist()) if name}
     resolved: list[str] = []
     umis: list[float] = []
     for row_index, record in enumerate(table.itertuples(index=False)):

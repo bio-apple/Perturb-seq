@@ -37,11 +37,12 @@ python -m perturbseq \
 ## 输出概览
 
 - `qc/`：mRNA / gRNA 统计
-- `DGE/`：Mixscape、Mixscale、描述性 log2FC
 - `UMAP/`：表达 UMAP、簇注释、细胞周期、Mixscape signature
-- `E-distance/`：对当前对照的能量距离
-- 根目录：`effect_main.tsv`、`effect_sensitivity.tsv`、`guide_effects.tsv`、`target_expression_effect.tsv`
+- `DGE/Mixscape/`：Mixscape 门槛、摘要、class / 2x2 / fraction
+- `DGE/mixscale/`：Mixscale ridge / scatter、门槛
+- `DGE/descriptive/`：描述性 CPM log2FC 与相关效应表
+- `E-distance/`：对当前对照的能量距离与 guide 伪批量距离
 
-图只写 PNG。细节见 [docs/](docs/README.md)。
+图只写 PNG（无 PDF、无同名图旁 txt）。细节见 [docs/](docs/README.md)。
 
 
