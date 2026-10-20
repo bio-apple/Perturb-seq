@@ -6,30 +6,35 @@
 
 ## 运行
 
-环境是 `/opt/miniconda3/envs/perturbseq-tertiary/`（Python 3.12）。入口是 `python -m perturbseq`（`perturbseq.__main__` 调用 `perturbseq.cli.main`）。`pyproject.toml` 里的 console script `perturbseq-tertiary` 指向同一个函数。必须显式传入 `--config`。程序没有默认配置。
+环境是 `/opt/miniconda3/envs/perturbseq-tertiary/`（Python 3.12）。入口是 `python -m perturbseq`（`perturbseq.__main__` 调用 `perturbseq.cli.main`）。`pyproject.toml` 里的 console script `perturbseq-tertiary` 指向同一个函数。
+
+`config/config.yaml` 只放分析软件的默认参数，例如 Mixscape、Mixscale、预处理、Augur 和作图。样本名、物种、输入目录、输出目录、guide 分隔符、非靶向对照和 CRISPR 模式在命令行输入。不传 `--config` 时读取这份默认参数文件。命令行会覆盖文件里的同名字段。
 
 ```bash
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq --config config/config.yaml --steps all
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq --config config/config.yaml --steps io,assign,preprocess
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq --config config/config.yaml --steps perturb,augur --resume
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq --config config/config.yaml --validate-only
+/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq \
+  --sample-id SAMPLE \
+  --organism human \
+  --input-dir /path/to/sample \
+  --output-dir /path/to/output \
+  --guide-separator '|' \
+  --nt-control NT_NAME
 ```
 
-`--steps` 默认 `all`。步骤名是 `io`、`assign`、`preprocess`、`perturb`、`augur`、`enrich`、`report`。`--resume` 从上一步的 checkpoint 接着跑。`--validate-only` 只检查参考表和 barcode，不进入分配之后的步骤。
+没有设计好的非靶向对照时，去掉 `--nt-control`。`--crispr-mode` 缺省是 `CRISPR_KO`，也可以写 `i`、`a` 或 `other`。`--steps` 默认 `all`。步骤名是 `io`、`assign`、`preprocess`、`perturb`、`augur`、`enrich`、`report`。`--resume` 从上一步的 checkpoint 接着跑。`--validate-only` 只检查参考表和 barcode，不进入分配之后的步骤。
 
-`experiment.sample_id` 必填。`experiment.organism` 必填，只能是 `human` 或 `mouse`。大小写不敏感，加载后写成小写。`organelle`、`细胞器`、`other`、`human,mouse`、空字符串、缺省或其他值都会失败，错误说明只能填 `human` 或 `mouse`。细胞器不是物种。人类线粒体前缀是 `MT-`，小鼠是 `mt-`；配置里写了 `mito_gene_prefix` 就必须与物种一致，没写就按物种填上。
+`--organism` 必填，只能是 `human` 或 `mouse`。大小写不敏感，加载后写成小写。`organelle`、`细胞器`、`other`、`human,mouse`、空字符串或其他值都会失败，错误说明只能填 `human` 或 `mouse`。细胞器不是物种。人类线粒体前缀是 `MT-`，小鼠是 `mt-`，由物种决定。
 
 读入基因号和基因符号后做一致性核对，不根据基因改写物种。`human` 对 `ENSG` 和 `MT-`，`mouse` 对 `ENSMUSG` 和 `mt-`。基因号与符号互相矛盾，或与输入物种不一致，就停止，并写出各自的数量和例子。叶绿体等其他细胞器前缀记在 `other_organelle_prefixes`，不计入 percent.mt。核对结果在 `resolved_config.yaml` 和 `run_info.json`：`resolved_organism` 是输入物种，`resolved_mito_prefix` 是采用的线粒体前缀，`species_check` 是 `passed` 或 `failed`，`organism_evidence` 是依据。验证失败时仍会写出 `resolved_config.yaml`，然后停止。
 
-`experiment.crispr_mode` 可以不写，缺省是 `CRISPR_KO`。也可以写 `KO`、`i`、`a`、`other`，分别对应 `CRISPR_KO`、`CRISPRi`、`CRISPRa`、`other`。`CRISPRi` 的预期方向是 `down`，`CRISPRa` 是 `up`，`CRISPR_KO` 是 `not_required`。`other` 必须同时有 `crispr_mode_description` 和 `expected_target_direction`（`down`、`up`、`bidirectional` 或 `unknown`）。矩阵和分配文件不会被用来改写这个模式。
+`--crispr-mode` 可以不写，缺省是 `CRISPR_KO`。也可以写 `KO`、`i`、`a`、`other`，分别对应 `CRISPR_KO`、`CRISPRi`、`CRISPRa`、`other`。`CRISPRi` 的预期方向是 `down`，`CRISPRa` 是 `up`，`CRISPR_KO` 是 `not_required`。`other` 必须同时有 `--crispr-description` 和 `--expected-direction`（`down`、`up`、`bidirectional` 或 `unknown`）。矩阵和分配文件不会被用来改写这个模式。
 
-`labels.nt_control` 可以不写或留空。写了并且数据里真有这些细胞时，对照就是这组设计好的非靶向细胞，zero-guide 细胞不并进去。没写时，分配表里 0 条 guide 的细胞，以及仅在矩阵里、记为 `no_guide` 的细胞，是临时对照：`control_source=zero_guide_cells`，标签是 `zero_guide`，不会写成某个 Non-Targeting 名字。有了这组临时对照之后，描述性 CPM log2FC、Mixscape、Mixscale、对对照的 E-distance 都会做。`multi_guide` 和 `single_targeting` 不是对照。输入目录里如果还有另一份 `*.positive_cell_guide_assignments.csv`，流程会停止。
+`--nt-control` 写该样本参考表里的非靶向 guide 名，示例里的 `NT_NAME` 要换成这个名字。可以不写。写了并且数据里真有这些细胞时，对照就是这组设计好的非靶向细胞，zero-guide 细胞不并进去。没写时，分配表里 0 条 guide 的细胞，以及仅在矩阵里、记为 `no_guide` 的细胞，是临时对照：`control_source=zero_guide_cells`，标签是 `zero_guide`，不会写成某个 Non-Targeting 名字。有了这组临时对照之后，描述性 CPM log2FC、Mixscape、Mixscale、对对照的 E-distance 都会做。`multi_guide` 和 `single_targeting` 不是对照。输入目录里如果还有另一份 `*.positive_cell_guide_assignments.csv`，流程会停止。
 
-`qc.thresholds_confirmed` 必须为 `true`，并且 `min_umi`、`max_umi`、`min_genes`、`max_mito_frac` 已经写成数值。程序使用配置里的这四个数，不另设一套通用阈值。
+四个 QC 绝对阈值不在默认参数文件里。命令行同时给出 `--min-umi`、`--max-umi`、`--min-genes`、`--max-mito-frac` 时使用这四个数。只给其中一部分会失败。全部留空时，在分配步骤用全部细胞的 median ± `qc.n_mad`（默认 3）计算，并写进 `tables/qc_thresholds.json`。
 
 `statistics.mode` 默认 `descriptive`，配置里也只接受这个值。写成 `guide_exploratory` 时，加载配置失败，错误文本是 `unsupported_inference_backend`。`allow_random_split_replicates: true` 同样被拒绝。
 
-程序没有内置样本。五个 DRAGEN 文件由配置里的 `experiment.sample_id` 和 `input.input_dir` 拼出来，也可以在 `input` 里把五个路径一次写全：
+程序没有内置样本。五个 DRAGEN 文件由 `--sample-id` 和 `--input-dir` 拼出来：
 
 - `{sample_id}.scRNA.filtered.matrix.mtx.gz`
 - `{sample_id}.scRNA.filtered.barcodes.tsv.gz`
@@ -37,7 +42,7 @@
 - `{sample_id}.scRNA.feature_barcode_reference.csv`
 - `{sample_id}.scRNA.positive_cell_guide_assignments.csv`
 
-`config/config.yaml` 只是一份示例。不传 `--config` 时流程不会读取它，也不会假定示例里的样本名、物种或 NT 名。
+`--batch-key` 和 `--cell-type-key` 不填时分别为空。空的批次列不做 Harmony。空的细胞类型列使 `cell_type` 保持 `ALL`。
 
 ## 分配
 
@@ -45,7 +50,7 @@
 
 分配状态互斥，只有四类：`no_guide`、`single_targeting`、`single_nt`、`multi_guide`。0 条在 `no_guide` 阶段排除。多于 1 条保持 `multi_guide`，在 `multi_guide` 阶段排除。`labels.multi_guide_policy` 只能是 `drop`。配置里如果出现 `labels.flag_guides_above`，加载配置时会拒绝启动。
 
-`input.guide_separator` 必须是已核实的非空字符串，只从配置读取。guide 名内部也含这个字符时，按参考库最长匹配切分。
+`--guide-separator` 必须是已核实的非空字符串。guide 名内部也含这个字符时，按参考库最长匹配切分。
 
 过滤阶段按这个顺序记账：`no_guide`、`multi_guide`、`low_guide_umi`、`qc_failed`、`low_cells_target`，剩下的是 `retained`。
 
@@ -91,9 +96,9 @@ Mixscale 散点图 `nbin=10`。横轴是该靶基因内部扰动分数的分位�
 
 ## 预处理与簇注释
 
-预处理从 `layers['counts']` 重新归一化到 `preprocess.normalize_target_sum`（10000），再 `log1p`。高变基因用 Seurat flavor，`n_hvg` 2000。线粒体基因从高变集合里拿掉，用后面的非线粒体基因补上。人类用 `MT-`，小鼠用 `mt-`。配置里的前缀和物种不一致时，加载配置失败。叶绿体等其他细胞器基因不计入 percent.mt，也不按线粒体从高变基因里排除。PCA 做在标准化后的高变基因上，`n_pcs` 30，`X` 保持 log 归一化。
+预处理从 `layers['counts']` 重新归一化到 `preprocess.normalize_target_sum`（10000），再 `log1p`。高变基因用 Seurat flavor，`n_hvg` 2000。线粒体基因从高变集合里拿掉，用后面的非线粒体基因补上。线粒体前缀由 `--organism` 决定，人类是 `MT-`，小鼠是 `mt-`。叶绿体等其他细胞器基因不计入 percent.mt，也不按线粒体从高变基因里排除。PCA 做在标准化后的高变基因上，`n_pcs` 30，`X` 保持 log 归一化。
 
-`preprocess.batch_key` 为空时不调用 Harmony。只有配置了 `batch_key`、而且有效水平少于 2 时，`uns['batch_correction']` 才写成 `not_run_fewer_than_two_batch_levels`。邻居数和 Leiden 分辨率从配置读取，Leiden 用 igraph。
+`--batch-key` 为空时不调用 Harmony。只有传入了批次列、而且有效水平少于 2 时，`uns['batch_correction']` 才写成 `not_run_fewer_than_two_batch_levels`。邻居数和 Leiden 分辨率从 `config/config.yaml` 读取，Leiden 用 igraph。
 
 细胞周期只用人类 Seurat 基因集，而且要已经有 `uns['log1p']`。打分不改 `X`，也不做回归。小鼠没有对应基因集时跳过，`uns['cell_cycle_status']` 为 `skipped_no_mouse_cell_cycle_genes`，不拿人类基因去打分，也不编造一套小鼠基因。
 
@@ -115,12 +120,4 @@ Mixscale 散点图 `nbin=10`。横轴是该靶基因内部扰动分数的分位�
 - `E-distance/figures` 与 `E-distance/tables`：每个通过 Mixscape 差异基因门槛的靶基因对当前对照（设计好的 NT，或 `zero_guide`）的 pertpy `DistanceTest("edistance")`，用对象里已有的 `X_pca`，置换单位是细胞，校正是 holm-sidak。guide 伪批量的两两距离热图和 MDS 也进这个目录；标题写明那是 guide 伪批量距离。没有配置 `perturb.min_guide_replicates` 时热图跳过，原因是 `min_guide_replicates_not_set`。E-test 的 p 不写入效应表。
 
 描述性效应表在输出根目录。主效应图 `target_expression_effect` 只画 `branch=main`，纵轴用配置里的 `pseudocount_cpm`。guide 伪批量 PCA 把每条 guide 缩放到 10000 再 `log1p`，标题是 `guide pseudobulk, not replicates`；guide 少于 3 条时跳过，原因 `fewer_than_3_guides`。描述性热图的行是 `gene_id`。共用一个 symbol 的不同基因保持各行；这个 symbol 在图中出现多次时，标签写成 `symbol (gene_id)`。
-
-## 测试
-
-```bash
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m pytest
-```
-
-测试用合成矩阵。物种核对、缺 NT 时的 `zero_guide` 临时对照、有设计 NT 时不并入 zero-guide、matrix-only 记为 `no_guide`、assignment-only 失败、小鼠不做人类细胞周期，都不读取外部样本目录。
 

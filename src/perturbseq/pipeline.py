@@ -25,17 +25,21 @@ from perturbseq.assign import (
     apply_eligibility,
     cells_per_guide,
     cells_per_target,
+    derive_qc_thresholds,
     filter_stage_counts,
     multi_guide_composition,
     validate_guide_targets,
 )
 from perturbseq.config import (
     ConfigError,
+    apply_customer_arguments,
     control_spec,
-    load_config,
     mito_prefix,
     output_dir,
+    read_config,
     resolve_input_paths,
+    software_config_path,
+    validate_config,
     verify_species_consistency,
 )
 from perturbseq.distance_tests import write_edistance_results
@@ -82,12 +86,57 @@ PACKAGES = [
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Single-sample Perturb-seq tertiary analysis")
-    parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="分析软件默认参数 YAML。缺省为仓库里的 config/config.yaml。样本和路径以命令行为准。",
+    )
+    parser.add_argument("--sample-id", required=True, help="样本名，用来拼接 DRAGEN 文件名")
+    parser.add_argument("--organism", required=True, help="human 或 mouse")
+    parser.add_argument("--input-dir", required=True, help="五个 DRAGEN 输入文件所在目录")
+    parser.add_argument("--output-dir", required=True, help="结果输出目录")
+    parser.add_argument("--guide-separator", required=True, help="多条 guide 之间的分隔符，例如 |")
+    parser.add_argument("--nt-control", default="", help="设计好的非靶向对照名。不填则用 zero-guide 细胞")
+    parser.add_argument("--crispr-mode", default="CRISPR_KO", help="KO、i、a 或 other，缺省 CRISPR_KO")
+    parser.add_argument("--crispr-description", default=None, help="crispr-mode 为 other 时的文字说明")
+    parser.add_argument(
+        "--expected-direction",
+        default=None,
+        help="other 模式的预期方向：down、up、bidirectional 或 unknown",
+    )
+    parser.add_argument("--batch-key", default=None, help="obs 里的批次列。不填则不做 Harmony")
+    parser.add_argument("--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL")
+    parser.add_argument("--min-umi", type=float, default=None)
+    parser.add_argument("--max-umi", type=float, default=None)
+    parser.add_argument("--min-genes", type=float, default=None)
+    parser.add_argument("--max-mito-frac", type=float, default=None)
     parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
-    config = load_config(args.config)
+    config_path = args.config or software_config_path()
+    config = read_config(config_path)
+    apply_customer_arguments(
+        config,
+        {
+            "sample_id": args.sample_id,
+            "organism": args.organism,
+            "input_dir": args.input_dir,
+            "output_dir": args.output_dir,
+            "guide_separator": args.guide_separator,
+            "nt_control": args.nt_control,
+            "crispr_mode": args.crispr_mode,
+            "crispr_mode_description": args.crispr_description,
+            "expected_target_direction": args.expected_direction,
+            "batch_key": args.batch_key,
+            "cell_type_key": args.cell_type_key,
+            "min_umi": args.min_umi,
+            "max_umi": args.max_umi,
+            "min_genes": args.min_genes,
+            "max_mito_frac": args.max_mito_frac,
+        },
+    )
+    validate_config(config)
     if args.validate_only:
         folder = output_dir(config)
         folder.mkdir(parents=True, exist_ok=True)
@@ -241,13 +290,26 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     calls["guide_umi_pass"] = _as_bool(calls["guide_umi_pass"])
     for column in ("total_counts", "n_genes_by_counts", "mito_frac"):
         calls[column] = pd.to_numeric(calls[column], errors="coerce")
-    thresholds = {
-        "min_umi": float(config["qc"]["min_umi"]),
-        "max_umi": float(config["qc"]["max_umi"]),
-        "min_genes": float(config["qc"]["min_genes"]),
-        "max_mito_frac": float(config["qc"]["max_mito_frac"]),
+    metrics = pd.DataFrame(
+        {
+            "total_counts": calls["total_counts"],
+            "n_genes_by_counts": calls["n_genes_by_counts"],
+            "pct_counts_mito": calls["mito_frac"],
+        }
+    )
+    thresholds = derive_qc_thresholds(metrics, config["qc"])
+    configured = all(config["qc"].get(key) is not None for key in (
+        "min_umi",
+        "max_umi",
+        "min_genes",
+        "max_mito_frac",
+    ))
+    recorded = {
+        **thresholds,
+        "n_mad": float(config["qc"].get("n_mad", 3)),
+        "source": "command_line" if configured else "median_mad",
     }
-    (folder / "tables" / "qc_thresholds.json").write_text(json.dumps(thresholds, indent=2) + "\n")
+    (folder / "tables" / "qc_thresholds.json").write_text(json.dumps(recorded, indent=2) + "\n")
     updated = apply_eligibility(
         calls,
         thresholds,

@@ -43,15 +43,91 @@ class ConfigError(RuntimeError):
     """The run is not allowed to start."""
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+_QC_CUTOFFS = ("min_umi", "max_umi", "min_genes", "max_mito_frac")
+
+
+def software_config_path() -> Path:
+    """Default analysis-parameter file. It does not name a sample or a directory."""
+    candidates = [
+        Path(__file__).resolve().parents[2] / "config" / "config.yaml",
+        Path.cwd() / "config" / "config.yaml",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise ConfigError("找不到分析软件默认参数文件。请用 --config 指定。")
+
+
+def read_config(path: str | Path) -> dict[str, Any]:
+    """Load a YAML mapping without checking customer fields."""
     config_path = Path(path)
     with config_path.open() as handle:
         loaded = yaml.safe_load(handle)
     if not isinstance(loaded, dict):
         raise ConfigError("配置文件必须是一个 YAML 映射。")
-    validate_config(loaded)
     loaded["_config_path"] = str(config_path.resolve())
     return loaded
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    loaded = read_config(path)
+    validate_config(loaded)
+    return loaded
+
+
+def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -> dict[str, Any]:
+    """Replace project fields with the values the customer passed on the command line.
+
+    Paths, sample name, organism, guide separator, and the designed NT name in
+    the YAML file are not used.
+    """
+    config["experiment"] = {
+        "sample_id": customer.get("sample_id"),
+        "organism": customer.get("organism"),
+        "crispr_mode": customer.get("crispr_mode"),
+        "crispr_mode_description": customer.get("crispr_mode_description"),
+        "expected_target_direction": customer.get("expected_target_direction"),
+    }
+    inputs = config.setdefault("input", {})
+    if not isinstance(inputs, dict):
+        inputs = {}
+        config["input"] = inputs
+    inputs["input_dir"] = customer.get("input_dir")
+    inputs["guide_separator"] = customer.get("guide_separator")
+    for key in ("matrix", "barcodes", "features", "feature_reference", "assignments"):
+        inputs.pop(key, None)
+
+    config["output"] = {"output_dir": customer.get("output_dir")}
+    run = config.get("run")
+    if isinstance(run, dict):
+        run.pop("output_dir", None)
+
+    labels = config.setdefault("labels", {})
+    if not isinstance(labels, dict):
+        labels = {}
+        config["labels"] = labels
+    labels["nt_control"] = _optional_text(customer.get("nt_control"))
+
+    qc = config.setdefault("qc", {})
+    if not isinstance(qc, dict):
+        qc = {}
+        config["qc"] = qc
+    for key in (*_QC_CUTOFFS, "thresholds_confirmed", "mito_gene_prefix", "mito_prefix"):
+        qc.pop(key, None)
+    provided = {key: customer.get(key) for key in _QC_CUTOFFS}
+    if any(value is not None for value in provided.values()):
+        qc.update(provided)
+
+    cell_type_key = _blank_to_none(customer.get("cell_type_key"))
+    batch_key = _blank_to_none(customer.get("batch_key"))
+    preprocess = config.setdefault("preprocess", {})
+    if isinstance(preprocess, dict):
+        preprocess["cell_type_key"] = cell_type_key
+        preprocess["batch_key"] = batch_key
+    perturb = config.setdefault("perturb", {})
+    if isinstance(perturb, dict):
+        perturb["cell_type_key"] = cell_type_key
+    return config
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -404,17 +480,32 @@ def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
 
 
 def _require_confirmed_qc(qc: dict[str, Any]) -> None:
-    if qc.get("thresholds_confirmed") is not True:
-        raise ConfigError("正式分析前 qc.thresholds_confirmed 必须为 true，且阈值已填写。")
-    for key in ("min_umi", "max_umi", "min_genes", "max_mito_frac"):
+    n_mad = qc.get("n_mad", 3)
+    if isinstance(n_mad, bool) or not isinstance(n_mad, int | float) or float(n_mad) <= 0:
+        raise ConfigError("qc.n_mad 必须是正数。")
+    qc["n_mad"] = float(n_mad)
+    present = [key for key in _QC_CUTOFFS if qc.get(key) is not None]
+    if not present:
+        return
+    if len(present) != len(_QC_CUTOFFS):
+        raise ConfigError(
+            "命令行上的 --min-umi、--max-umi、--min-genes、--max-mito-frac 必须同时填写，"
+            "或者全部留空，留空时用 median ± qc.n_mad。"
+        )
+    for key in _QC_CUTOFFS:
         value = qc.get(key)
         if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ConfigError(f"qc.{key} 必须是已确认的数值。")
+            raise ConfigError(f"qc.{key} 必须是数值。")
     if float(qc["min_umi"]) >= float(qc["max_umi"]):
         raise ConfigError("qc.min_umi 必须小于 qc.max_umi。")
     mito = float(qc["max_mito_frac"])
     if not 0 <= mito <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")
+
+
+def _blank_to_none(value: Any) -> str | None:
+    text = _optional_text(value)
+    return text or None
 
 
 def _validate_statistics(statistics: dict[str, Any]) -> None:

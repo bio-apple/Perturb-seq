@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 enrichment = ["gseapy>=1.1"]
-dev = ["pytest>=8", "ruff>=0.9"]
+dev = ["ruff>=0.9"]
 
 [project.scripts]
 perturbseq-tertiary = "perturbseq.cli:main"
@@ -40,9 +40,6 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.11"

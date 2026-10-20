@@ -1,37 +1,17 @@
-# 示例配置。必须用 --config 传入；程序不会默认加载它，也不会改写 organism。
-# CRISPR 模式按这份示例的命名记为 CRISPR_KO，不是流程默认假设。
-# guide 分隔符已从分配文件核实为 '|'；guide 名内部也含该字符，解析时按参考库最长匹配。
-# QC 阈值是该样本 log1p 尺度 median ± 3 MAD 的记录值，不是通用默认。
-document_version: '1.4'
-experiment:
-  sample_id: A549_2
-  organism: human
-  organism_description: null
-  crispr_mode: CRISPR_KO
-  crispr_mode_description: null
-  expected_target_direction: null
+# 分析软件默认参数。样本、物种、输入输出目录、guide 分隔符、非靶向对照和 CRISPR 模式由命令行传入。
+# 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
 input:
-  input_dir: /Users/yfan/Desktop/test_data
   guide_reference_key: name
-  guide_separator: '|'
   barcode_policy: strict
-output:
-  output_dir: results
 labels:
-  nt_control: Non-Targeting_Control
   feature_type_crispr: CRISPR Direct Capture
   feature_type_gex: Gene Expression
   multi_guide_policy: drop
   # 下游分析只保留恰好这么多条 guide 的细胞。默认 1。
-  # 0 条记为 no_guide；多于该数的细胞记为 multi_guide，在 multi_guide 阶段剔除。
   guides_per_cell: 1
 qc:
-  thresholds_confirmed: true
-  min_umi: 7226.94
-  max_umi: 36997.16
-  min_genes: 3344.07
-  max_mito_frac: 0.05856
-  mito_gene_prefix: MT-
+  # 未在命令行给出四个 QC 阈值时，用 median ± n_mad × 1.4826 × MAD。
+  n_mad: 3
   min_cells_per_target: 20
   min_cells_per_guide: 10
   min_guide_umi: null
@@ -41,8 +21,6 @@ preprocess:
   n_pcs: 30
   n_neighbors: 15
   leiden_resolution: 1.0
-  cell_type_key: null
-  batch_key: null
 mixscape:
   enabled: true
   min_de_genes: 5
@@ -54,7 +32,6 @@ mixscape:
   min_target_cells: 20
   min_nt_cells: 20
   # CalcPerturbSig：ndims=40，num.neighbors=20。矩阵比 40 小时才截断。
-  # 教程的 split.by="replicate" 不采用：本项目只有一个生物学样本。
   n_dims: 40
   n_control_neighbors: 20
   # RunMixscape iter.num。
@@ -63,7 +40,7 @@ mixscape:
   ambiguous_lower: 0.2
   ambiguous_upper: 0.8
 # RunMixscale 教程实参：https://satijalab.github.io/Mixscale/
-# min.de.genes = 5，logfc.threshold = 0.2，max.de.genes = 100，fine.mode = F，split.by 留空。
+# min.de.genes = 5，logfc.threshold = 0.2，max.de.genes = 100，fine.mode = F。
 # pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
 mixscale:
   min_de_genes: 5
@@ -84,7 +61,6 @@ statistics:
   sensitivity_branch: mixscape_perturbed
   allow_random_split_replicates: false
 perturb:
-  cell_type_key: null
   distance_metric: edistance
   mixscape_min_de_genes: 5
   # Mixscape 的回退 logfc，与 mixscape.logfc_threshold 一致。Mixscale 不读这个键。
@@ -143,6 +119,5 @@ plotting:
     retained: '#2CA02C'
 run:
   random_seed: 0
-  output_dir: results
 runtime:
   seed: 0

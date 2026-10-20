@@ -1,10 +1,10 @@
 # 输出目录
 
-路径相对于配置里的 `output.output_dir`。`config/config.yaml` 写的是 `results`。图只保存 PNG，dpi 用 `plotting.dpi`（默认 300）。没有 PDF，没有 HTML 报告。
+路径相对于命令行 `--output-dir`。图只保存 PNG，dpi 用 `plotting.dpi`（默认 300）。没有 PDF，没有 HTML 报告。
 
 `FigureStore.skip` 按图名写原因，不看调用时的 section：mRNA/gRNA 统计和高变基因、PCA 写 `qc/tables/<图名>.skipped.txt`，`_DGE_FIGURES` 里的图写 `DGE/plot_data/<图名>.skipped.txt`，文件名以 `umap_` 开头的图写 `UMAP/tables/<图名>.skipped.txt`，`perturbation_distance_heatmap` 和 `perturbation_embedding` 写 `E-distance/tables/<图名>.skipped.txt`。其余图名写到输出根下的 `plot_data/`。`volcano` 在 DGE 集合里，所以单独火山图的跳过说明是 `DGE/plot_data/volcano.skipped.txt`。`target_effect_forest` 不在分桶名单里，跳过说明在 `plot_data/target_effect_forest.skipped.txt`。E-test 缺 `X_pca` 时，`distance_tests` 直接写 `E-distance/figures/edistance_etest.skipped.txt`，内容 `missing_X_pca`。
 
-下面是当前代码的输出，不绑定某一次样本运行。`config/config.yaml` 只是示例，程序不默认读取它。
+下面是当前代码的输出，不绑定某一次样本运行。`config/config.yaml` 只含分析软件默认参数。样本、物种、目录和对照来自命令行。
 
 mRNA 和 gRNA 的统计图、表在 `qc/`。差异表达门槛以及之后的图和表在 `DGE/`。描述性 CPM 效应表、原始输入、checkpoint、h5ad 在输出根目录，不进 `DGE/`。
 
@@ -82,5 +82,3 @@ mRNA 和 gRNA 的统计图、表在 `qc/`。差异表达门槛以及之后的图
 | `DGE/figures/summary/perturbation_summary.png` | 摘要条形图。显著性计数在摘要表里是 NA，因此这张图不拿它当柱高 | 摘要表为空，或数值列全是 NA |
 
 `report` 不调用 `save_target_log2fc_bar`。函数仍在 `plotting.py` 里，下一次 `report` 不会因为它重画 `{靶基因}_log2fc.png`。
-
-合肥样本不是默认测试集。仓库里没有 `config/hefei_third.yaml`。另一次校验曾记下样本名 `test`、物种 `mouse`、`crispr_mode: other`、仅矩阵 2568 个 barcode、仅分配 0 个。那个目录不在当前工作区的 `results/` 里。
