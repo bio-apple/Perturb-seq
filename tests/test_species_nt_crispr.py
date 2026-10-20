@@ -316,6 +316,26 @@ def _toy_sample(folder: Path, assignment_rows: str) -> dict[str, Path]:
     }
 
 
+def test_mouse_does_not_run_human_cell_cycle():
+    from perturbseq.pipeline import _score_cell_cycle
+    from perturbseq.plotting import score_human_cell_cycle_after_log1p
+
+    config = _base("mouse")
+    validate_config(config)
+    symbols = ["MCM5", "PCNA", "MKI67", "TOP2A"]
+    adata = AnnData(np.ones((4, len(symbols))))
+    adata.var_names = symbols
+    adata.var["gene_symbol"] = symbols
+    adata.uns["log1p"] = {"base": None}
+    _score_cell_cycle(adata, config)
+    assert adata.uns["cell_cycle_status"] == "skipped_no_mouse_cell_cycle_genes"
+    assert "小鼠" in str(adata.uns["cell_cycle_note"])
+    assert "phase" not in adata.obs.columns
+    assert "cell_cycle_s_found" not in adata.uns
+    assert score_human_cell_cycle_after_log1p(adata, organism="mouse") == "skipped_not_human"
+    assert "phase" not in adata.obs.columns
+
+
 def test_matrix_only_is_no_guide_and_assignment_only_still_fails(tmp_path):
     kept = _toy_sample(tmp_path / "kept", "A,1,GuideA,2\n")
     adata, annotated, checks = load_sample(

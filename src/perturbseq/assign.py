@@ -112,9 +112,10 @@ def build_guide_catalog(reference: pd.DataFrame) -> pd.DataFrame:
 def validate_guide_targets(reference: pd.DataFrame, *, nt_control: str) -> pd.DataFrame:
     """Use target_gene_name as the only target when that column exists.
 
-    A blank target is an error. The one exception is a guide whose name is the
-    configured control label: A549 leaves those cells blank and identifies them
-    by name. A blank is never treated as non-targeting for any other guide.
+    A blank target is an error. The one exception is a guide whose name equals
+    the configured NT label: that guide is the designed control even when
+    target_gene_name is blank. A blank is never treated as non-targeting for
+    any other guide.
     References without the column keep that name-based control path.
     """
     catalog = build_guide_catalog(reference)
@@ -570,8 +571,8 @@ def disambiguate_shared_guides(
 ) -> pd.DataFrame:
     """Assign a reference id when several guides share one name.
 
-    Non-targeting guides in this assay share ``Non-Targeting_Control``. The
-    CRISPR count matrix distinguishes EditR-NTC-01, EditR-NTC-02, and so on.
+    The shared name comes from the reference table. The CRISPR count matrix
+    picks the id with the most UMIs. There is no fixed non-targeting name.
     """
     table = annotated.copy()
     if guide_umi.shape[1] == 0:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import matplotlib
 
@@ -523,83 +525,254 @@ def draw_qc_violin(
     )
 
 
-CLUSTER_STATE_MARKERS = {
-    "S": ["MCM5", "PCNA", "TYMS", "RRM2"],
-    "G2M": ["TOP2A", "MKI67", "CDK1", "CCNB2"],
-    "Epithelial": ["EPCAM", "KRT8", "KRT18", "KRT19"],
-    "Stress": ["ATF3", "DDIT3", "HSPA1A", "JUN"],
-    "Interferon": ["ISG15", "IFIT1", "MX1", "OAS1"],
-    "Hypoxia": ["VEGFA", "LDHA", "PGK1", "ENO1"],
+_SINGLER_REFERENCES = {
+    "mouse": "MouseRNAseqData",
+    "human": "HumanPrimaryCellAtlasData",
+}
+SINGLER_IMPLEMENTATION = "R SingleR"
+
+_SINGLER_RSCRIPT = r"""
+options(timeout = 600)
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) %% 2 != 0) stop("参数不成对")
+opt <- list()
+for (i in seq(1, length(args), by = 2)) {
+  key <- gsub("-", "_", sub("^--", "", args[[i]]))
+  opt[[key]] <- args[[i + 1]]
+}
+organism <- opt$organism
+reference_name <- opt$reference_name
+if (is.null(organism) || is.null(reference_name) || is.null(opt$test) || is.null(opt$out)) {
+  stop("缺少 SingleR 参数")
+}
+known <- c(mouse = "MouseRNAseqData", human = "HumanPrimaryCellAtlasData")
+if (!(organism %in% names(known))) stop("experiment.organism 只能是 human 或 mouse")
+
+read_matrix <- function(path) {
+  frame <- utils::read.delim(path, check.names = FALSE, sep = "\t")
+  genes <- as.character(frame[[1]])
+  if (anyDuplicated(genes)) stop("表达矩阵基因名重复")
+  mat <- as.matrix(frame[, -1, drop = FALSE])
+  storage.mode(mat) <- "double"
+  rownames(mat) <- genes
+  mat
 }
 
+reference_matrix <- if (is.null(opt$reference_matrix)) "" else opt$reference_matrix
+if (nzchar(reference_matrix)) {
+  reference_organism <- if (is.null(opt$reference_organism)) "" else opt$reference_organism
+  if (reference_organism != organism) {
+    stop(sprintf("参考物种 %s 与输入物种 %s 不一致", reference_organism, organism))
+  }
+  if (reference_name %in% as.character(known) && known[[organism]] != reference_name) {
+    stop(sprintf("参考 %s 与输入物种 %s 不一致", reference_name, organism))
+  }
+  ref <- read_matrix(reference_matrix)
+  label_frame <- utils::read.delim(opt$reference_labels, sep = "\t", check.names = FALSE)
+  labels <- as.character(label_frame[[1]])
+  if (length(labels) != ncol(ref)) stop("参考标签数量和样本数不一致")
+} else {
+  if (reference_name != known[[organism]]) {
+    stop(sprintf("参考 %s 与输入物种 %s 不一致", reference_name, organism))
+  }
+  ref <- if (organism == "mouse") {
+    celldex::MouseRNAseqData()
+  } else {
+    celldex::HumanPrimaryCellAtlasData()
+  }
+  labels <- as.character(SummarizedExperiment::colData(ref)$label.main)
+  if (anyNA(labels) || any(!nzchar(labels))) stop("参考 label.main 有缺失")
+}
 
-def cluster_annotations(adata: AnnData) -> tuple[pd.Series, pd.DataFrame]:
-    """Label each Leiden cluster by the state program enriched relative to the others.
+test <- read_matrix(opt$test)
+pred <- SingleR::SingleR(test = test, ref = ref, labels = labels)
+score_mat <- as.matrix(pred$scores)
+pruned <- as.character(pred$pruned.labels)
+pruned[is.na(pruned)] <- ""
+out <- data.frame(
+  cluster = rownames(pred),
+  label = as.character(pred$labels),
+  delta_next = as.numeric(pred$delta.next),
+  pruned_label = pruned,
+  max_score = apply(score_mat, 1, max),
+  singler_version = as.character(packageVersion("SingleR")),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+utils::write.table(out, opt$out, sep = "\t", quote = FALSE, row.names = FALSE)
+"""
 
-    A549 is one cell line, so these labels are cluster states, not tissue cell types.
-    A program is used only when at least two of its genes are present. The winning
-    program must be at least 0.5 standard deviations above the cluster mean of
-    programs; otherwise the cluster stays unassigned.
+
+class SingleRReference(NamedTuple):
+    """One SingleR reference. ``matrix`` is genes by samples; empty means load celldex."""
+
+    name: str
+    organism: str
+    matrix: np.ndarray | None = None
+    labels: tuple[str, ...] = ()
+    features: tuple[str, ...] = ()
+
+
+def singler_reference_name(organism: str) -> str:
+    """celldex reference for this organism. Mouse never maps to the human atlas."""
+    key = str(organism).strip().lower()
+    try:
+        return _SINGLER_REFERENCES[key]
+    except KeyError:
+        raise ValueError(f"experiment.organism 只能是 human 或 mouse，收到 {organism}") from None
+
+
+def cluster_annotations(
+    adata: AnnData,
+    organism: str,
+    *,
+    reference: SingleRReference | None = None,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Annotate each Leiden cluster with SingleR and store ``obs['singler_label']``.
+
+    Expression is the per-cluster mean of ``adata.X``. The reference has to be the
+    same species as ``organism``. This does not write ``obs['cell_type']``.
     """
-    from scipy import sparse
-
-    if "leiden" not in adata.obs or "X_umap" not in adata.obsm:
-        raise ValueError("缺少 leiden 或 X_umap。")
-    symbols = (
-        adata.var["gene_symbol"].astype(str)
-        if "gene_symbol" in adata.var.columns
-        else pd.Series(adata.var_names.astype(str), index=adata.var_names)
-    )
-    lookup: dict[str, int] = {}
-    for index, gene in enumerate(symbols.to_numpy()):
-        lookup.setdefault(str(gene), index)
-    chosen: dict[str, list[int]] = {}
-    coverage: dict[str, str] = {}
-    for program, genes in CLUSTER_STATE_MARKERS.items():
-        indexes = [lookup[gene] for gene in genes if gene in lookup]
-        if len(indexes) >= 2:
-            chosen[program] = indexes
-            coverage[program] = f"{len(indexes)}/{len(genes)}"
-    if not chosen:
-        raise ValueError("状态基因在矩阵中不足。")
-    columns = sorted({index for indexes in chosen.values() for index in indexes})
-    block = adata.X[:, columns]
-    dense = np.asarray(block.toarray() if sparse.issparse(block) else block, dtype=float)
-    position = {column: offset for offset, column in enumerate(columns)}
+    species = str(organism).strip().lower()
+    expected = singler_reference_name(species)
+    if reference is None:
+        reference = SingleRReference(name=expected, organism=species)
+    else:
+        ref_species = str(reference.organism).strip().lower()
+        if ref_species != species:
+            raise ValueError(f"参考物种 {reference.organism} 与输入物种 {organism} 不一致")
+        if reference.name in _SINGLER_REFERENCES.values() and reference.name != expected:
+            raise ValueError(f"参考 {reference.name} 与输入物种 {organism} 不一致")
+    if "leiden" not in adata.obs:
+        raise ValueError("缺少 leiden。")
+    profiles = _cluster_mean_expression(adata)
+    label_field = "label.main" if reference.name in _SINGLER_REFERENCES.values() else "provided"
+    predicted = _run_singler(profiles, reference, species)
     clusters = adata.obs["leiden"].astype(str).to_numpy()
-    order = sorted(set(clusters), key=lambda value: int(value) if value.isdigit() else value)
-    scores = pd.DataFrame(index=order, columns=list(chosen), dtype=float)
-    for program, indexes in chosen.items():
-        offsets = [position[index] for index in indexes]
-        values = dense[:, offsets].mean(axis=1)
-        scores[program] = pd.Series(values, index=adata.obs_names).groupby(clusters).mean()
-    centered = scores.sub(scores.mean(axis=0), axis=1)
-    scale = centered.std(axis=0).replace(0, 1)
-    standardized = centered.div(scale, axis=1)
+    order = _cluster_order(clusters)
+    by_cluster = predicted.set_index(predicted["cluster"].astype(str))
+    missing = [cluster for cluster in order if cluster not in by_cluster.index]
+    if missing:
+        raise ValueError(f"SingleR 没有返回簇 {missing[0]}")
+    mapping = {cluster: str(by_cluster.loc[cluster, "label"]) for cluster in order}
+    adata.obs["singler_label"] = [mapping[cluster] for cluster in clusters]
     rows = []
-    mapping = {}
     for cluster in order:
-        ranked = standardized.loc[cluster].sort_values(ascending=False)
-        top = str(ranked.index[0])
-        margin = float(ranked.iloc[0] - (ranked.iloc[1] if len(ranked) > 1 else 0))
-        label = top if float(ranked.iloc[0]) >= 0.5 and margin >= 0.25 else "unassigned"
-        mapping[cluster] = label
+        record = by_cluster.loc[cluster]
+        pruned = str(record["pruned_label"])
         rows.append(
             {
                 "leiden": cluster,
-                "annotation": label,
-                "top_program": top,
-                "top_z": float(ranked.iloc[0]),
-                "margin": margin,
+                "singler_label": mapping[cluster],
+                "pruned_label": pruned if pruned else pd.NA,
+                "delta_next": float(record["delta_next"]),
+                "max_score": float(record["max_score"]),
                 "n_cells": int((clusters == cluster).sum()),
-                "genes_found": coverage.get(top, ""),
+                "reference": reference.name,
+                "organism": species,
+                "label_field": label_field,
+                "implementation": SINGLER_IMPLEMENTATION,
+                "singler_version": str(record["singler_version"]),
             }
         )
-    labels = pd.Series(clusters, index=adata.obs_names).map(mapping)
+    labels = pd.Series(adata.obs["singler_label"].to_numpy(), index=adata.obs_names)
     return labels, pd.DataFrame(rows)
 
 
-ANNOTATION_METHOD = "relative z-score of state marker programs across clusters"
+def _cluster_order(clusters: np.ndarray) -> list[str]:
+    return sorted(set(clusters), key=lambda value: int(value) if str(value).isdigit() else value)
+
+
+def _cluster_mean_expression(adata: AnnData) -> pd.DataFrame:
+    """Genes by Leiden cluster. Values are the mean of ``adata.X`` inside the cluster."""
+    from scipy import sparse
+
+    if "gene_symbol" in adata.var.columns:
+        symbols = adata.var["gene_symbol"].astype(str).to_numpy()
+    else:
+        symbols = adata.var_names.astype(str).to_numpy()
+    keep: list[int] = []
+    names: list[str] = []
+    seen: set[str] = set()
+    for index, gene in enumerate(symbols):
+        if gene in seen or gene in {"", "nan", "None"}:
+            continue
+        seen.add(gene)
+        keep.append(index)
+        names.append(gene)
+    if not keep:
+        raise ValueError("矩阵里没有基因符号。")
+    if len(keep) == adata.n_vars and keep[-1] == len(keep) - 1:
+        chosen = adata.X
+    else:
+        chosen = adata.X[:, keep]
+    clusters = adata.obs["leiden"].astype(str).to_numpy()
+    rows = []
+    for cluster in _cluster_order(clusters):
+        block = chosen[clusters == cluster]
+        if sparse.issparse(block):
+            values = np.asarray(block.mean(axis=0)).ravel()
+        else:
+            values = np.asarray(block, dtype=float).mean(axis=0)
+        rows.append(values)
+    return pd.DataFrame(np.vstack(rows), index=_cluster_order(clusters), columns=names).T
+
+
+def _run_singler(profiles: pd.DataFrame, reference: SingleRReference, organism: str) -> pd.DataFrame:
+    rscript = shutil.which("Rscript")
+    if rscript is None:
+        raise ValueError("没有找到 Rscript，无法运行 SingleR。")
+    with tempfile.TemporaryDirectory(prefix="perturbseq-singler-") as folder:
+        root = Path(folder)
+        test_path = root / "test.tsv"
+        out_path = root / "labels.tsv"
+        script_path = root / "singler_cluster.R"
+        table = profiles.reset_index(names="gene")
+        table.to_csv(test_path, sep="\t", index=False)
+        script_path.write_text(_SINGLER_RSCRIPT)
+        command = [
+            rscript,
+            str(script_path),
+            "--test",
+            str(test_path),
+            "--out",
+            str(out_path),
+            "--organism",
+            organism,
+            "--reference-name",
+            reference.name,
+        ]
+        if reference.matrix is not None:
+            matrix = np.asarray(reference.matrix, dtype=float)
+            if matrix.ndim != 2:
+                raise ValueError("参考矩阵必须是基因×样本。")
+            if len(reference.features) != matrix.shape[0] or len(reference.labels) != matrix.shape[1]:
+                raise ValueError("参考矩阵和基因或标签长度不一致。")
+            ref_path = root / "reference.tsv"
+            pd.DataFrame(matrix, index=list(reference.features)).reset_index(names="gene").to_csv(
+                ref_path, sep="\t", index=False
+            )
+            label_path = root / "reference_labels.tsv"
+            pd.DataFrame({"label": list(reference.labels)}).to_csv(label_path, sep="\t", index=False)
+            command.extend(
+                [
+                    "--reference-matrix",
+                    str(ref_path),
+                    "--reference-labels",
+                    str(label_path),
+                    "--reference-organism",
+                    str(reference.organism).strip().lower(),
+                ]
+            )
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            message = detail.splitlines()[-1] if detail else "SingleR 失败"
+            raise ValueError(message)
+        predicted = pd.read_csv(out_path, sep="\t")
+    if predicted.empty or predicted["cluster"].astype(str).duplicated().any():
+        raise ValueError("SingleR 没有返回每个簇一个标签。")
+    return predicted
 
 
 def leiden_resolution(adata: AnnData) -> float | None:
@@ -614,29 +787,36 @@ def leiden_resolution(adata: AnnData) -> float | None:
 
 
 def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
-    """One figure: Leiden clusters and their state labels on the same UMAP."""
+    """One figure: Leiden clusters and their SingleR labels on the same UMAP."""
     name = "umap_cluster_annotation"
     if "leiden" not in adata.obs or "X_umap" not in adata.obsm:
         store.skip(name, "missing_fields")
         return
+    organism = str(store.context.get("organism", ""))
     try:
-        labels, summary = cluster_annotations(adata)
+        labels, summary = cluster_annotations(adata, organism)
     except ValueError as exc:
         store.skip(name, str(exc))
         return
     resolution = leiden_resolution(adata)
     resolution_text = "not stored" if resolution is None else f"{resolution:g}"
+    reference_name = str(summary["reference"].iloc[0])
+    label_field = str(summary["label_field"].iloc[0])
+    version = str(summary["singler_version"].iloc[0])
     summary = summary.copy()
     summary["leiden_resolution"] = resolution if resolution is not None else pd.NA
     summary["clustering"] = "Leiden igraph"
-    summary["annotation_method"] = ANNOTATION_METHOD
+    summary["annotation_method"] = (
+        f"{SINGLER_IMPLEMENTATION} {version} on cluster-mean log-normalized expression; "
+        f"reference={reference_name} {label_field}"
+    )
     coordinates = np.asarray(adata.obsm["X_umap"], dtype=float)
     table = pd.DataFrame(
         {
             "UMAP1": coordinates[:, 0],
             "UMAP2": coordinates[:, 1],
             "leiden": adata.obs["leiden"].astype(str).to_numpy(),
-            "annotation": labels.to_numpy(),
+            "singler_label": labels.to_numpy(),
         }
     )
     figure, axes = plt.subplots(1, 2, figsize=(12, 5.4), sharex=True, sharey=True)
@@ -647,13 +827,13 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
         data=table,
         x="UMAP1",
         y="UMAP2",
-        hue="annotation",
+        hue="singler_label",
         s=4,
         linewidth=0,
         ax=axes[1],
     )
     axes[0].set_title(f"Leiden (igraph)\nresolution = {resolution_text}")
-    axes[1].set_title("Annotation\nrelative z-score of marker programs")
+    axes[1].set_title(f"SingleR ({reference_name})\n{label_field}")
     for axis in axes:
         axis.set_xlabel("UMAP 1")
         axis.set_ylabel("UMAP 2")
@@ -666,12 +846,11 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
             ha="center",
             va="center",
         )
-    axes[1].legend(title="annotation", frameon=False, fontsize=7, loc="best")
+    axes[1].legend(title="singler_label", frameon=False, fontsize=7, loc="best")
     method = (
         f"clustering=Leiden igraph, resolution={resolution_text}; "
-        f"annotation={ANNOTATION_METHOD}; "
-        "label if top z>=0.5 and margin>=0.25, else unassigned; "
-        "cluster states, not tissue cell types"
+        f"annotation={summary['annotation_method'].iloc[0]}; "
+        "one SingleR label per Leiden cluster; obs['cell_type'] unchanged"
     )
     store.save(figure, name, "plot", summary, method)
     note = store.figure_dir(name, "plot") / f"{name}.txt"
@@ -680,9 +859,12 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
         "\n".join(
             [
                 f"聚类：Leiden，igraph，resolution = {resolution_text}",
-                "细胞注释：各簇 marker 程序平均表达，再在簇之间做相对 z-score。",
-                "取得分最高的程序；top z >= 0.5 且与第二名差距 >= 0.25 才赋值，否则 unassigned。",
-                "这是相对其他簇的状态，不是组织细胞类型，也不写入 cell_type。",
+                (
+                    f"细胞注释：{SINGLER_IMPLEMENTATION} {version}，参考 {reference_name}，"
+                    f"标签字段 {label_field}。"
+                ),
+                "先按 Leiden 簇对 log 归一化表达取平均，再对每个簇做 SingleR。",
+                "标签写入 obs['singler_label']。不修改 obs['cell_type']。",
                 "",
             ]
         )
@@ -812,8 +994,9 @@ def draw_mixscape_fraction(store: FigureStore, fractions: pd.DataFrame) -> None:
 def draw_target_expression(store: FigureStore, effects: pd.DataFrame) -> None:
     """One point per target: descriptive CPM log2FC on the main contrast.
 
-    The value is log2((CPM_target+1)/(CPM_NT+1)) from summed counts. It is not a
-    mean of log1p expression, and the sensitivity branch is not drawn here.
+    The value is the descriptive CPM log2FC already stored on the effect table.
+    The axis names the configured control and the table's pseudocount. It is not
+    a mean of log1p expression, and the sensitivity branch is not drawn here.
     """
     effect_column = (
         "log2fc_descriptive" if "log2fc_descriptive" in effects.columns else "effect_log1p"
@@ -840,7 +1023,10 @@ def draw_target_expression(store: FigureStore, effects: pd.DataFrame) -> None:
     else:
         axis.set_xticks([])
     phrase = _contrast_name(str(store.context.get("control_label", "")))
-    axis.set_ylabel(f"log2((CPM_target+1)/(CPM of {phrase}+1))")
+    alpha = 1.0
+    if "pseudocount_cpm" in shown.columns and shown["pseudocount_cpm"].notna().any():
+        alpha = float(shown["pseudocount_cpm"].iloc[0])
+    axis.set_ylabel(f"log2((CPM_target+{alpha:g})/(CPM of {phrase}+{alpha:g}))")
     axis.set_title(f"target vs {phrase}, not a replicate test")
     store.save(
         figure,
@@ -1021,7 +1207,7 @@ def draw_distance_heatmap(store: FigureStore, distance: pd.DataFrame) -> None:
         "summary",
         long,
         "pairwise energy distance among guide pseudobulks; "
-        "not each target vs Non-Targeting_Control",
+        "not the contrast against the configured control",
     )
 
 
@@ -1048,7 +1234,7 @@ def draw_distance_embedding(store: FigureStore, embedding: pd.DataFrame) -> None
         "perturbation_embedding",
         "summary",
         embedding,
-        "MDS of pairwise perturbation distances; not the E-test vs Non-Targeting_Control; "
+        "MDS of pairwise perturbation distances; not the E-test against the configured control; "
         "axes are not biological variables",
     )
 
@@ -1804,7 +1990,7 @@ def analysis_target_genes(adata: AnnData, control: str) -> list[str]:
     labels = adata.obs["target_gene"].astype(str)
     if "perturbation_status" in adata.obs:
         labels = labels[adata.obs["perturbation_status"].astype(str).eq("targeting")]
-    excluded = {control, "NT", "Non-Targeting_Control", "zero_guide", "nan", "None", "<NA>", "NA", ""}
+    excluded = {str(control), "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA", ""}
     names = {gene for gene in labels if gene not in excluded}
     return sorted(names)
 
@@ -1915,7 +2101,7 @@ def target_in_de_gene_count_table(
     table = target_in_de_table(adata, control=control)
     if table.empty:
         return pd.DataFrame(columns=columns)
-    excluded = {"", "NT", "Non-Targeting_Control", "nan", "None", "<NA>", "NA", str(control)}
+    excluded = {"", "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA", str(control)}
     keep = table["target_in_de"].astype(bool)
     keep &= table["n_de_genes"].astype(int) >= int(min_de_genes)
     keep &= ~table["target_gene"].astype(str).isin(excluded)
@@ -1962,9 +2148,10 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
 
 
 def target_in_de_gene_count_note(control: str, min_de_genes: int = 5) -> str:
-    excluded = ["NT", "Non-Targeting_Control"]
-    if str(control) not in excluded:
-        excluded.append(str(control))
+    excluded: list[str] = []
+    for label in (str(control), "zero_guide"):
+        if label and label not in excluded:
+            excluded.append(label)
     return (
         "口径\n"
         "只画同时满足下面两条的靶基因，每根柱是一个靶基因。\n"
@@ -2009,7 +2196,7 @@ def draw_target_in_de_gene_counts(
     sidecar.write_text(target_in_de_gene_count_note(control, min_de_genes))
 
 
-_EXCLUDED_TARGET_LABELS = {"", "NT", "Non-Targeting_Control", "nan", "None", "<NA>", "NA"}
+_EXCLUDED_TARGET_LABELS = {"", "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA"}
 _NOT_SINGLE_TARGET_STATUS = {
     "no_guide",
     "nt",
@@ -2025,7 +2212,7 @@ def single_targeting_cell_counts(
     cells: pd.DataFrame,
     *,
     catalog: list[str] | None = None,
-    control: str = "Non-Targeting_Control",
+    control: str = "",
 ) -> pd.DataFrame:
     """Count cells with exactly one guide assigned to each targeting gene.
 
@@ -2112,7 +2299,7 @@ def target_cell_count_note(summary: dict[str, int], *, source: str) -> str:
         "口径\n"
         "细胞数 = 该靶基因的 single targeting 细胞数：一个细胞恰好 1 条 guide，"
         "并且分配到这个靶基因。\n"
-        "不含 NT / Non-Targeting_Control，不含 no_guide，不含 multi_guide。\n"
+        "不含配置里的对照标签，不含 no_guide，不含 multi_guide。\n"
         "细胞数为 0 的靶基因不画柱，数量写在图上。\n"
         "细胞数 ≥ 20 与细胞数 ≥ 40 分别计数；≥ 40 是 ≥ 20 的子集，不是互斥区间。\n"
         "柱按细胞数从高到低排列。靶基因过多时不标注每个基因名。\n"

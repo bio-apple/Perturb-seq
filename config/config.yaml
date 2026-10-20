@@ -1,5 +1,5 @@
-# A549_2 测试配置。物种按 ENSG 定为 human。
-# CRISPR 模式按 Edit-R NTC 与 gene|design_N 命名记为 CRISPR_KO。
+# 示例配置。必须用 --config 传入；程序不会默认加载它，也不会改写 organism。
+# CRISPR 模式按这份示例的命名记为 CRISPR_KO，不是流程默认假设。
 # guide 分隔符已从分配文件核实为 '|'；guide 名内部也含该字符，解析时按参考库最长匹配。
 # QC 阈值是该样本 log1p 尺度 median ± 3 MAD 的记录值，不是通用默认。
 document_version: '1.4'
