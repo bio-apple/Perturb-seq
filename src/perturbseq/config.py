@@ -47,7 +47,10 @@ class ConfigError(RuntimeError):
     """The run is not allowed to start."""
 
 
-_QC_CUTOFFS = ("min_umi", "max_umi", "min_genes", "max_mito_frac")
+# UMI and mito absolute cutoffs: all set on the CLI, or all derived by median ± MAD.
+_QC_CUTOFFS = ("min_umi", "max_umi", "max_mito_frac")
+# Expressed-gene bounds are software defaults (and optional CLI overrides), not MAD-derived.
+_GENE_CUTOFFS = ("min_genes", "max_genes")
 
 
 def software_config_path() -> Path:
@@ -127,6 +130,9 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
     provided = {key: customer.get(key) for key in _QC_CUTOFFS}
     if any(value is not None for value in provided.values()):
         qc.update(provided)
+    for key in _GENE_CUTOFFS:
+        if customer.get(key) is not None:
+            qc[key] = customer[key]
     if customer.get("max_ribo_frac") is not None:
         qc["max_ribo_frac"] = customer["max_ribo_frac"]
 
@@ -190,6 +196,7 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "min_umi": None,
         "max_umi": None,
         "min_genes": None,
+        "max_genes": None,
         "max_mito_frac": None,
         "max_ribo_frac": None,
         "mito_gene_prefix": None,
@@ -681,14 +688,16 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     if isinstance(n_mad, bool) or not isinstance(n_mad, int | float) or float(n_mad) <= 0:
         raise ConfigError("qc.n_mad 必须是正数。")
     qc["n_mad"] = float(n_mad)
+    _require_gene_cutoffs(qc)
     _optional_fraction(qc, "max_ribo_frac", "qc.max_ribo_frac")
     present = [key for key in _QC_CUTOFFS if qc.get(key) is not None]
     if not present:
         return
     if len(present) != len(_QC_CUTOFFS):
         raise ConfigError(
-            "命令行上的 --min-umi、--max-umi、--min-genes、--max-mito-frac 必须同时填写，"
+            "命令行上的 --min-umi、--max-umi、--max-mito-frac 必须同时填写，"
             "或者全部留空，留空时用 median ± qc.n_mad。"
+            "表达基因数上下限由 qc.min_genes / qc.max_genes 单独设置。"
         )
     for key in _QC_CUTOFFS:
         value = qc.get(key)
@@ -699,6 +708,19 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     mito = float(qc["max_mito_frac"])
     if not 0 <= mito <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")
+
+
+def _require_gene_cutoffs(qc: dict[str, Any]) -> None:
+    """Keep cells with min_genes < n_genes < max_genes (drop ≤ min or ≥ max)."""
+    for key in _GENE_CUTOFFS:
+        value = qc.get(key)
+        if value is None or isinstance(value, bool) or not isinstance(value, int | float):
+            raise ConfigError(f"qc.{key} 必须是数值。默认 min_genes=100、max_genes=6000。")
+        if float(value) < 0:
+            raise ConfigError(f"qc.{key} 不能为负。")
+        qc[key] = float(value)
+    if float(qc["min_genes"]) >= float(qc["max_genes"]):
+        raise ConfigError("qc.min_genes 必须小于 qc.max_genes。")
 
 
 def _optional_fraction(section: dict[str, Any], key: str, label: str) -> None:

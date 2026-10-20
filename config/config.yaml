@@ -26,7 +26,7 @@ mixscape:
   enabled: true
   min_de_genes: 5
   # RunMixscape / MixscapeHeatmap 的 logfc.threshold。教程调用没有改写，函数默认 0.25。
-  logfc_threshold: 0.25
+  logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
   # CalcPerturbSig：ndims=40，num.neighbors=20。矩阵比 40 小时才截断。
@@ -39,7 +39,7 @@ mixscape:
 # pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
 mixscale:
   min_de_genes: 5
-  logfc_threshold: 0.2
+  logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
 statistics:
