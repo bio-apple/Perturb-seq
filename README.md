@@ -1,6 +1,6 @@
 # Perturb-seq 单样本三级分析
 
-从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale、扰动距离和 Augur。一次运行一个生物学样本。
+从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 和扰动距离。一次运行一个生物学样本。
 
 文档索引见 [docs/README.md](docs/README.md)。
 
@@ -17,7 +17,7 @@ conda install -y -c conda-forge r-base=4.4.3
 Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org"); BiocManager::install(version = "3.20", ask = FALSE, update = FALSE); BiocManager::install(c("SingleR", "celldex"), version = "3.20", ask = FALSE, update = FALSE)'
 ```
 
-簇注释用 R 4.4.3 + Bioconductor 3.20 的 SingleR / celldex；`singler.enabled: false` 可跳过。celldex 首次下载参考与 Enrichr 需联网。
+簇注释用 R 4.4.3 + Bioconductor 3.20 的 SingleR / celldex；`singler.enabled: false` 可跳过。celldex 首次下载参考需联网。
 
 ## 最小运行示例
 
@@ -37,7 +37,7 @@ python -m perturbseq \
 ## 输出概览
 
 - `qc/`：mRNA / gRNA 统计
-- `DGE/`：Mixscape、Mixscale、描述性 log2FC、Augur、Enrichr
+- `DGE/`：Mixscape、Mixscale、描述性 log2FC
 - `UMAP/`：表达 UMAP、簇注释、细胞周期、Mixscape signature
 - `E-distance/`：对当前对照的能量距离
 - 根目录：`effect_main.tsv`、`effect_sensitivity.tsv`、`guide_effects.tsv`、`target_expression_effect.tsv`

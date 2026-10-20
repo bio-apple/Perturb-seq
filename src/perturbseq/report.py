@@ -17,14 +17,12 @@ from perturbseq.perturb_effect import perturbation_type
 from perturbseq.plotting import (
     FigureStore,
     draw_assignment_status,
-    draw_augur,
     draw_cells_per_guide,
     draw_cells_per_target,
     draw_cluster_annotation,
     draw_descriptive_heatmap,
     draw_distance_embedding,
     draw_distance_heatmap,
-    draw_enrichment,
     draw_grna_capture_library,
     draw_guide_consistency,
     draw_guides_per_cell,
@@ -177,11 +175,6 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
     distance = _read_matrix(output_dir / "perturbation_distance.tsv")
     draw_distance_heatmap(store, distance)
     draw_distance_embedding(store, _read(output_dir / "perturbation_embedding.tsv"))
-    draw_augur(store, _read(output_dir / "augur_scores.tsv"))
-    enrichment = _read(output_dir / "enrichment_results.tsv")
-    if enrichment.empty:
-        enrichment = _read(tables / "enrichment.tsv")
-    draw_enrichment(store, enrichment)
     summary = _read(output_dir / "qc_summary.tsv")
     if not summary.empty:
         summary["n_significant_de_genes"] = pd.NA
@@ -252,9 +245,23 @@ def _draw_cell_cycle(output_dir: Path, adata: AnnData | None, config: dict[str, 
             return
     if "phase" not in adata.obs.columns:
         return
+    spec = control_spec(config)
+    control_label = str(spec["control_label"])
+    if spec["temporary"]:
+        control_values = (control_label,)
+        control_title = "zero-guide cells"
+    else:
+        control_values = tuple(
+            dict.fromkeys(
+                value for value in ("nt", control_label) if value and value not in {"nan", "None"}
+            )
+        )
+        control_title = "NT"
     draw_nt_perturbed_cell_cycle_umap(
         adata,
         output_dir,
+        control_values=control_values,
+        control_title=control_title,
         dpi=int(config.get("plotting", {}).get("dpi", 300)),
     )
 
@@ -320,16 +327,6 @@ def _build_summary(output_dir: Path, config: dict[str, Any]) -> pd.DataFrame:
             on="target_gene",
             how="left",
         )
-    augur = _read(output_dir / "augur_scores.tsv")
-    if (
-        not augur.empty
-        and {"target_gene", "auc"}.issubset(augur.columns)
-        and not augur["target_gene"].duplicated().any()
-    ):
-        columns = ["target_gene", "auc"]
-        if "auc_sd" in augur.columns:
-            columns.append("auc_sd")
-        summary = summary.merge(augur[columns], on="target_gene", how="left")
     statistics = config.get("statistics", {})
     if isinstance(statistics, dict) and "fdr_threshold" in statistics:
         summary["fdr_threshold"] = float(statistics["fdr_threshold"])

@@ -253,24 +253,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "min_nt_mean_cpm": None,
         "direction_log2fc_tolerance": None,
     },
-    "augur": {
-        "classifier": None,
-        "n_folds": None,
-        "n_subsamples": None,
-        "subsample_size": None,
-        "n_estimators": None,
-        "feature_perc": None,
-        "n_threads": None,
-        "branch": None,
-        "select_variance_features": None,
-    },
-    "enrichment": {
-        "enabled": None,
-        "database": None,
-        "gene_sets": None,
-        "min_genes": None,
-        "max_targets": None,
-    },
     "singler": {"enabled": None},
     "plotting": {
         "formats": None,
@@ -285,7 +267,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "scatter_max_points": None,
         "volcano_lfc": None,
         "heatmap_max_genes": None,
-        "enrichment_top_n": None,
         "save_plot_data": None,
         "palette": _ANY_KEYS,
     },
@@ -379,19 +360,10 @@ def validate_config(config: dict[str, Any]) -> None:
     _section(config, "perturb")
     statistics = config.setdefault("statistics", {"mode": "descriptive"})
     _validate_statistics(statistics)
-    _section(config, "augur")
     _section(config, "plotting")
     seed = config["runtime"].get("seed", 0)
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ConfigError("随机种子必须是整数。")
-
-    augur = config["augur"]
-    classifier = augur.get("classifier", "random_forest")
-    if classifier not in {"random_forest", "logistic_regression"}:
-        raise ConfigError("augur.classifier 只能是 random_forest 或 logistic_regression。")
-    folds = augur.get("n_folds", 5)
-    if not isinstance(folds, int) or isinstance(folds, bool) or folds < 2:
-        raise ConfigError("augur.n_folds 必须是不小于 2 的整数。")
 
 
 def resolve_input_paths(config: dict[str, Any]) -> dict[str, Path]:
@@ -716,7 +688,7 @@ def _require_gene_cutoffs(qc: dict[str, Any]) -> None:
     for key in _GENE_CUTOFFS:
         value = qc.get(key)
         if value is None or isinstance(value, bool) or not isinstance(value, int | float):
-            raise ConfigError(f"qc.{key} 必须是数值。默认 min_genes=100、max_genes=6000。")
+            raise ConfigError(f"qc.{key} 必须是数值。默认 min_genes=200、max_genes=6000。")
         if float(value) < 0:
             raise ConfigError(f"qc.{key} 不能为负。")
         qc[key] = float(value)

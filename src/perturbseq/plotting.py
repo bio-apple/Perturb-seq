@@ -65,8 +65,6 @@ _DGE_FIGURES = frozenset(
         "guide_consistency",
         "pseudobulk_library_size",
         "pseudobulk_pca",
-        "augur_score_bar",
-        "enrichment_dotplot",
         "perturbation_summary",
     }
 )
@@ -134,18 +132,17 @@ class FigureStore:
     ) -> None:
         folder = self.figure_dir(name, section)
         folder.mkdir(parents=True, exist_ok=True)
-        figure.text(0.01, 0.005, self._caption(method), fontsize=7, ha="left", va="bottom")
         if getattr(figure, "perturbseq_manual_layout", False):
             figure.subplots_adjust(left=0.22, right=0.9, bottom=0.14, top=0.96)
         else:
-            figure.tight_layout(rect=(0, 0.05, 1, 1))
+            figure.tight_layout()
         path = folder / f"{name}.png"
         figure.savefig(path, dpi=int(self.plotting["dpi"]), bbox_inches="tight")
         if path.stat().st_size <= 0:
             raise RuntimeError(f"图文件为空: {path}")
-        stale_pdf = folder / f"{name}.pdf"
-        if stale_pdf.exists():
-            stale_pdf.unlink()
+        for stale in (folder / f"{name}.pdf", folder / f"{name}.txt"):
+            if stale.exists():
+                stale.unlink()
         plt.close(figure)
         data_folder = self.data_dir(name, section)
         data_folder.mkdir(parents=True, exist_ok=True)
@@ -168,6 +165,7 @@ class FigureStore:
                 "branch": "UMAP" if bucket == "umap" else section,
                 "status": "written",
                 "reason": "",
+                "method": method,
                 "data_path": data_path,
                 "png_path": str(path),
                 "pdf_path": "",
@@ -223,11 +221,6 @@ class FigureStore:
 
     def write_manifest(self, path: Path) -> None:
         pd.DataFrame(self.manifest).to_csv(path, sep="\t", index=False)
-
-    def _caption(self, method: str) -> str:
-        parts = [f"{key}={value}" for key, value in self.context.items()]
-        parts.append(f"method={method}")
-        return "; ".join(parts)
 
     def _figure(
         self, width: float | None = None, height: float | None = None
@@ -1066,22 +1059,6 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
         "one SingleR label per Leiden cluster; obs['cell_type'] unchanged"
     )
     store.save(figure, name, "plot", summary, method)
-    note = store.figure_dir(name, "plot") / f"{name}.txt"
-    note.parent.mkdir(parents=True, exist_ok=True)
-    note.write_text(
-        "\n".join(
-            [
-                f"聚类：Leiden，igraph，resolution = {resolution_text}",
-                (
-                    f"细胞注释：{SINGLER_IMPLEMENTATION} {version}，参考 {reference_name}，"
-                    f"标签字段 {label_field}。"
-                ),
-                "先按 Leiden 簇对 log 归一化表达取平均，再对每个簇做 SingleR。",
-                "标签写入 obs['singler_label']。不修改 obs['cell_type']。",
-                "",
-            ]
-        )
-    )
 
 
 def draw_qc_scatter(
@@ -1590,99 +1567,6 @@ def draw_distance_embedding(store: FigureStore, embedding: pd.DataFrame) -> None
     )
 
 
-def draw_augur(store: FigureStore, scores: pd.DataFrame) -> None:
-    if scores.empty or "auc" not in scores.columns:
-        store.skip("augur_score_bar", "missing_fields")
-        return
-    tested = scores.dropna(subset=["auc"]).sort_values("auc", ascending=False)
-    if tested.empty:
-        store.skip("augur_score_bar", "insufficient_cells")
-        return
-    figure, axis = store._figure(width=max(8, min(24, 0.12 * len(tested))))
-    x = np.arange(len(tested))
-    axis.bar(x, tested["auc"], color=store.palette("targeting"))
-    if "auc_sd" in tested and tested["auc_sd"].notna().any():
-        axis.errorbar(
-            x, tested["auc"], yerr=tested["auc_sd"], fmt="none", ecolor="black", elinewidth=0.6
-        )
-    axis.axhline(0.5, color="black", linestyle="--")
-    if len(tested) <= 40:
-        if "cell_type" in tested.columns and tested["cell_type"].astype(str).nunique() > 1:
-            tick = tested["target_gene"].astype(str) + "|" + tested["cell_type"].astype(str)
-        else:
-            tick = tested["target_gene"].astype(str)
-        axis.set_xticks(x, tick, rotation=90)
-    else:
-        axis.set_xticks([])
-    axis.set_ylabel("AUC")
-    store.save(
-        figure,
-        "augur_score_bar",
-        "summary",
-        scores,
-        "Augur AUC is label separability, not editing efficiency",
-    )
-
-
-def draw_enrichment(store: FigureStore, enrichment: pd.DataFrame) -> None:
-    top_n = int(store.plotting["enrichment_top_n"])
-    if (
-        enrichment.empty
-        or "direction" not in enrichment.columns
-        or "term" not in enrichment.columns
-    ):
-        store.skip("enrichment_dotplot", "no_candidate_genes")
-        return
-    tested = (
-        enrichment[enrichment["reason"] == "tested"]
-        if "reason" in enrichment.columns
-        else enrichment
-    )
-    fdr_column = "enrichment_fdr" if "enrichment_fdr" in tested.columns else "fdr"
-    if fdr_column not in tested.columns:
-        store.skip("enrichment_dotplot", "no_candidate_genes")
-        return
-    tested = tested.copy()
-    tested["adjusted_p"] = pd.to_numeric(tested[fdr_column], errors="coerce")
-    tested = tested.dropna(subset=["adjusted_p"])
-    if tested.empty:
-        store.skip("enrichment_dotplot", "no_candidate_genes")
-        return
-    best = tested.sort_values("adjusted_p").groupby(["direction", "term"], sort=False).head(1)
-    frames = []
-    for direction in ("up", "down"):
-        part = best[best["direction"] == direction].nsmallest(top_n, "adjusted_p")
-        frames.append(part)
-    shown = pd.concat(frames, ignore_index=True)
-    if shown.empty:
-        store.skip("enrichment_dotplot", "no_candidate_genes")
-        return
-    figure, axes = plt.subplots(1, 2, figsize=(14, 6))
-    for axis, direction in zip(axes, ("up", "down"), strict=True):
-        part = shown[shown["direction"] == direction]
-        if part.empty:
-            axis.set_axis_off()
-            continue
-        axis.scatter(
-            part["adjusted_p"],
-            np.arange(len(part)),
-            s=20 + part["overlap"].to_numpy(dtype=float) * 8,
-            c=-np.log10(part["adjusted_p"].clip(lower=1e-300)),
-        )
-        axis.set_yticks(np.arange(len(part)), part["term"].astype(str))
-        axis.set_xlabel("Enrichr adjusted P")
-        axis.set_title(f"{direction}; not a replicate test")
-    store.save(
-        figure,
-        "enrichment_dotplot",
-        "summary",
-        shown,
-        "Enrichr overrepresentation of genes with |descriptive CPM log2FC| at or above "
-        "volcano_lfc; adjusted P is a gene-set statistic on that fixed list, not a "
-        "biological-replicate FDR; power is not estimable from one sample",
-    )
-
-
 def draw_summary(store: FigureStore, summary: pd.DataFrame) -> None:
     metrics = [
         column
@@ -1692,7 +1576,6 @@ def draw_summary(store: FigureStore, summary: pd.DataFrame) -> None:
             "fraction_perturbed",
             "effect_log1p",
             "n_significant",
-            "auc",
         )
         if column in summary.columns
         and pd.to_numeric(summary[column], errors="coerce").notna().any()
@@ -2324,12 +2207,11 @@ def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> 
     hits = set(table.loc[table["target_in_de"].astype(bool), "target_gene"].astype(str))
     keep = {f"{_safe(target)}_mixscape_2x2" for target in hits}
     for stem in keep:
-        for suffix in (".png", ".txt"):
-            src = source / f"{stem}{suffix}"
-            if src.exists():
-                shutil.copy2(src, destination / src.name)
+        src = source / f"{stem}.png"
+        if src.exists():
+            shutil.copy2(src, destination / src.name)
     for path in destination.glob("*_mixscape_2x2.*"):
-        if path.stem not in keep:
+        if path.suffix != ".png" or path.stem not in keep:
             path.unlink()
     return table
 
@@ -2401,21 +2283,6 @@ def target_de_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
     return figure, frame
 
 
-def target_de_count_note(control: str, min_de_genes: int = 5) -> str:
-    return (
-        "口径\n"
-        "靶基因总数 = 分析里出现的 targeting 靶基因数，"
-        f"不含 NT / {control}。\n"
-        "有差异表达基因 = 按 Mixscape 门槛筛完后，差异基因数 ≥ "
-        f"min_de_genes（{min_de_genes}）的靶基因。"
-        "门槛：min_de_genes=5，logfc_threshold=0.25，pval_cutoff=0.05，max_de_genes=100。"
-        "不够 5 个的不算「存在差异表达基因」。\n"
-        "差异基因包含对应靶基因 = 上一类的子集："
-        "该靶基因自己的 symbol 精确出现在它的差异基因名单里。\n"
-        "柱子顺序：靶基因总数；有差异表达基因的靶基因；差异基因包含对应靶基因。\n"
-    )
-
-
 def draw_target_de_counts(
     store: FigureStore, adata: AnnData, *, control: str, min_de_genes: int = 5
 ) -> None:
@@ -2435,9 +2302,6 @@ def draw_target_de_counts(
         frame,
         "three target-DE counts; integer labels; blue bars; no flag line",
     )
-    sidecar = store.figure_dir(name, "plot") / "target_de_counts.txt"
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(target_de_count_note(control, min_de_genes))
 
 
 def target_in_de_gene_count_table(
@@ -2498,28 +2362,6 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
     return figure, frame
 
 
-def target_in_de_gene_count_note(control: str, min_de_genes: int = 5) -> str:
-    excluded: list[str] = []
-    for label in (str(control), "zero_guide"):
-        if label and label not in excluded:
-            excluded.append(label)
-    return (
-        "口径\n"
-        "只画同时满足下面两条的靶基因，每根柱是一个靶基因。\n"
-        "1. 有差异基因：n_de_genes ≥ "
-        f"min_de_genes（{min_de_genes}）。"
-        "一条基因算差异基因，当 abs(log fold change) ≥ logfc_threshold "
-        "且 BH 校正后的 adj_p < 0.05。"
-        "n_de_genes 是完整计数，不按 max_de_genes 截断。\n"
-        "2. 差异基因名单包含该靶基因：该靶基因的 symbol 与名单里的基因名完全一致"
-        "（区分大小写，不是子串匹配）。"
-        "名单是打分时保存的差异基因，按 raw p 排序，长度不超过 max_de_genes。\n"
-        f"不含 {' / '.join(excluded)}。\n"
-        "柱高和柱顶整数都是未截断的 n_de_genes，不是截断后的名单长度。\n"
-        "按 n_de_genes 从高到低排列。\n"
-    )
-
-
 def draw_target_in_de_gene_counts(
     store: FigureStore, adata: AnnData, *, control: str, min_de_genes: int = 5
 ) -> None:
@@ -2542,9 +2384,6 @@ def draw_target_in_de_gene_counts(
         frame,
         "targets whose stored DE list contains their own symbol; label is full n_de_genes",
     )
-    sidecar = store.figure_dir(name, "plot") / f"{name}.txt"
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(target_in_de_gene_count_note(control, min_de_genes))
 
 
 _EXCLUDED_TARGET_LABELS = {"", "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA"}
@@ -2645,22 +2484,6 @@ def target_cell_count_bars(table: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
     return figure, drawn
 
 
-def target_cell_count_note(summary: dict[str, int], *, source: str) -> str:
-    return (
-        "口径\n"
-        "细胞数 = 该靶基因的 single targeting 细胞数：一个细胞恰好 1 条 guide，"
-        "并且分配到这个靶基因。\n"
-        "不含配置里的对照标签，不含 no_guide，不含 multi_guide。\n"
-        "细胞数为 0 的靶基因不画柱，数量写在图上。\n"
-        "细胞数 ≥ 20 与细胞数 ≥ 40 分别计数；≥ 40 是 ≥ 20 的子集，不是互斥区间。\n"
-        "柱按细胞数从高到低排列。靶基因过多时不标注每个基因名。\n"
-        f"来源：{source}\n"
-        f"细胞数 = 0 的靶基因：{summary['n_targets_zero']}\n"
-        f"细胞数 ≥ 20 的靶基因：{summary['n_targets_ge_20']}\n"
-        f"细胞数 ≥ 40 的靶基因：{summary['n_targets_ge_40']}\n"
-    )
-
-
 def draw_target_cell_counts(
     store: FigureStore,
     table: pd.DataFrame,
@@ -2668,16 +2491,16 @@ def draw_target_cell_counts(
     source: str,
 ) -> dict[str, int]:
     summary = target_cell_count_summary(table)
+    summary["source"] = source
     figure, _drawn = target_cell_count_bars(table)
     folder = store.figure_dir("target_cell_counts", "qc")
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "target_cell_counts.png"
     figure.savefig(path, dpi=int(store.plotting.get("dpi", 300)), bbox_inches="tight")
     plt.close(figure)
-    stale = path.with_suffix(".pdf")
-    if stale.exists():
-        stale.unlink()
-    (folder / "target_cell_counts.txt").write_text(target_cell_count_note(summary, source=source))
+    for stale in (path.with_suffix(".pdf"), path.with_suffix(".txt")):
+        if stale.exists():
+            stale.unlink()
     counts = store.data_dir("target_cell_counts")
     counts.mkdir(parents=True, exist_ok=True)
     table.to_csv(counts / "target_cell_counts.tsv", sep="\t", index=False)
@@ -2729,26 +2552,10 @@ def log2fc_bar_figure(genes: pd.DataFrame) -> Figure:
     return figure
 
 
-def target_log2fc_note(target: str, genes: pd.DataFrame, *, definition: str) -> str:
-    listed = ", ".join(
-        f"{record.gene_symbol}:{record.log2fc:.4g}" for record in genes.itertuples(index=False)
-    )
-    return (
-        f"target={target}\n"
-        f"log2fc={definition}\n"
-        "layout=pertpy plot_fold_change; n_top_vars=15 up and 15 down; "
-        "target symbol is always included; genes ordered by log2FC descending\n"
-        "y=Log2 fold change\n"
-        f"genes={listed}\n"
-    )
-
-
 def save_target_log2fc_bar(
     folder: Path,
     target: str,
     genes: pd.DataFrame,
-    *,
-    definition: str,
 ) -> Path:
     selected = log2fc_bar_genes(genes, target, n_top=15)
     figure = log2fc_bar_figure(selected)
@@ -2756,10 +2563,9 @@ def save_target_log2fc_bar(
     path = folder / f"{_safe(target)}_log2fc.png"
     figure.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(figure)
-    stale = path.with_suffix(".pdf")
-    if stale.exists():
-        stale.unlink()
-    path.with_suffix(".txt").write_text(target_log2fc_note(target, selected, definition=definition))
+    for stale in (path.with_suffix(".pdf"), path.with_suffix(".txt")):
+        if stale.exists():
+            stale.unlink()
     return path
 
 
@@ -2940,28 +2746,17 @@ def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> Non
     axis.set_ylim(-0.2, len(identities))
     table = pd.DataFrame(rows)
     skipped = _skipped_de_targets(adata)
+    skipped_text = ",".join(skipped) if skipped else "none"
+    unscored_passed = sorted(set(passed) - set(identities))
+    unscored_text = ",".join(unscored_passed) if unscored_passed else "none"
     store.save(
         figure,
         name,
         "mixscale",
         table,
         "Mixscale ridge of targets that passed the DE gate; "
-        "score is perturbation strength, not editing success; no legend",
-    )
-    sidecar = store.figure_dir(name, "mixscale") / "mixscale_score_ridge.txt"
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    skipped_text = ",".join(skipped) if skipped else "none"
-    unscored_passed = sorted(set(passed) - set(identities))
-    unscored_text = ",".join(unscored_passed) if unscored_passed else "none"
-    sidecar.write_text(
-        f"n_cells={int(finite.size)}\n"
-        f"n_identities={len(identities)}\n"
-        f"control={control}\n"
-        f"skipped_targets={skipped_text}\n"
-        f"unscored_passed_targets={unscored_text}\n"
-        "omitted_reason=not enough DE genes; a score without a passed DE gate is not drawn\n"
-        "unscored_passed_reason=expression DE gate passed, but fewer than min_de_genes "
-        "could be projected, so no score is drawn\n"
+        "score is perturbation strength, not editing success; no legend; "
+        f"skipped_targets={skipped_text}; unscored_passed_targets={unscored_text}",
     )
 
 
@@ -3122,31 +2917,13 @@ def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin
         "mixscale",
         table,
         "Mixscale_ScatterPlot; quantile bins of mixscale_score within each target; "
-        "NT excluded; y is that target gene's own log-normalized expression; no legend",
-    )
-    sidecar = store.figure_dir(name, "mixscale") / f"{name}.txt"
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(
-        f"n_targets={len(genes)}\n"
-        f"nbin={nbin}\n"
-        f"control={control}\n"
-        "nt_in_facets=false\n"
-        "binning=within each target, quantile bins of finite mixscale_score "
-        "(R quantile type 7, probs=seq(0, 1, 1/nbin)); "
-        "each bin is a closed interval, so a score on a cutoff is counted in both "
-        "adjacent bins; NT cells are excluded before binning\n"
-        "y=mean log-normalized expression of the target gene itself "
-        "(adata.X, Seurat RNA data slot)\n"
-        "y_axis_symbol_rule=exact gene_symbol or var name first; if both miss, "
-        "exactly one case-insensitive gene_symbol is used; two symbols that differ "
-        "only by case stay missing; DE-list membership is not changed and stays "
-        "case-sensitive\n"
-        f"case_insensitive_y={','.join(case_insensitive) or 'none'}\n"
-        f"omitted_failed_de={','.join(sorted(set(failed))) or 'none'}\n"
-        f"omitted_fallback_score={','.join(fallback) or 'none'}\n"
-        f"omitted_no_finite_score={','.join(unscored) or 'none'}\n"
-        f"omitted_missing_gene={','.join(missing) or 'none'}\n"
-        "fallback_rule=a target whose finite mixscale scores are all 1 is omitted\n"
+        "NT excluded; y is that target gene's own log-normalized expression; no legend; "
+        f"n_targets={len(genes)}; nbin={nbin}; control={control}; "
+        f"case_insensitive_y={','.join(case_insensitive) or 'none'}; "
+        f"omitted_failed_de={','.join(sorted(set(failed))) or 'none'}; "
+        f"omitted_fallback_score={','.join(fallback) or 'none'}; "
+        f"omitted_no_finite_score={','.join(unscored) or 'none'}; "
+        f"omitted_missing_gene={','.join(missing) or 'none'}",
     )
 
 
@@ -3369,18 +3146,19 @@ def draw_nt_perturbed_cell_cycle_umap(
     status_column: str = "perturbation_status",
     phase_column: str = "phase",
     embedding: str = "X_umap",
-    nt_values: tuple[str, ...] = ("nt",),
+    control_values: tuple[str, ...] | None = None,
+    control_title: str | None = None,
+    nt_values: tuple[str, ...] | None = None,
     perturbed_values: tuple[str, ...] = ("targeting",),
     point_size: float = 3.0,
     dpi: int = 300,
 ) -> dict[str, Any]:
-    """Draw Perturbed, NT, and cell-cycle panels on one shared UMAP.
+    """Draw Perturbed, control, and cell-cycle panels on one shared UMAP.
 
-    Order is left to right: Perturbed, Perturbation Status (NT), Cell Cycle
-    Phase. ``perturbed_values`` selects the Perturbed panel. Mixscape
-    ``non_perturbed`` is not included unless the caller puts that label in
-    ``perturbed_values``. The PNG and its sidecar txt are written under
-    ``output_dir/UMAP/figures/``.
+    Order is left to right: Perturbed, Perturbation Status (designed NT or
+    zero-guide cells), Cell Cycle Phase. ``control_values`` selects the middle
+    panel; when omitted, ``nt_values`` is used, then ``("nt",)``. Designed NT
+    and temporary zero-guide controls both use this middle panel.
     """
     output_dir = Path(output_dir)
     output_path = output_dir / "UMAP" / "figures" / "umap_nt_perturbed_cell_cycle.png"
@@ -3392,6 +3170,17 @@ def draw_nt_perturbed_cell_cycle_umap(
         raise ValueError(f"缺少列 {status_column}")
     if phase_column not in adata.obs:
         raise ValueError(f"缺少列 {phase_column}")
+    if control_values is None:
+        control_values = nt_values if nt_values is not None else ("nt",)
+    if not control_values:
+        raise ValueError("对照面板缺少 control_values。")
+    if control_title is None:
+        if set(control_values) == {ZERO_GUIDE_LABEL}:
+            control_title = "zero-guide cells"
+        elif set(control_values) <= {"nt", ZERO_GUIDE_LABEL}:
+            control_title = "NT / zero-guide"
+        else:
+            control_title = "NT" if set(control_values) == {"nt"} else " / ".join(control_values)
     coordinates = np.asarray(adata.obsm[embedding], dtype=float)
     if coordinates.ndim != 2 or coordinates.shape[1] != 2 or coordinates.shape[0] != adata.n_obs:
         raise ValueError(f"{embedding} 必须是 n_obs x 2")
@@ -3400,9 +3189,9 @@ def draw_nt_perturbed_cell_cycle_umap(
 
     status = adata.obs[status_column].astype(str)
     phase = adata.obs[phase_column].astype(str)
-    nt_mask = status.isin(nt_values).to_numpy()
+    control_mask = status.isin(control_values).to_numpy()
     perturbed_mask = status.isin(perturbed_values).to_numpy()
-    omitted = ~(nt_mask | perturbed_mask)
+    omitted = ~(control_mask | perturbed_mask)
     phase_known = phase.isin(["G1", "G2M", "S"]).to_numpy()
 
     x_span = float(np.max(coordinates[:, 0]) - np.min(coordinates[:, 0])) or 1.0
@@ -3418,19 +3207,19 @@ def draw_nt_perturbed_cell_cycle_umap(
 
     figure, axes = plt.subplots(1, 3, figsize=(16.8, 5.2))
     figure.patch.set_facecolor("white")
-    perturbed_axis, nt_axis, cycle_axis = axes
-    for axis in (perturbed_axis, nt_axis, cycle_axis):
+    perturbed_axis, control_axis, cycle_axis = axes
+    for axis in (perturbed_axis, control_axis, cycle_axis):
         _prepare_umap_axis(axis, xlim, ylim)
 
-    nt_axis.scatter(
-        coordinates[nt_mask, 0],
-        coordinates[nt_mask, 1],
+    control_axis.scatter(
+        coordinates[control_mask, 0],
+        coordinates[control_mask, 1],
         c=_NT_COLOR,
         s=point_size,
         linewidths=0,
         rasterized=True,
     )
-    nt_axis.set_title("Perturbation Status\nNT", fontsize=14, pad=8)
+    control_axis.set_title(f"Perturbation Status\n{control_title}", fontsize=14, pad=8)
     perturbed_axis.scatter(
         coordinates[perturbed_mask, 0],
         coordinates[perturbed_mask, 1],
@@ -3469,39 +3258,22 @@ def draw_nt_perturbed_cell_cycle_umap(
     omitted_counts = status[omitted].value_counts().astype(int).to_dict()
     summary = {
         "n_cells": int(adata.n_obs),
-        "n_nt": int(nt_mask.sum()),
+        "n_control": int(control_mask.sum()),
+        "n_nt": int(control_mask.sum()),
         "n_perturbed": int(perturbed_mask.sum()),
         "n_status_omitted": int(omitted.sum()),
         "omitted_status_counts": {str(key): int(value) for key, value in omitted_counts.items()},
         "n_phase_omitted": int((~phase_known).sum()),
         "phase_counts": {label: int((phase == label).sum()) for label in ("G1", "G2M", "S")},
         "status_column": status_column,
-        "nt_values": list(nt_values),
+        "control_values": list(control_values),
+        "control_title": control_title,
+        "nt_values": list(control_values),
         "perturbed_values": list(perturbed_values),
         "png_path": str(output_path),
         "panel_order": ["Perturbed", "Perturbation Status", "Cell Cycle Phase"],
     }
-    note = output_path.with_suffix(".txt")
-    omitted_text = (
-        ", ".join(f"{key}={value}" for key, value in summary["omitted_status_counts"].items())
-        or "无"
-    )
-    note.write_text(
-        "\n".join(
-            [
-                "panel_order: Perturbed, Perturbation Status (NT), Cell Cycle Phase",
-                f"嵌入: obsm['{embedding}']",
-                f"NT 面板: {status_column} in {list(nt_values)}",
-                (f"Perturbed 面板: {status_column} in {list(perturbed_values)}，不是 Mixscape NP"),
-                f"细胞数: {summary['n_cells']}",
-                f"NT: {summary['n_nt']}",
-                f"Perturbed: {summary['n_perturbed']}",
-                f"省略: {summary['n_status_omitted']} ({omitted_text})",
-                f"细胞周期: {summary['phase_counts']}",
-                f"png: {output_path}",
-                "",
-            ]
-        )
-    )
-    summary["txt_path"] = str(note)
+    stale_txt = output_path.with_suffix(".txt")
+    if stale_txt.exists():
+        stale_txt.unlink()
     return summary

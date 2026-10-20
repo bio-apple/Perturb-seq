@@ -48,7 +48,6 @@ from perturbseq.config import (
     verify_species_consistency,
 )
 from perturbseq.distance_tests import write_edistance_results
-from perturbseq.enrichment import enrich_perturbations
 from perturbseq.io import (
     InputMismatch,
     load_sample,
@@ -68,9 +67,8 @@ from perturbseq.perturb_effect import (
 )
 from perturbseq.preprocess import preprocess
 from perturbseq.report import write_report
-from perturbseq.responsiveness import run_augur
 
-STEPS = ["io", "assign", "preprocess", "perturb", "augur", "enrich", "report"]
+STEPS = ["io", "assign", "preprocess", "perturb", "report"]
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -85,7 +83,6 @@ PACKAGES = [
     "seaborn",
     "statsmodels",
     "PyYAML",
-    "gseapy",
 ]
 
 
@@ -123,7 +120,7 @@ def main(argv: list[str] | None = None) -> None:
         "--min-genes",
         type=float,
         default=None,
-        help="表达基因数下限。细胞 n_genes ≤ 该值时剔除。默认读配置（100）。",
+        help="表达基因数下限。细胞 n_genes ≤ 该值时剔除。默认读配置（200）。",
     )
     parser.add_argument(
         "--max-genes",
@@ -242,16 +239,6 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
         elif step == "perturb":
             state["adata"] = _require(state, folder, "preprocess")
             state["adata"] = _step_perturb(folder, config, state["adata"])
-        elif step == "augur":
-            state["adata"] = _require(state, folder, "perturb")
-            scores = run_augur(state["adata"], config)
-            scores.to_csv(folder / "augur_scores.tsv", sep="\t", index=False)
-            _write_h5ad(state["adata"], folder / "checkpoints" / "augur.h5ad")
-        elif step == "enrich":
-            effects = _read_table(folder / "effect_main.tsv")
-            enrichment, reason = enrich_perturbations(effects, config)
-            enrichment.to_csv(folder / "enrichment_results.tsv", sep="\t", index=False)
-            (folder / "tables" / "enrichment_status.txt").write_text(reason + "\n")
         elif step == "report":
             state["adata"] = (
                 state["adata"] if state["adata"] is not None else _load_resume(folder, "report")
@@ -826,12 +813,6 @@ def _refresh_mixscape_ledger(folder: Path, adata) -> None:
     ledger.to_csv(path, sep="\t", index=False)
 
 
-def _read_table(path: Path) -> pd.DataFrame:
-    if not path.exists() or path.stat().st_size == 0:
-        return pd.DataFrame()
-    return pd.read_csv(path, sep="\t")
-
-
 def _note_untested_targets(notes: pd.DataFrame, adata, control: str) -> pd.DataFrame:
     """Targets with too few perturbed guide replicates never enter the model."""
     present = (
@@ -874,16 +855,13 @@ def _load_resume(folder: Path, step: str):
         "assign": "io",
         "preprocess": "assign",
         "perturb": "preprocess",
-        "augur": "perturb",
-        "enrich": "perturb",
-        "report": "augur",
+        "report": "perturb",
     }
     if step not in previous:
         return None
     path = folder / "checkpoints" / f"{previous[step]}.h5ad"
     fallback = {
-        "report": ["augur.h5ad", "perturb.h5ad", "preprocess.h5ad", "assign.h5ad"],
-        "enrich": ["perturb.h5ad"],
+        "report": ["perturb.h5ad", "preprocess.h5ad", "assign.h5ad"],
     }
     candidates = (
         [path]

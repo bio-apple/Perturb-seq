@@ -9,7 +9,7 @@
 1. [目录结构](#目录结构)
 2. [跳过文件写在哪](#跳过文件写在哪)
 3. [校验与分配](#校验与分配)
-4. [预处理、效应、距离、富集](#预处理效应距离富集)
+4. [预处理、效应、距离](#预处理效应距离)
 5. [report 图](#report-图)
 
 ---
@@ -19,7 +19,7 @@
 | 目录 | 内容 |
 | --- | --- |
 | `qc/` | mRNA / gRNA 统计（`figures`、`tables`） |
-| `DGE/` | Mixscape、Mixscale、描述性 log2FC、Augur、Enrichr（`figures/<section>`、`tables`、`plot_data`） |
+| `DGE/` | Mixscape、Mixscale、描述性 log2FC（`figures/<section>`、`tables`、`plot_data`） |
 | `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
 | `E-distance/` | 对当前对照的 E-test；guide 伪批量距离热图 / MDS |
 | 输出根目录 | 效应表、checkpoint、`adata_processed.h5ad`、`resolved_config.yaml`、`run_info.json` |
@@ -51,7 +51,7 @@
 | `barcode_differences.tsv`、`input_validation.json` | `io` / `--validate-only` | 集合一致时差异表仅表头 |
 | `tables/guide_reference_conflicts.tsv` | 参考表冲突 | 参考表通过 |
 | `tables/cell_calls.tsv`、`io_checks.json`、`multi_guide_composition.tsv`、`checkpoints/io.h5ad` | `io` 通过 | assignment-only 时提前退出 |
-| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI、mito≥20%、表达基因数 100–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
+| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI、mito≥20%、表达基因数 200–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
 | `qc/tables/qc_metrics.tsv` | UMI、基因数、mito、ribo、guide UMI、捕获效率 | 同上 |
 | `qc/tables/grna_capture_library_correlation.tsv` | Spearman；含低文库排除是否执行 | 缺列 / 细胞 < 2 / 方差 0 |
 | `qc/tables/assignment_summary.tsv` | 四类分配计数 | 同上 |
@@ -63,7 +63,7 @@
 
 ---
 
-## 预处理、效应、距离、富集
+## 预处理、效应、距离
 
 | 路径 | 何时有 | 何时缺 |
 | --- | --- | --- |
@@ -77,8 +77,6 @@
 | `pseudobulk/guide_metadata.tsv`、`guide_counts.h5ad` | 按 `guide_id` 加总 | 无 guide |
 | `E-distance/tables/edistance_etest.tsv`、图 | 对当前对照的 E-test（`X_pca`，细胞置换） | `no_zero_guide_cells` / `missing_X_pca` |
 | `perturbation_distance.tsv`、`perturbation_embedding.tsv` | 需已配置 `perturb.min_guide_replicates` | `min_guide_replicates_not_set` / `insufficient_cells` |
-| `augur_scores.tsv`、`checkpoints/augur.h5ad` | Augur | 细胞不足为失败行 |
-| `enrichment_results.tsv`、`tables/enrichment_status.txt` | Enrichr（需联网） | `disabled` / 无基因 / `enrichr_failed` 等 |
 | `qc_summary.tsv`、`perturbation_summary.tsv`、`plot_manifest.tsv`、`adata_processed.h5ad` | `report` 完成；`n_significant_de_genes` 为 NA | 无 `cells_per_target` 时摘要空 |
 
 效应表 bootstrap 列与重抽样规则见 [analysis.md § 统计](analysis.md#统计)。
@@ -86,6 +84,8 @@
 ---
 
 ## report 图
+
+图目录只写 PNG；不写同名 `.txt`。方法说明在 `plot_manifest.tsv` 的 `method` 列。跳过原因仍写在 `*.skipped.txt`（tables / plot_data）。
 
 ### QC
 
@@ -111,7 +111,7 @@
 | `umap_assignment` / `umap_target` / `umap_status` / `umap_mixscape_class` / `umap_leiden` | 表达 UMAP | 无 `X_umap` 或列 |
 | `umap_cell_type.png` | 真实细胞类型 | 仅 `ALL` → `unstratified_cell_type` |
 | `umap_cluster_annotation.png` | Leiden + SingleR（需 R / celldex，首次下载需联网） | `singler_disabled`；无 leiden；无 Rscript |
-| `umap_nt_perturbed_cell_cycle.png` | Perturbed / Status / Phase（scib human/mouse） | 缺基因 / 无 scib / 无 phase |
+| `umap_nt_perturbed_cell_cycle.png` | Perturbed / 对照（设计 NT 或 zero-guide cells）/ Phase（scib human/mouse） | 缺基因 / 无 scib / 无 phase |
 | `umap_mixscape.png` | signature 空间 | `signature_umap_not_run`；非有限坐标 |
 | `umap_mixscape_class_global.png` | 已分类细胞 | 无有限坐标或已分类细胞 |
 
@@ -133,8 +133,6 @@
 | `DGE/plot_data/volcano.skipped.txt` | `inference_not_available` | 单样本不画单独火山图 |
 | `plot_data/target_effect_forest.skipped.txt` | `inference_not_available` | 同上 |
 | `E-distance/…/perturbation_distance_heatmap.png` 等 | guide 伪批量两两距离（标题标明非 E-test） | 无 `min_guide_replicates` |
-| `summary/augur_score_bar.png` | Augur AUC | 表空或细胞不足 |
-| `summary/enrichment_dotplot.png` | Enrichr | `no_candidate_genes` |
 | `summary/perturbation_summary.png` | 摘要条形图 | 表空或数值全 NA |
 
 `report` 不调用 `save_target_log2fc_bar`，因此不会重画 `{靶基因}_log2fc.png`。

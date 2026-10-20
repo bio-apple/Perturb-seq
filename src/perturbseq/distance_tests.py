@@ -9,7 +9,6 @@ https://pertpy.scverse.org/en/latest/tutorials/notebooks/distance_tests.html
 
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -182,15 +181,14 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
     axis.set_title(f"E-test: target vs {shown}")
     axis.set_xlabel("within-sample p-value (not biological replicates)")
     axis.set_ylabel(f"E-distance to {shown}")
-    caption = _caption(table)
-    wrapped = "\n".join(textwrap.wrap(caption, width=108))
-    figure.tight_layout(rect=(0, 0.18, 1, 1))
-    figure.text(0.01, 0.01, wrapped, fontsize=7, ha="left", va="bottom")
+    figure.tight_layout()
     figure.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(figure)
     if path.stat().st_size <= 0:
         raise RuntimeError(f"图文件为空: {path}")
-    path.with_suffix(".txt").write_text(_sidecar(table) + "\n")
+    stale_txt = path.with_suffix(".txt")
+    if stale_txt.exists():
+        stale_txt.unlink()
 
 
 def _pca_view(
@@ -257,43 +255,6 @@ def _select_groups(
         f"{base}全量靶基因的两两矩阵不是教程的主结果，"
         f"因此使用 {source} 中 passed 为 true 的 {len(chosen)} 个靶基因，加上对照 {contrast}。"
         "距离用对象里已有的 X_pca，即 log-normalized 高变基因的 PCA。"
-    )
-
-
-def _caption(table: pd.DataFrame) -> str:
-    note = (
-        str(table["inference_note"].iloc[0])
-        if "inference_note" in table.columns
-        else INFERENCE_NOTE
-    )
-    return note
-
-
-def _sidecar(table: pd.DataFrame) -> str:
-    rule = str(table["selection_rule"].iloc[0]) if "selection_rule" in table.columns else ""
-    metric = str(table["metric"].iloc[0]) if "metric" in table.columns else "edistance"
-    obsm = str(table["obsm_key"].iloc[0]) if "obsm_key" in table.columns else _OBSM_KEY
-    n_perms = table["n_perms"].iloc[0] if "n_perms" in table.columns else _TUTORIAL_N_PERMS
-    threshold = (
-        table["padj_threshold"].iloc[0] if "padj_threshold" in table.columns else _TUTORIAL_PADJ
-    )
-    correction = str(table["correction"].iloc[0]) if "correction" in table.columns else "holm-sidak"
-    return "\n".join(
-        [
-            _caption(table),
-            rule,
-            (
-                f"pertpy DistanceTest metric={metric} obsm_key={obsm} "
-                f"n_perms={n_perms} padj_threshold={threshold} correction={correction}."
-            ),
-            (
-                "对照是 zero-guide cells（临时对照，不是设计好的 Non-Targeting）。"
-                "每个点是一个靶基因相对这些细胞的 E-distance。"
-                if str(table["contrast"].iloc[0]) == ZERO_GUIDE_LABEL
-                else f"对照是 {table['contrast'].iloc[0]}。每个点是一个靶基因相对该对照的 E-distance。"
-            ),
-            "significant 用的是未校正 p 值是否低于 padj_threshold，与教程散点的 hue 一致。",
-        ]
     )
 
 

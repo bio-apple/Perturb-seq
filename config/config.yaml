@@ -9,11 +9,16 @@ labels:
   # 下游分析只保留恰好这么多条 guide 的细胞。默认 1。
   guides_per_cell: 1
 qc:
+  # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
+  # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。
+  # UMI 未在命令行给出时，用 median ± n_mad × 1.4826 × MAD。
+  n_mad: 3
   min_genes: 200
   max_genes: 6000
   max_mito_frac: 0.2
   min_cells_per_target: 20
   min_cells_per_guide: 10
+  min_guide_umi: null
 
 preprocess:
   normalize_target_sum: 10000
@@ -65,21 +70,6 @@ target_expression:
   min_nt_detection_fraction: 0.05
   min_nt_mean_cpm: 1.0
   direction_log2fc_tolerance: 0.1
-augur:
-  classifier: random_forest
-  n_folds: 5
-  n_subsamples: 3
-  subsample_size: 20
-  n_estimators: 80
-  feature_perc: 0.5
-  n_threads: 4
-  branch: main
-enrichment:
-  enabled: true
-  database: GO_Biological_Process_2023
-  gene_sets: GO_Biological_Process_2023
-  min_genes: 10
-  max_targets: 40
 # 簇注释调用 Rscript 里的 SingleR 与 celldex。false 时跳过，不要求安装 R。
 singler:
   enabled: true
@@ -97,7 +87,6 @@ plotting:
   scatter_max_points: 50000
   volcano_lfc: 1.0
   heatmap_max_genes: 50
-  enrichment_top_n: 15
   save_plot_data: true
   palette:
     nt: '#7F7F7F'

@@ -27,7 +27,7 @@
 | 参数 | 说明 |
 | --- | --- |
 | `--crispr-mode` | 默认 `CRISPR_KO`，也可 `i` / `a` / `other` |
-| `--steps` | 默认 `all`：`io` → `assign` → `preprocess` → `perturb` → `augur` → `enrich` → `report` |
+| `--steps` | 默认 `all`：`io` → `assign` → `preprocess` → `perturb` → `report` |
 | `--resume` | 从上一 checkpoint 继续 |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
@@ -121,7 +121,7 @@
 
 ### 表达基因数
 
-默认剔除表达基因数 ≤ 100 或 ≥ 6000 的细胞：`qc.min_genes=100`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI 成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。
+默认剔除表达基因数 ≤ 200 或 ≥ 6000 的细胞：`qc.min_genes=200`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI 成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。靶基因 / guide 细胞数门槛默认 `min_cells_per_target=20`、`min_cells_per_guide=10`。
 
 ### 线粒体比例
 
@@ -223,11 +223,9 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 
 区间表示样本内描述性不确定性，不能当作显著性检验或生物学重复置信区间。
 
-### 单样本 DE 与 Enrichr
+### 单样本 DE
 
 edgeR / PyDESeq2：`single_sample_de_not_estimable`，四张表只有表头。
-
-Enrichr：`|log2fc_descriptive| ≥ plotting.volcano_lfc`（默认 1.0）的固定名单，需联网。adjusted P → `enrichment_fdr`。无入选基因 → `no_effect_ranked_genes`；断网 → `enrichr_failed`。
 
 无细胞类型注释时 `cell_type=ALL`，`cell_type_scope=unstratified`。
 

@@ -91,8 +91,7 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
 def assign_cell_type(adata: AnnData, config: dict[str, Any]) -> str | None:
     """Use a real cell-type column, otherwise mark every cell ALL.
 
-    The return value is the column Augur should pass as ``cell_type_col``.
-    None means the population is unstratified.
+    Returns the obs column used for cell type, or None when unstratified.
     """
     annotation = config.get("input", {}).get("cell_annotations")
     if annotation:
