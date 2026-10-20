@@ -2,7 +2,7 @@
 
 从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale、扰动距离和 Augur。一次运行一个生物学样本。
 
-规格见 [docs/analysis.md](docs/analysis.md)，输出见 [docs/outputs.md](docs/outputs.md)。
+文档索引见 [docs/README.md](docs/README.md)。
 
 ## 环境搭建
 
@@ -11,7 +11,7 @@
 ```bash
 conda create -y -n perturbseq-tertiary python=3.12 pip
 conda activate perturbseq-tertiary
-pip install -r requirements.lock
+pip install -r requirements.txt
 pip install -e . --no-deps
 conda install -y -c conda-forge r-base=4.4.3
 Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org"); BiocManager::install(version = "3.20", ask = FALSE, update = FALSE); BiocManager::install(c("SingleR", "celldex"), version = "3.20", ask = FALSE, update = FALSE)'
@@ -42,4 +42,4 @@ python -m perturbseq \
 - `E-distance/`：对当前对照的能量距离
 - 根目录：`effect_main.tsv`、`effect_sensitivity.tsv`、`guide_effects.tsv`、`target_expression_effect.tsv`
 
-图只写 PNG。细节见 [docs/outputs.md](docs/outputs.md)。
+图只写 PNG。细节见 [docs/](docs/README.md)。
