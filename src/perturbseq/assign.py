@@ -578,8 +578,9 @@ def _gene_block_sum(counts: Any, mask: np.ndarray, n_obs: int) -> np.ndarray:
 def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str, float]:
     """Use configured cutoffs, or median ± MAD on the observed distribution.
 
-    Ribosome fraction is a separate upper bound. It is not one of the four
-    absolute thresholds that must be supplied together.
+    Expressed-gene bounds (``min_genes`` / ``max_genes``) come from software
+    defaults or the CLI. They are not derived by MAD. Ribosome fraction is a
+    separate upper bound and is also outside the UMI/mito absolute set.
     """
     n_mad = float(qc.get("n_mad", 3))
     if "pct_counts_ribo" in metrics.columns:
@@ -588,12 +589,13 @@ def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str,
         ribo = metrics["ribo_frac"]
     else:
         raise ValueError("缺少核糖体比例，不能把未计算的 QC 默认为通过。")
+    if qc.get("min_genes") is None or qc.get("max_genes") is None:
+        raise ValueError("缺少 qc.min_genes 或 qc.max_genes。")
     return {
         "min_umi": _cutoff(metrics["total_counts"], qc.get("min_umi"), n_mad, "lower", log=True),
         "max_umi": _cutoff(metrics["total_counts"], qc.get("max_umi"), n_mad, "upper", log=True),
-        "min_genes": _cutoff(
-            metrics["n_genes_by_counts"], qc.get("min_genes"), n_mad, "lower", log=True
-        ),
+        "min_genes": float(qc["min_genes"]),
+        "max_genes": float(qc["max_genes"]),
         "max_mito_frac": _cutoff(
             metrics["pct_counts_mito"], qc.get("max_mito_frac"), n_mad, "upper", log=False
         ),
@@ -676,14 +678,25 @@ def apply_eligibility(
     mito = table["mito_frac"].to_numpy(dtype=float)
     ribo = table["ribo_frac"].to_numpy(dtype=float)
     finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito) & np.isfinite(ribo)
+    if "max_genes" not in thresholds:
+        raise ValueError("缺少 max_genes，不能把未计算的基因数 QC 默认为通过。")
     low_umi = finite & (total < float(thresholds["min_umi"]))
     high_umi = finite & (total > float(thresholds["max_umi"]))
-    low_genes = finite & (genes < float(thresholds["min_genes"]))
+    # Drop cells with ≤ min_genes or ≥ max_genes expressed genes.
+    low_genes = finite & (genes <= float(thresholds["min_genes"]))
+    high_genes = finite & (genes >= float(thresholds["max_genes"]))
     high_mito = finite & (mito > float(thresholds["max_mito_frac"]))
     high_ribo = finite & (ribo > float(thresholds["max_ribo_frac"]))
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
     qc_pass = (
-        finite & ~low_umi & ~high_umi & ~low_genes & ~high_mito & ~high_ribo & ~low_library
+        finite
+        & ~low_umi
+        & ~high_umi
+        & ~low_genes
+        & ~high_genes
+        & ~high_mito
+        & ~high_ribo
+        & ~low_library
     )
     qc_reasons = []
     for index in range(len(table)):
@@ -696,6 +709,8 @@ def apply_eligibility(
             reasons.append("high_umi")
         if low_genes[index]:
             reasons.append("low_genes")
+        if high_genes[index]:
+            reasons.append("high_genes")
         if high_mito[index]:
             reasons.append("high_mito")
         if high_ribo[index]:
