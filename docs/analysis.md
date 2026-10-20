@@ -108,17 +108,21 @@
 
 ## QC
 
-### 四个绝对阈值
+### UMI 与线粒体绝对阈值
 
-命令行须同时给出 `--min-umi`、`--max-umi`、`--min-genes`、`--max-mito-frac`，或全部留空。部分给出会失败。
+命令行须同时给出 `--min-umi`、`--max-umi`、`--max-mito-frac`，或全部留空。部分给出会失败。
 
 全部留空时，在分配步骤用全部细胞计算，写入 `tables/qc_thresholds.json`，`source=median_mad`：
 
-- UMI / 基因数：`log1p` → median ± `qc.n_mad`（默认 3）× 1.4826 × MAD → `expm1`
+- UMI：`log1p` → median ± `qc.n_mad`（默认 3）× 1.4826 × MAD → `expm1`
 - 线粒体比例：原分数上同一公式，限制在 \[0, 1\]
 - MAD 为 0 时改用标准差
 
-命令行给齐四个数时 `source=command_line`。
+命令行给齐这三个数时 `source=command_line`。
+
+### 表达基因数
+
+默认剔除表达基因数 ≤ 100 或 ≥ 6000 的细胞：`qc.min_genes=100`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI / 线粒体的成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。
 
 ### 核糖体比例
 

@@ -51,7 +51,7 @@
 | `barcode_differences.tsv`、`input_validation.json` | `io` / `--validate-only` | 集合一致时差异表仅表头 |
 | `tables/guide_reference_conflicts.tsv` | 参考表冲突 | 参考表通过 |
 | `tables/cell_calls.tsv`、`io_checks.json`、`multi_guide_composition.tsv`、`checkpoints/io.h5ad` | `io` 通过 | assignment-only 时提前退出 |
-| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含四个 QC、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
+| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI/mito、表达基因数 100–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
 | `qc/tables/qc_metrics.tsv` | UMI、基因数、mito、ribo、guide UMI、捕获效率 | 同上 |
 | `qc/tables/grna_capture_library_correlation.tsv` | Spearman；含低文库排除是否执行 | 缺列 / 细胞 < 2 / 方差 0 |
 | `qc/tables/assignment_summary.tsv` | 四类分配计数 | 同上 |

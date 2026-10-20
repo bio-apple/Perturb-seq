@@ -9,10 +9,12 @@ labels:
   # 下游分析只保留恰好这么多条 guide 的细胞。默认 1。
   guides_per_cell: 1
 qc:
-  # 未在命令行给出四个 QC 阈值时，用 median ± n_mad × 1.4826 × MAD。
+  # 未在命令行给出 min_umi / max_umi / max_mito_frac 时，用 median ± n_mad × 1.4826 × MAD。
   # 核糖体比例上限，以及「已检出 guide 的细胞」的文库大小下限，也用这一套 MAD。
-  # 它们不是第五个必须和 min_umi / max_umi / min_genes / max_mito_frac 一起给出的绝对阈值。
+  # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes 的细胞。不由 MAD 推导。
   n_mad: 3
+  min_genes: 100
+  max_genes: 6000
   min_cells_per_target: 20
   min_cells_per_guide: 10
   min_guide_umi: null

@@ -113,13 +113,29 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL")
     parser.add_argument("--min-umi", type=float, default=None)
     parser.add_argument("--max-umi", type=float, default=None)
-    parser.add_argument("--min-genes", type=float, default=None)
-    parser.add_argument("--max-mito-frac", type=float, default=None)
+    parser.add_argument(
+        "--max-mito-frac",
+        type=float,
+        default=None,
+        help="线粒体 reads 比例上限，0 到 1。细胞 ≥ 该值时剔除。默认读配置（0.2 = 20%）。",
+    )
+    parser.add_argument(
+        "--min-genes",
+        type=float,
+        default=None,
+        help="表达基因数下限。细胞 n_genes ≤ 该值时剔除。默认读配置（100）。",
+    )
+    parser.add_argument(
+        "--max-genes",
+        type=float,
+        default=None,
+        help="表达基因数上限。细胞 n_genes ≥ 该值时剔除。默认读配置（6000）。",
+    )
     parser.add_argument(
         "--max-ribo-frac",
         type=float,
         default=None,
-        help="核糖体蛋白基因比例上限，0 到 1。不填则用 median + n_mad × MAD，不并入四个绝对阈值。",
+        help="核糖体蛋白基因比例上限，0 到 1。不填则用 median + n_mad × MAD，不并入 UMI 绝对阈值。",
     )
     parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
     parser.add_argument("--resume", action="store_true")
@@ -143,8 +159,9 @@ def main(argv: list[str] | None = None) -> None:
             "cell_type_key": args.cell_type_key,
             "min_umi": args.min_umi,
             "max_umi": args.max_umi,
-            "min_genes": args.min_genes,
             "max_mito_frac": args.max_mito_frac,
+            "min_genes": args.min_genes,
+            "max_genes": args.max_genes,
             "max_ribo_frac": args.max_ribo_frac,
         },
     )
@@ -323,8 +340,8 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     )
     thresholds = derive_qc_thresholds(metrics, config["qc"])
     n_mad = float(config["qc"].get("n_mad", 3))
-    four = ("min_umi", "max_umi", "min_genes", "max_mito_frac")
-    configured = all(config["qc"].get(key) is not None for key in four)
+    umi_pair = ("min_umi", "max_umi")
+    configured = all(config["qc"].get(key) is not None for key in umi_pair)
     library_rule = low_library_no_guide_rule(calls["total_counts"], calls["n_guides"], n_mad)
     correlation = capture_library_correlation(calls)
     correlation["low_library_no_guide_applied"] = bool(library_rule["applied"])
@@ -334,6 +351,10 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         **thresholds,
         "n_mad": n_mad,
         "source": "command_line" if configured else "median_mad",
+        "gene_bounds_source": "configured",
+        "gene_filter": "drop_n_genes_le_min_or_ge_max",
+        "mito_frac_source": "configured",
+        "mito_filter": "drop_mito_frac_ge_max",
         "ribo_frac_source": (
             "command_line" if config["qc"].get("max_ribo_frac") is not None else "median_mad"
         ),
