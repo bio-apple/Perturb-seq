@@ -6,7 +6,7 @@
 
 ## 运行
 
-环境是 `/opt/miniconda3/envs/perturbseq-tertiary/`（Python 3.12）。入口是 `python -m perturbseq`（`perturbseq.__main__` 调用 `perturbseq.cli.main`）。`pyproject.toml` 里的 console script `perturbseq-tertiary` 指向同一个函数。
+环境是 `/opt/miniconda3/envs/perturbseq-tertiary/`（Python 3.12）。运行所需的 Python 包只以 `requirements.lock` 为准，用 `pip install -r requirements.lock` 安装。入口是 `python -m perturbseq`（`perturbseq.__main__` 调用 `perturbseq.cli.main`）。`pyproject.toml` 里的 console script `perturbseq-tertiary` 指向同一个函数，安装本包时也从这份锁定文件读取依赖。
 
 `config/config.yaml` 只放分析软件的默认参数，例如 Mixscape、Mixscale、预处理、Augur 和作图。样本名、物种、输入目录、输出目录、guide 分隔符、非靶向对照和 CRISPR 模式在命令行输入。不传 `--config` 时读取这份默认参数文件。命令行会覆盖文件里的同名字段。
 
