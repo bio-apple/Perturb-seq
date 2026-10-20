@@ -1,0 +1,148 @@
+# A549_2 测试配置。物种按 ENSG 定为 human。
+# CRISPR 模式按 Edit-R NTC 与 gene|design_N 命名记为 CRISPR_KO。
+# guide 分隔符已从分配文件核实为 '|'；guide 名内部也含该字符，解析时按参考库最长匹配。
+# QC 阈值是该样本 log1p 尺度 median ± 3 MAD 的记录值，不是通用默认。
+document_version: '1.4'
+experiment:
+  sample_id: A549_2
+  organism: human
+  organism_description: null
+  crispr_mode: CRISPR_KO
+  crispr_mode_description: null
+  expected_target_direction: null
+input:
+  input_dir: /Users/yfan/Desktop/test_data
+  guide_reference_key: name
+  guide_separator: '|'
+  barcode_policy: strict
+output:
+  output_dir: results
+labels:
+  nt_control: Non-Targeting_Control
+  feature_type_crispr: CRISPR Direct Capture
+  feature_type_gex: Gene Expression
+  multi_guide_policy: drop
+  # 下游分析只保留恰好这么多条 guide 的细胞。默认 1。
+  # 0 条记为 no_guide；多于该数的细胞记为 multi_guide，在 multi_guide 阶段剔除。
+  guides_per_cell: 1
+qc:
+  thresholds_confirmed: true
+  min_umi: 7226.94
+  max_umi: 36997.16
+  min_genes: 3344.07
+  max_mito_frac: 0.05856
+  mito_gene_prefix: MT-
+  min_cells_per_target: 20
+  min_cells_per_guide: 10
+  min_guide_umi: null
+preprocess:
+  normalize_target_sum: 10000
+  n_hvg: 2000
+  n_pcs: 30
+  n_neighbors: 15
+  leiden_resolution: 1.0
+  cell_type_key: null
+  batch_key: null
+mixscape:
+  enabled: true
+  min_de_genes: 5
+  # RunMixscape / MixscapeHeatmap 的 logfc.threshold。教程调用没有改写，函数默认 0.25。
+  logfc_threshold: 0.25
+  pval_cutoff: 0.05
+  max_de_genes: 100
+  fine_mode: false
+  min_target_cells: 20
+  min_nt_cells: 20
+  # CalcPerturbSig：ndims=40，num.neighbors=20。矩阵比 40 小时才截断。
+  # 教程的 split.by="replicate" 不采用：本项目只有一个生物学样本。
+  n_dims: 40
+  n_control_neighbors: 20
+  # RunMixscape iter.num。
+  iter_num: 10
+  ambiguous_enabled: false
+  ambiguous_lower: 0.2
+  ambiguous_upper: 0.8
+# RunMixscale 教程实参：https://satijalab.github.io/Mixscale/
+# min.de.genes = 5，logfc.threshold = 0.2，max.de.genes = 100，fine.mode = F，split.by 留空。
+# pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
+mixscale:
+  min_de_genes: 5
+  logfc_threshold: 0.2
+  pval_cutoff: 0.05
+  max_de_genes: 100
+  fine_mode: false
+statistics:
+  mode: descriptive
+  aggregation:
+    - target
+    - guide
+  normalization: cpm
+  pseudocount_cpm: 1.0
+  min_nt_cells: 20
+  fdr_threshold: 0.05
+  main_branch: all_eligible
+  sensitivity_branch: mixscape_perturbed
+  allow_random_split_replicates: false
+perturb:
+  cell_type_key: null
+  distance_metric: edistance
+  mixscape_min_de_genes: 5
+  # Mixscape 的回退 logfc，与 mixscape.logfc_threshold 一致。Mixscale 不读这个键。
+  mixscape_logfc: 0.25
+  mixscape_pval: 0.05
+  n_cpus: 4
+target_expression:
+  min_nt_detection_fraction: 0.05
+  min_nt_mean_cpm: 1.0
+  direction_log2fc_tolerance: 0.1
+augur:
+  enabled: true
+  classifier: random_forest
+  n_folds: 5
+  n_subsamples: 3
+  subsample_size: 20
+  n_estimators: 80
+  feature_perc: 0.5
+  n_threads: 4
+  branch: main
+enrichment:
+  enabled: true
+  mode: exploratory_effect_rank
+  database: GO_Biological_Process_2023
+  database_version: Enrichr
+  gene_sets: GO_Biological_Process_2023
+  min_genes: 10
+  max_targets: 40
+plotting:
+  formats:
+    - png
+  mixscape_heatmap_max_targets: 20
+  mixscape_heatmap_max_genes: 20
+  mixscape_heatmap_max_cells: 300
+  dpi: 300
+  width: 8
+  height: 6
+  theme: whitegrid
+  top_n_guides: 20
+  max_legend_categories: 20
+  scatter_max_points: 50000
+  volcano_lfc: 1.0
+  volcano_label_top_n: 10
+  heatmap_max_genes: 50
+  enrichment_top_n: 15
+  save_plot_data: true
+  palette:
+    nt: '#7F7F7F'
+    targeting: '#1F77B4'
+    single_targeting: '#1F77B4'
+    single_nt: '#7F7F7F'
+    low_cells_target: '#FF7F0E'
+    qc_failed: '#D62728'
+    multi_guide: '#9467BD'
+    no_guide: '#BDBDBD'
+    retained: '#2CA02C'
+run:
+  random_seed: 0
+  output_dir: results
+runtime:
+  seed: 0

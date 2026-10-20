@@ -1,0 +1,675 @@
+"""Parse guide calls and keep a complete, exclusive cell ledger."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scipy import sparse
+
+STATUS_NO_GUIDE = "no_guide"
+STATUS_SINGLE_TARGET = "single_targeting"
+STATUS_SINGLE_NT = "single_nt"
+STATUS_MULTI = "multi_guide"
+STATUS_TARGET = "targeting"
+STATUS_NT = "nt"
+STATUS_RETAINED = "retained"
+
+EXCLUSION_PRIORITY = (
+    "no_guide",
+    "multi_guide",
+    "low_guide_umi",
+    "qc_failed",
+    "low_cells_target",
+)
+
+MULTI_ALL_NT = "all_nt"
+MULTI_SAME_TARGET = "same_target"
+MULTI_MIXED_NT = "targeting_nt_mixed"
+MULTI_DIFFERENT_TARGETS = "multiple_targets"
+
+
+class GuideReferenceError(ValueError):
+    """A guide id does not have exactly one target_gene_name."""
+
+    def __init__(self, guide_ids: list[str], reason: str) -> None:
+        self.guide_ids = list(guide_ids)
+        self.reason = reason
+        super().__init__(reason + ": " + ", ".join(self.guide_ids))
+
+
+def name_token_width(reference: pd.DataFrame) -> int:
+    widths = reference["name"].astype(str).map(lambda value: value.count("|") + 1)
+    return int(widths.max()) if len(widths) else 1
+
+
+def segment_feature_call(feature_call: str, names: set[str], max_tokens: int) -> list[str]:
+    """Split a DRAGEN feature_call on the guide separator.
+
+    Guide names may themselves contain '|'. The longest reference name that
+    consumes the next tokens is taken, so a name is not cut at its internal pipe.
+    """
+    if feature_call == "":
+        return []
+    tokens = feature_call.split("|")
+    parts: list[str] = []
+    index = 0
+    while index < len(tokens):
+        matched: str | None = None
+        upper = min(max_tokens, len(tokens) - index)
+        for width in range(upper, 0, -1):
+            candidate = "|".join(tokens[index : index + width])
+            if candidate in names:
+                matched = candidate
+                index += width
+                break
+        if matched is None:
+            parts.append("|".join(tokens[index:]))
+            break
+        parts.append(matched)
+    return parts
+
+
+def parse_transcripts(raw: str) -> list[float]:
+    if raw == "":
+        return []
+    values = []
+    for field in raw.split("|"):
+        if field == "":
+            raise ValueError("num_transcripts 含空字段。")
+        try:
+            values.append(float(field))
+        except ValueError as exc:
+            raise ValueError(f"num_transcripts 含非数值 UMI: {field}") from exc
+    return values
+
+
+def build_guide_catalog(reference: pd.DataFrame) -> pd.DataFrame:
+    """One row per reference guide, with the configured NT label applied later."""
+    catalog = pd.DataFrame(
+        {
+            "guide_id": reference["id"].astype(str),
+            "guide_name": reference["name"].astype(str),
+            "target_gene_name": reference.get(
+                "target_gene_name", pd.Series("", index=reference.index)
+            )
+            .astype(str)
+            .str.strip(),
+            "target_gene_id": reference.get("target_gene_id", pd.Series("", index=reference.index))
+            .astype(str)
+            .str.strip(),
+            "feature_type": reference.get(
+                "feature_type", pd.Series("", index=reference.index)
+            ).astype(str),
+        }
+    )
+    return catalog.reset_index(drop=True)
+
+
+def validate_guide_targets(reference: pd.DataFrame, *, nt_control: str) -> pd.DataFrame:
+    """Use target_gene_name as the only target when that column exists.
+
+    A blank target is an error. The one exception is a guide whose name is the
+    configured control label: A549 leaves those cells blank and identifies them
+    by name. A blank is never treated as non-targeting for any other guide.
+    References without the column keep that name-based control path.
+    """
+    catalog = build_guide_catalog(reference)
+    if "target_gene_name" not in reference.columns:
+        return catalog
+    conflicts = sorted(
+        {
+            str(guide_id)
+            for guide_id, group in catalog.groupby("guide_id", sort=False)
+            if group["target_gene_name"].nunique(dropna=False) > 1
+        }
+    )
+    if conflicts:
+        raise GuideReferenceError(conflicts, "同一 guide id 对应多个 target_gene_name")
+    empty_ids = sorted(
+        {
+            str(row.guide_id)
+            for row in catalog.itertuples(index=False)
+            if row.target_gene_name == "" and row.guide_name != nt_control
+        }
+    )
+    if empty_ids:
+        raise GuideReferenceError(empty_ids, "target_gene_name 为空")
+    return catalog
+
+
+def target_by_guide_name(catalog: pd.DataFrame) -> dict[str, str]:
+    """Map each guide name to the column target. Do not parse the name or id."""
+    mapping: dict[str, str] = {}
+    conflicts: list[str] = []
+    for name, group in catalog.groupby("guide_name", sort=False):
+        values = set(group["target_gene_name"].astype(str))
+        if len(values) != 1:
+            conflicts.extend(str(guide_id) for guide_id in group["guide_id"])
+            continue
+        mapping[str(name)] = next(iter(values))
+    if conflicts:
+        raise GuideReferenceError(
+            sorted(set(conflicts)), "同一 guide name 对应多个 target_gene_name"
+        )
+    return mapping
+
+
+def annotate_assignments(
+    assignments: pd.DataFrame,
+    reference: pd.DataFrame,
+    *,
+    nt_control: str,
+    multi_guide_policy: str,
+    min_guide_umi: float | None,
+    matrix_barcodes: set[str],
+    guides_per_cell: int = 1,
+) -> pd.DataFrame:
+    """Classify every assignment row into four exclusive categories.
+
+    ``guides_per_cell`` is the count kept for later analysis. It does not add a
+    fifth assignment class. Cells with more guides stay ``multi_guide``.
+    """
+    if multi_guide_policy != "drop":
+        raise ValueError("本版只支持 multi_guide_policy=drop。")
+    if guides_per_cell < 1:
+        raise ValueError("guides_per_cell 必须是正整数。")
+    catalog = validate_guide_targets(reference, nt_control=nt_control)
+    names = set(catalog["guide_name"])
+    max_tokens = name_token_width(reference)
+    shared_names = set(catalog.loc[catalog["guide_name"].duplicated(keep=False), "guide_name"])
+    target_by_name = target_by_guide_name(catalog)
+    id_by_unique_name = {}
+    for name, group in catalog.groupby("guide_name", sort=False):
+        if len(group) == 1:
+            id_by_unique_name[str(name)] = str(group["guide_id"].iloc[0])
+
+    rows: list[dict[str, Any]] = []
+    for record in assignments.itertuples(index=False):
+        call = str(record.feature_call)
+        parts = segment_feature_call(call, names, max_tokens)
+        transcripts = parse_transcripts(str(record.num_transcripts))
+        known = all(part in names for part in parts)
+        aligned = len(parts) == int(record.num_features) and len(transcripts) == len(parts)
+        barcode = str(record.cell_barcode)
+        if barcode not in matrix_barcodes:
+            raise ValueError(f"分配 barcode 不在矩阵中: {barcode}")
+        if not known or not aligned:
+            raise ValueError(f"guide 解析与 num_features 不一致: {barcode}")
+        status, guide_name, target, targets = _assignment_for_call(
+            parts=parts,
+            nt_control=nt_control,
+            target_by_name=target_by_name,
+        )
+        guide_id = id_by_unique_name.get(guide_name, "")
+        if guide_name in shared_names:
+            guide_id = ""
+        guide_umi_pass = min_guide_umi is None or all(
+            weight >= float(min_guide_umi) for weight in transcripts
+        )
+        subtype = (
+            _multi_subtype(parts, nt_control, target_by_name) if status == STATUS_MULTI else pd.NA
+        )
+        analysis_status = {
+            STATUS_SINGLE_TARGET: STATUS_TARGET,
+            STATUS_SINGLE_NT: STATUS_NT,
+        }.get(status, status)
+        rows.append(
+            {
+                "cell_barcode": barcode,
+                "n_guides_called": int(record.num_features),
+                "n_guides": len(parts),
+                "feature_call": call,
+                "guide_list": "|".join(parts),
+                "guide_list_json": json.dumps(parts),
+                "target_list_json": json.dumps(targets),
+                "guide_name": guide_name,
+                "guide_id": guide_id,
+                "guide_names": parts,
+                "guide_transcripts": transcripts,
+                "target_gene": target
+                if status in {STATUS_SINGLE_TARGET, STATUS_SINGLE_NT}
+                else pd.NA,
+                "assignment_status": status,
+                "multi_guide_subtype": subtype,
+                "guide_umi_pass": guide_umi_pass or not parts,
+                "perturbation_status": analysis_status,
+                "shared_guide_name": guide_name in shared_names,
+                "in_matrix": True,
+            }
+        )
+    return pd.DataFrame.from_records(rows)
+
+
+def _assignment_for_call(
+    *,
+    parts: list[str],
+    nt_control: str,
+    target_by_name: dict[str, str],
+) -> tuple[str, str, str, list[str]]:
+    targets = [_target_of(part, nt_control, target_by_name) for part in parts]
+    if not parts:
+        return STATUS_NO_GUIDE, "", "", []
+    if len(parts) > 1:
+        return STATUS_MULTI, "", "", targets
+    guide_name = parts[0]
+    target = targets[0]
+    if target == "":
+        raise ValueError(f"guide 没有靶基因: {guide_name}")
+    if _is_nt(guide_name, target_by_name.get(guide_name, ""), nt_control):
+        return STATUS_SINGLE_NT, guide_name, nt_control, [nt_control]
+    return STATUS_SINGLE_TARGET, guide_name, target, [target]
+
+
+def _target_of(guide_name: str, nt_control: str, target_by_name: dict[str, str]) -> str:
+    target = target_by_name.get(guide_name, "").strip()
+    if _is_nt(guide_name, target, nt_control):
+        return nt_control
+    return target
+
+
+def _multi_subtype(parts: list[str], nt_control: str, target_by_name: dict[str, str]) -> str:
+    nt_flags = []
+    targets = []
+    for part in parts:
+        target = target_by_name.get(part, "")
+        is_nt = _is_nt(part, target, nt_control)
+        nt_flags.append(is_nt)
+        if not is_nt and target:
+            targets.append(target)
+    if all(nt_flags):
+        return MULTI_ALL_NT
+    if any(nt_flags) and targets:
+        return MULTI_MIXED_NT
+    if len(set(targets)) == 1 and targets:
+        return MULTI_SAME_TARGET
+    return MULTI_DIFFERENT_TARGETS
+
+
+def control_cell_mask(obs: pd.DataFrame, spec: dict[str, Any]) -> np.ndarray:
+    """Cells used as the contrast. Designed NT and zero-guide cells stay separate.
+
+    Temporary control cells are assignment ``no_guide`` with zero guides. That
+    covers an empty assignment call and a matrix barcode missing from the
+    positive assignment table. ``multi_guide`` and ``single_targeting`` are not
+    controls. A configured NT label does not recruit zero-guide cells.
+    """
+    n = len(obs)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if spec.get("temporary"):
+        if "assignment_status" in obs.columns and "n_guides" in obs.columns:
+            assignment = obs["assignment_status"].astype(str)
+            n_guides = pd.to_numeric(obs["n_guides"], errors="coerce").fillna(0)
+            return (assignment.eq(STATUS_NO_GUIDE) & n_guides.eq(0)).to_numpy()
+        label = str(spec.get("control_label", ""))
+        return _obs_eq(obs, "target_gene", label) | _obs_eq(obs, "perturbation_status", label)
+    label = str(spec.get("control_label", ""))
+    designed = _obs_eq(obs, "perturbation_status", STATUS_NT) | _obs_eq(obs, "target_gene", label)
+    if "assignment_status" in obs.columns:
+        designed &= ~_obs_eq(obs, "assignment_status", STATUS_NO_GUIDE)
+    return designed
+
+
+def _obs_eq(obs: pd.DataFrame, column: str, value: str) -> np.ndarray:
+    if column not in obs.columns:
+        return np.zeros(len(obs), dtype=bool)
+    return obs[column].astype(str).eq(value).to_numpy()
+
+
+def _is_nt(guide_name: str, target_gene_name: str, nt_control: str) -> bool:
+    label = nt_control.strip() if isinstance(nt_control, str) else ""
+    if not label:
+        return False
+    return guide_name == label or target_gene_name == label
+
+
+def multi_guide_composition(
+    annotated: pd.DataFrame,
+    *,
+    nt_control: str,
+    reference: pd.DataFrame,
+) -> pd.DataFrame:
+    """Classify multi-guide calls before they are dropped."""
+    catalog = validate_guide_targets(reference, nt_control=nt_control)
+    target_by_name = target_by_guide_name(catalog)
+    names = set(catalog["guide_name"])
+    max_tokens = name_token_width(reference)
+    counts = {MULTI_ALL_NT: 0, MULTI_SAME_TARGET: 0, MULTI_MIXED_NT: 0, MULTI_DIFFERENT_TARGETS: 0}
+    multi = annotated[annotated["n_guides_called"] > 1]
+    for record in multi.itertuples(index=False):
+        parts = segment_feature_call(str(record.feature_call), names, max_tokens)
+        if len(parts) < 2 or any(part not in names for part in parts):
+            continue
+        targets = []
+        nt_flags = []
+        for part in parts:
+            target = target_by_name.get(part, "")
+            is_nt = _is_nt(part, target, nt_control)
+            nt_flags.append(is_nt)
+            if not is_nt and target:
+                targets.append(target)
+        if all(nt_flags):
+            counts[MULTI_ALL_NT] += 1
+        elif any(nt_flags) and targets:
+            counts[MULTI_MIXED_NT] += 1
+        elif len(set(targets)) == 1 and targets:
+            counts[MULTI_SAME_TARGET] += 1
+        elif len(set(targets)) > 1:
+            counts[MULTI_DIFFERENT_TARGETS] += 1
+    return pd.DataFrame({"composition": list(counts), "n_cells": list(counts.values())})
+
+
+def mito_fraction(mito_counts: np.ndarray, total_counts: np.ndarray) -> np.ndarray:
+    """Mitochondrial share of library size, on the same 0–1 scale as max_mito_frac.
+
+    A library size of 0 has no denominator, so the value is missing rather than 0.
+    """
+    mito = np.asarray(mito_counts, dtype=np.float64).ravel()
+    total = np.asarray(total_counts, dtype=np.float64).ravel()
+    fraction = np.full(total.shape, np.nan, dtype=np.float64)
+    np.divide(mito, total, out=fraction, where=total > 0)
+    return fraction
+
+
+def qc_metrics(adata: AnnData, mito_prefix: str) -> pd.DataFrame:
+    counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
+    if sparse.issparse(counts):
+        total = np.asarray(counts.sum(axis=1)).ravel()
+        detected = np.asarray((counts > 0).sum(axis=1)).ravel()
+    else:
+        total = np.asarray(counts.sum(axis=1)).ravel()
+        detected = np.asarray((counts > 0).sum(axis=1)).ravel()
+    symbols = adata.var["gene_symbol"].astype(str)
+    mito = symbols.str.startswith(mito_prefix).to_numpy()
+    if mito.any():
+        block = counts[:, mito]
+        mito_sum = (
+            np.asarray(block.sum(axis=1)).ravel()
+            if sparse.issparse(block)
+            else np.asarray(block.sum(axis=1)).ravel()
+        )
+    else:
+        mito_sum = np.zeros(adata.n_obs, dtype=np.float64)
+    mito_frac = mito_fraction(mito_sum, total)
+    return pd.DataFrame(
+        {
+            "cell_barcode": adata.obs_names.astype(str),
+            "total_counts": total,
+            "n_genes_by_counts": detected,
+            "pct_counts_mito": mito_frac,
+        }
+    )
+
+
+def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str, float]:
+    """Use configured cutoffs, or median ± MAD on the observed distribution."""
+    n_mad = float(qc.get("n_mad", 3))
+    return {
+        "min_umi": _cutoff(metrics["total_counts"], qc.get("min_umi"), n_mad, "lower", log=True),
+        "max_umi": _cutoff(metrics["total_counts"], qc.get("max_umi"), n_mad, "upper", log=True),
+        "min_genes": _cutoff(
+            metrics["n_genes_by_counts"], qc.get("min_genes"), n_mad, "lower", log=True
+        ),
+        "max_mito_frac": _cutoff(
+            metrics["pct_counts_mito"], qc.get("max_mito_frac"), n_mad, "upper", log=False
+        ),
+    }
+
+
+def _cutoff(
+    values: pd.Series,
+    configured: Any,
+    n_mad: float,
+    side: str,
+    *,
+    log: bool,
+) -> float:
+    if configured is not None:
+        return float(configured)
+    array = values.to_numpy(dtype=np.float64)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return 0.0
+    transformed = np.log1p(np.clip(array, 0, None)) if log else array
+    median = float(np.median(transformed))
+    mad = float(np.median(np.abs(transformed - median)))
+    sigma = 1.4826 * mad
+    if sigma == 0:
+        sigma = float(np.std(transformed))
+    if side == "lower":
+        bound = median - n_mad * sigma
+        raw = float(np.expm1(bound)) if log else bound
+        return float(max(0.0, raw))
+    bound = median + n_mad * sigma
+    raw = float(np.expm1(bound)) if log else bound
+    if not log:
+        return float(min(1.0, max(0.0, raw)))
+    return float(max(0.0, raw))
+
+
+def apply_eligibility(
+    annotated: pd.DataFrame,
+    thresholds: dict[str, float],
+    *,
+    min_cells_per_target: int,
+    cell_type: str = "ALL",
+    guides_per_cell: int = 1,
+) -> pd.DataFrame:
+    """Attach QC, every exclusion reason, and one primary reason per cell."""
+    table = annotated.copy()
+    for column in ("total_counts", "n_genes_by_counts", "mito_frac"):
+        if column not in table.columns:
+            raise ValueError(f"缺少 {column}，不能把未计算的 QC 默认为通过。")
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+    total = table["total_counts"].to_numpy(dtype=float)
+    genes = table["n_genes_by_counts"].to_numpy(dtype=float)
+    mito = table["mito_frac"].to_numpy(dtype=float)
+    finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito)
+    low_umi = finite & (total < float(thresholds["min_umi"]))
+    high_umi = finite & (total > float(thresholds["max_umi"]))
+    low_genes = finite & (genes < float(thresholds["min_genes"]))
+    high_mito = finite & (mito > float(thresholds["max_mito_frac"]))
+    qc_pass = finite & ~low_umi & ~high_umi & ~low_genes & ~high_mito
+    qc_reasons = []
+    for index in range(len(table)):
+        reasons = []
+        if not finite[index]:
+            reasons.append("qc_not_computable")
+        if low_umi[index]:
+            reasons.append("low_umi")
+        if high_umi[index]:
+            reasons.append("high_umi")
+        if low_genes[index]:
+            reasons.append("low_genes")
+        if high_mito[index]:
+            reasons.append("high_mito")
+        qc_reasons.append(json.dumps(reasons))
+    table["qc_pass"] = qc_pass
+    table["qc_fail_reasons_json"] = qc_reasons
+    table["cell_type"] = cell_type
+    single = table["assignment_status"].isin([STATUS_SINGLE_TARGET, STATUS_SINGLE_NT])
+    allowed_count = table["n_guides"].astype(int) == int(guides_per_cell)
+    base = single & allowed_count & table["guide_umi_pass"].astype(bool) & table["qc_pass"]
+    table["base_eligible"] = base.to_numpy()
+    targeting_base = base & (table["assignment_status"] == STATUS_SINGLE_TARGET)
+    grouped = table.loc[targeting_base].groupby(["target_gene", "cell_type"], dropna=False).size()
+    low_keys = {key for key, count in grouped.items() if int(count) < min_cells_per_target}
+    pair = pd.MultiIndex.from_arrays(
+        [table["target_gene"].astype(str), table["cell_type"].astype(str)]
+    )
+    low_cells = targeting_base.to_numpy() & pair.isin(low_keys)
+    all_reasons = []
+    primary = []
+    for index, record in enumerate(table.itertuples(index=False)):
+        reasons = []
+        if record.assignment_status == STATUS_NO_GUIDE:
+            reasons.append("no_guide")
+        if record.assignment_status == STATUS_MULTI or int(record.n_guides) > int(guides_per_cell):
+            reasons.append("multi_guide")
+        if not bool(record.guide_umi_pass):
+            reasons.append("low_guide_umi")
+        if not bool(record.qc_pass):
+            reasons.append("qc_failed")
+        if low_cells[index]:
+            reasons.append("low_cells_target")
+        chosen = STATUS_RETAINED
+        for reason in EXCLUSION_PRIORITY:
+            if reason in reasons:
+                chosen = reason
+                break
+        all_reasons.append(json.dumps(reasons))
+        primary.append(chosen)
+    table["exclusion_reasons_json"] = all_reasons
+    table["exclusion_reason_primary"] = primary
+    table["analysis_eligible"] = table["exclusion_reason_primary"] == STATUS_RETAINED
+    return table
+
+
+def filter_stage_counts(table: pd.DataFrame) -> pd.DataFrame:
+    """Newly excluded cells at each priority stage. Earlier stages are already gone."""
+    remaining = len(table)
+    rows = [
+        {
+            "stage": "input",
+            "n_before": remaining,
+            "n_newly_excluded": 0,
+            "n_after": remaining,
+            "primary_reason": "",
+        }
+    ]
+    counts = table["exclusion_reason_primary"].value_counts()
+    for reason in EXCLUSION_PRIORITY:
+        removed = int(counts.get(reason, 0))
+        after = remaining - removed
+        rows.append(
+            {
+                "stage": reason,
+                "n_before": remaining,
+                "n_newly_excluded": removed,
+                "n_after": after,
+                "primary_reason": reason,
+            }
+        )
+        remaining = after
+    retained = int((table["exclusion_reason_primary"] == STATUS_RETAINED).sum())
+    if remaining != retained:
+        raise RuntimeError(f"阶段计数 {remaining} 与 retained {retained} 不一致。")
+    return pd.DataFrame(rows)
+
+
+def disambiguate_shared_guides(
+    annotated: pd.DataFrame,
+    guide_umi: sparse.spmatrix,
+    barcodes: pd.Index,
+    crispr_ids: list[str],
+    crispr_names: list[str],
+) -> pd.DataFrame:
+    """Assign a reference id when several guides share one name.
+
+    Non-targeting guides in this assay share ``Non-Targeting_Control``. The
+    CRISPR count matrix distinguishes EditR-NTC-01, EditR-NTC-02, and so on.
+    """
+    table = annotated.copy()
+    if guide_umi.shape[1] == 0:
+        table["guide_umi_observed"] = np.nan
+        return table
+    positions = pd.Index(barcodes.astype(str)).get_indexer(table["cell_barcode"].astype(str))
+    names = np.asarray(crispr_names)
+    ids = np.asarray(crispr_ids)
+    columns_by_name = {
+        name: np.flatnonzero(names == name)
+        for name in set(table.loc[table["shared_guide_name"], "guide_name"].astype(str))
+    }
+    id_to_column = {guide_id: index for index, guide_id in enumerate(crispr_ids)}
+    resolved: list[str] = []
+    umis: list[float] = []
+    for row_index, record in enumerate(table.itertuples(index=False)):
+        matrix_row = int(positions[row_index])
+        status = str(record.perturbation_status)
+        if matrix_row < 0 or status not in {STATUS_NT, STATUS_TARGET}:
+            resolved.append(str(record.guide_id))
+            umis.append(np.nan)
+            continue
+        if bool(record.shared_guide_name):
+            columns = columns_by_name.get(str(record.guide_name), np.array([], dtype=int))
+            values = _row_values(guide_umi, matrix_row, columns)
+            if values.size == 0 or float(np.nanmax(values)) <= 0:
+                resolved.append("")
+                umis.append(0.0)
+                continue
+            winner = int(np.argmax(values))
+            resolved.append(str(ids[columns[winner]]))
+            umis.append(float(values[winner]))
+            continue
+        column = id_to_column.get(str(record.guide_id))
+        resolved.append(str(record.guide_id))
+        if column is None:
+            umis.append(np.nan)
+            continue
+        values = _row_values(guide_umi, matrix_row, np.asarray([column]))
+        umis.append(float(values[0]) if values.size else np.nan)
+    table["guide_id"] = resolved
+    table["guide_umi_observed"] = umis
+    return table
+
+
+def _row_values(matrix: sparse.spmatrix, row: int, columns: np.ndarray) -> np.ndarray:
+    if columns.size == 0:
+        return np.array([], dtype=float)
+    block = matrix[row, columns]
+    if sparse.issparse(block):
+        return np.asarray(block.toarray()).ravel()
+    return np.asarray(block).ravel()
+
+
+def cells_per_guide(table: pd.DataFrame) -> pd.DataFrame:
+    used = _analysis_rows(table)
+    if used.empty:
+        return pd.DataFrame(columns=["guide_id", "guide_name", "target_gene", "n_cells"])
+    grouped = (
+        used.groupby(["guide_id", "guide_name", "target_gene"], dropna=False)
+        .size()
+        .reset_index(name="n_cells")
+        .sort_values("n_cells", ascending=False)
+    )
+    return grouped
+
+
+def _analysis_rows(table: pd.DataFrame) -> pd.DataFrame:
+    if "analysis_eligible" in table.columns:
+        return table[table["analysis_eligible"].astype(bool)].copy()
+    return table[table["perturbation_status"].isin([STATUS_TARGET, STATUS_NT])].copy()
+
+
+def cells_per_target(table: pd.DataFrame, min_cells_per_guide: int) -> pd.DataFrame:
+    used = _analysis_rows(table)
+    if used.empty:
+        return pd.DataFrame(
+            columns=[
+                "target_gene",
+                "n_cells",
+                "n_guides",
+                "n_guides_passing",
+                "perturbation_status",
+            ]
+        )
+    rows = []
+    for target, group in used.groupby("target_gene", sort=False):
+        guide_counts = group.groupby("guide_id").size()
+        status = group["perturbation_status"].iloc[0]
+        rows.append(
+            {
+                "target_gene": target,
+                "n_cells": int(len(group)),
+                "n_guides": int((guide_counts.index != "").sum()),
+                "n_guides_passing": int(
+                    (guide_counts[guide_counts.index != ""] >= min_cells_per_guide).sum()
+                ),
+                "perturbation_status": status,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("n_cells", ascending=False)
