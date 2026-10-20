@@ -19,7 +19,7 @@ qc:
 preprocess:
   normalize_target_sum: 10000
   n_hvg: 2000
-  n_pcs: 30
+  n_pcs: 40
   n_neighbors: 15
   leiden_resolution: 1.0
 mixscape:
