@@ -163,7 +163,9 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
         raise ValueError("E-test 表是空的，不能作图。")
     contrast = str(table["contrast"].iloc[0])
     plotted = table[table["group"].astype(str) != contrast].copy()
-    plotted["significant"] = _as_bool(plotted["significant"])
+    # Color by adjusted significance when present: matches padj_threshold in the table.
+    hue_col = "significant_adj" if "significant_adj" in plotted.columns else "significant"
+    plotted[hue_col] = _as_bool(plotted[hue_col])
     path.parent.mkdir(parents=True, exist_ok=True)
     matplotlib.rcParams["font.sans-serif"] = ["Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
     matplotlib.rcParams["axes.unicode_minus"] = False
@@ -173,14 +175,19 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
             data=plotted,
             x="pvalue",
             y="distance",
-            hue="significant",
+            hue=hue_col,
             palette={True: "green", False: "red"},
             ax=axis,
         )
     shown = "zero-guide cells" if contrast == ZERO_GUIDE_LABEL else contrast
-    axis.set_title(f"E-test: target vs {shown}")
-    axis.set_xlabel("within-sample p-value (not biological replicates)")
+    axis.set_title(f"E-test on expression X_pca vs {shown} (within-sample; not replicates)")
+    axis.set_xlabel("within-sample p-value (cell permutation; not biological replicates)")
     axis.set_ylabel(f"E-distance to {shown}")
+    legend = axis.get_legend()
+    if legend is not None:
+        legend.set_title(
+            "within-sample sig. (adj)" if hue_col == "significant_adj" else "within-sample sig."
+        )
     figure.tight_layout()
     figure.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(figure)

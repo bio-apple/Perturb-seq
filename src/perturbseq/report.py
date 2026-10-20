@@ -334,17 +334,23 @@ def _build_summary(output_dir: Path, config: dict[str, Any]) -> pd.DataFrame:
         summary = summary.merge(
             effects[["target_gene", "effect_log1p"]], on="target_gene", how="left"
         )
-    de_notes = _read(tables / "de_notes.tsv")
-    if not de_notes.empty and "n_fdr_significant" in de_notes.columns:
-        summary = summary.merge(
-            de_notes[["target_gene", "n_fdr_significant"]].rename(
-                columns={"n_fdr_significant": "n_significant"}
-            ),
-            on="target_gene",
-            how="left",
-        )
+    # descriptive 单样本：不把任何 FDR/显著计数并入摘要，避免读成组间推断。
     statistics = config.get("statistics", {})
-    if isinstance(statistics, dict) and "fdr_threshold" in statistics:
+    mode = (
+        str(statistics.get("mode", "descriptive"))
+        if isinstance(statistics, dict)
+        else "descriptive"
+    )
+    if mode != "descriptive" and isinstance(statistics, dict) and "fdr_threshold" in statistics:
+        de_notes = _read(tables / "de_notes.tsv")
+        if not de_notes.empty and "n_fdr_significant" in de_notes.columns:
+            summary = summary.merge(
+                de_notes[["target_gene", "n_fdr_significant"]].rename(
+                    columns={"n_fdr_significant": "n_significant"}
+                ),
+                on="target_gene",
+                how="left",
+            )
         summary["fdr_threshold"] = float(statistics["fdr_threshold"])
     return summary
 

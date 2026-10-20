@@ -29,7 +29,6 @@ from perturbseq.assign import (
     cells_per_target,
     derive_qc_thresholds,
     filter_stage_counts,
-    low_library_no_guide_rule,
     multi_guide_composition,
     validate_guide_targets,
 )
@@ -93,7 +92,9 @@ def main(argv: list[str] | None = None) -> None:
         help="分析软件默认参数 YAML。缺省为仓库里的 config/config.yaml。样本和路径以命令行为准。",
     )
     parser.add_argument("--sample-id", required=True, help="样本名，用来拼接 DRAGEN 文件名")
-    parser.add_argument("--organism", required=True, help="human 或 mouse")
+    parser.add_argument(
+        "--organism", required=True, help="human 或 mouse（写入 experiment.organism）"
+    )
     parser.add_argument("--input-dir", required=True, help="五个 DRAGEN 输入文件所在目录")
     parser.add_argument("--output-dir", required=True, help="结果输出目录")
     parser.add_argument("--guide-separator", required=True, help="多条 guide 之间的分隔符，例如 |")
@@ -101,10 +102,14 @@ def main(argv: list[str] | None = None) -> None:
         "--nt-control", default="", help="设计好的非靶向对照名。不填则用 zero-guide 细胞"
     )
     parser.add_argument(
-        "--crispr-mode", default="CRISPR_KO", help="KO、i、a 或 other，缺省 CRISPR_KO"
+        "--crispr-mode",
+        default="KO",
+        help="KO、i、a 或 other，缺省 KO（内部映射为 CRISPR_KO / CRISPRi / CRISPRa / other）",
     )
     parser.add_argument(
-        "--crispr-description", default=None, help="crispr-mode 为 other 时的文字说明"
+        "--crispr-description",
+        default=None,
+        help="--crispr-mode 为 other 时的文字说明",
     )
     parser.add_argument(
         "--expected-direction",
@@ -115,8 +120,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL"
     )
-    parser.add_argument("--min-umi", type=float, default=None)
-    parser.add_argument("--max-umi", type=float, default=None)
+    parser.add_argument(
+        "--min-umi",
+        type=float,
+        default=None,
+        help="文库 UMI 下限。须与 --max-umi 成对给出；都不填则不做 UMI 绝对阈值过滤。",
+    )
+    parser.add_argument(
+        "--max-umi",
+        type=float,
+        default=None,
+        help="文库 UMI 上限。须与 --min-umi 成对给出；都不填则不做 UMI 绝对阈值过滤。",
+    )
     parser.add_argument(
         "--max-mito-frac",
         type=float,
@@ -139,7 +154,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-ribo-frac",
         type=float,
         default=None,
-        help="核糖体蛋白基因比例上限，0 到 1。不填则用 median + n_mad × MAD，不并入 UMI 绝对阈值。",
+        help="核糖体蛋白基因比例上限，0 到 1。不填则不做 ribo 过滤，不并入 UMI 绝对阈值。",
     )
     parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
     parser.add_argument("--resume", action="store_true")
@@ -330,34 +345,31 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     ):
         if column in calls.columns:
             calls[column] = pd.to_numeric(calls[column], errors="coerce")
-    metrics = pd.DataFrame(
-        {
-            "total_counts": calls["total_counts"],
-            "n_genes_by_counts": calls["n_genes_by_counts"],
-            "pct_counts_mito": calls["mito_frac"],
-            "pct_counts_ribo": calls["ribo_frac"],
-        }
-    )
-    thresholds = derive_qc_thresholds(metrics, config["qc"])
-    n_mad = float(config["qc"].get("n_mad", 3))
+    thresholds = derive_qc_thresholds(config["qc"])
     umi_pair = ("min_umi", "max_umi")
-    configured = all(config["qc"].get(key) is not None for key in umi_pair)
-    library_rule = low_library_no_guide_rule(calls["total_counts"], calls["n_guides"], n_mad)
+    umi_configured = all(config["qc"].get(key) is not None for key in umi_pair)
+    ribo_configured = config["qc"].get("max_ribo_frac") is not None
+    # MAD-based shallow no-guide exclusion removed; stage kept in ledger at 0.
+    library_rule = {
+        "applied": False,
+        "reason": "disabled_mad_qc_removed",
+        "min_total_counts": None,
+        "source": "disabled",
+        "note": "原 MAD 文库下限规则已移除，不再排除 low_library_no_guide。",
+    }
     correlation = capture_library_correlation(calls)
-    correlation["low_library_no_guide_applied"] = bool(library_rule["applied"])
+    correlation["low_library_no_guide_applied"] = False
     correlation["low_library_no_guide_reason"] = library_rule["reason"]
-    correlation["low_library_min_total_counts"] = library_rule["min_total_counts"]
+    correlation["low_library_min_total_counts"] = None
     recorded = {
         **thresholds,
-        "n_mad": n_mad,
-        "source": "command_line" if configured else "median_mad",
+        "source": "command_line" if umi_configured else "skipped",
+        "umi_filter": "absolute_cutoffs" if umi_configured else "disabled",
         "gene_bounds_source": "configured",
         "gene_filter": "drop_n_genes_le_min_or_ge_max",
         "mito_frac_source": "configured",
         "mito_filter": "drop_mito_frac_ge_max",
-        "ribo_frac_source": (
-            "command_line" if config["qc"].get("max_ribo_frac") is not None else "median_mad"
-        ),
+        "ribo_frac_source": "command_line" if ribo_configured else "disabled",
         "ribo_prefixes": list(ribo_prefixes(config)),
         "ribo_match": "gene_symbol_prefix_case_insensitive",
         "low_library_no_guide": library_rule,
@@ -368,13 +380,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     correlation.to_csv(
         _qc_tables(folder) / "grna_capture_library_correlation.tsv", sep="\t", index=False
     )
-    if library_rule["applied"]:
-        print(
-            f"  low_library_no_guide threshold: {library_rule['min_total_counts']}",
-            flush=True,
-        )
-    else:
-        print(f"  low_library_no_guide skipped: {library_rule['reason']}", flush=True)
+    print(f"  low_library_no_guide skipped: {library_rule['reason']}", flush=True)
     updated = apply_eligibility(
         calls,
         thresholds,
@@ -676,7 +682,7 @@ def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
     notes = {
         "scored_after_log1p": "scib Tirosh/Regev 基因集；写入 phase、S_score、G2M_score。",
         "already_scored": "obs 已有 phase，跳过重复打分。",
-        "skipped_unsupported_organism": "organism 不是 human 或 mouse。",
+        "skipped_unsupported_organism": "experiment.organism 不是 human 或 mouse。",
         "skipped_missing_log1p": "尚未 log1p，跳过打分。",
         "skipped_missing_cell_cycle_genes": "矩阵里几乎找不到该物种的细胞周期基因。",
         "skipped_scib_unavailable": "未安装 scib，无法读取细胞周期基因集。",

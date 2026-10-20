@@ -27,6 +27,9 @@ NO_NT_CONTROL = "no_nt_control"
 ZERO_GUIDE_LABEL = "zero_guide"
 CONTROL_SOURCE_ZERO = "zero_guide_cells"
 CONTROL_SOURCE_DESIGNED = "designed_nt"
+# Shared width for preprocess PCA (n_pcs) and Mixscape CalcPerturbSig (n_dims).
+DEFAULT_EMBEDDING_NDIMS = 30
+DEFAULT_SIGNATURE_NDIMS = DEFAULT_EMBEDDING_NDIMS
 TEMPORARY_CONTROL_WARNING = (
     "当前对照是临时 zero-guide cells，这不是设计好的非靶向对照。"
     "zero-guide 细胞可能在 UMI、基因数、线粒体比例、环境 RNA 和细胞状态上与靶向细胞不同。"
@@ -47,9 +50,9 @@ class ConfigError(RuntimeError):
     """The run is not allowed to start."""
 
 
-# UMI absolute cutoffs: both set on the CLI, or both derived by median ± MAD.
+# UMI absolute cutoffs: both set on the CLI/config, or both omitted (filter skipped).
 _QC_CUTOFFS = ("min_umi", "max_umi")
-# Gene bounds and mito fraction are software defaults (optional CLI overrides), not MAD-derived.
+# Gene bounds and mito fraction are software defaults (optional CLI overrides).
 _GENE_CUTOFFS = ("min_genes", "max_genes")
 
 
@@ -193,7 +196,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "flag_guides_above": None,
     },
     "qc": {
-        "n_mad": None,
         "min_cells_per_target": None,
         "min_cells_per_guide": None,
         "min_guide_umi": None,
@@ -365,6 +367,10 @@ def validate_config(config: dict[str, Any]) -> None:
     _normalize_runtime(config)
     _section(config, "preprocess")
     _section(config, "perturb")
+    _section(config, "mixscape")
+    _section(config, "mixscale")
+    _validate_embedding_ndims(config)
+    _validate_mixscape_fallback(config)
     statistics = config.setdefault("statistics", {"mode": "descriptive"})
     _validate_statistics(statistics)
     _section(config, "plotting")
@@ -548,11 +554,11 @@ def expected_expression(config: dict[str, Any]) -> tuple[str, str]:
     """Return the direction code and the sentence used in figure captions."""
     mode = config["experiment"]["crispr_mode"]
     if mode == "CRISPRi":
-        return "down", "CRISPRi 预期靶基因表达下降。"
+        return "down", "i 预期靶基因表达下降。"
     if mode == "CRISPRa":
-        return "up", "CRISPRa 预期靶基因表达升高。"
+        return "up", "a 预期靶基因表达升高。"
     if mode == "CRISPR_KO":
-        return "not_required", "CRISPR_KO 不以 RNA 表达下降作为唯一成功标准。"
+        return "not_required", "KO 不以 RNA 表达下降作为唯一成功标准。"
     direction = str(config["experiment"]["expected_target_direction"])
     description = str(config["experiment"]["crispr_mode_description"]).strip()
     sentence = {
@@ -621,9 +627,7 @@ def _crispr_mode(experiment: dict[str, Any]) -> str:
     elif isinstance(raw, str) and raw.strip() in CRISPR_ALIASES:
         mode = CRISPR_ALIASES[raw.strip()]
     else:
-        raise ConfigError(
-            "experiment.crispr_mode 必须是 KO / CRISPR_KO、i / CRISPRi、a / CRISPRa 或 other。"
-        )
+        raise ConfigError("experiment.crispr_mode 必须是 KO、i、a 或 other。")
     experiment["crispr_mode"] = mode
     return mode
 
@@ -642,33 +646,33 @@ def _nt_control(labels: dict[str, Any]) -> str:
 def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
     if mode == "CRISPRi":
         if direction not in (None, "down"):
-            raise ConfigError("CRISPRi 的 expected_target_direction 只能是 null 或 down。")
+            raise ConfigError(
+                "experiment.crispr_mode=i 时 expected_target_direction 只能是 null 或 down。"
+            )
         return "down"
     if mode == "CRISPRa":
         if direction not in (None, "up"):
-            raise ConfigError("CRISPRa 的 expected_target_direction 只能是 null 或 up。")
+            raise ConfigError(
+                "experiment.crispr_mode=a 时 expected_target_direction 只能是 null 或 up。"
+            )
         return "up"
     if mode == "CRISPR_KO":
         if direction not in (None, "not_required"):
             raise ConfigError(
-                "CRISPR_KO 的 expected_target_direction 只能是 null 或 not_required。"
+                "experiment.crispr_mode=KO 时 expected_target_direction 只能是 null 或 not_required。"
             )
         return "not_required"
     if not isinstance(description, str) or not description.strip():
-        raise ConfigError("crispr_mode 为 other 时必须填写 crispr_mode_description。")
+        raise ConfigError("experiment.crispr_mode 为 other 时必须填写 crispr_mode_description。")
     if direction not in DIRECTIONS:
         raise ConfigError(
-            "crispr_mode 为 other 时 expected_target_direction 必须是 "
+            "experiment.crispr_mode 为 other 时 expected_target_direction 必须是 "
             "down、up、bidirectional 或 unknown。"
         )
     return str(direction)
 
 
 def _require_confirmed_qc(qc: dict[str, Any]) -> None:
-    n_mad = qc.get("n_mad", 3)
-    if isinstance(n_mad, bool) or not isinstance(n_mad, int | float) or float(n_mad) <= 0:
-        raise ConfigError("qc.n_mad 必须是正数。")
-    qc["n_mad"] = float(n_mad)
     _require_gene_cutoffs(qc)
     _require_mito_cutoff(qc)
     _optional_fraction(qc, "max_ribo_frac", "qc.max_ribo_frac")
@@ -678,9 +682,10 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     if len(present) != len(_QC_CUTOFFS):
         raise ConfigError(
             "命令行上的 --min-umi、--max-umi 必须同时填写，"
-            "或者全部留空，留空时用 median ± qc.n_mad。"
+            "或者全部留空（留空则不做 UMI 绝对阈值过滤）。"
             "线粒体比例上限由 qc.max_mito_frac 单独设置（默认 0.2）。"
             "表达基因数上下限由 qc.min_genes / qc.max_genes 单独设置。"
+            "核糖体比例上限由 --max-ribo-frac / qc.max_ribo_frac 显式给出，缺省则不做 ribo 过滤。"
         )
     for key in _QC_CUTOFFS:
         value = qc.get(key)
@@ -730,6 +735,51 @@ def _optional_fraction(section: dict[str, Any], key: str, label: str) -> None:
 def _blank_to_none(value: Any) -> str | None:
     text = _optional_text(value)
     return text or None
+
+
+def _validate_embedding_ndims(config: dict[str, Any]) -> None:
+    """Keep preprocess.n_pcs and mixscape.n_dims aligned (default 30)."""
+    preprocess = config["preprocess"]
+    mixscape = config["mixscape"]
+    n_pcs = preprocess.get("n_pcs", DEFAULT_EMBEDDING_NDIMS)
+    n_dims = mixscape.get("n_dims", DEFAULT_EMBEDDING_NDIMS)
+    for name, value in (("preprocess.n_pcs", n_pcs), ("mixscape.n_dims", n_dims)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 2:
+            raise ConfigError(f"{name} 必须是 ≥2 的整数。")
+    if n_pcs != n_dims:
+        raise ConfigError(
+            f"preprocess.n_pcs={n_pcs} 与 mixscape.n_dims={n_dims} 不一致；"
+            f"二者须相同（默认 {DEFAULT_EMBEDDING_NDIMS}）。"
+        )
+    preprocess["n_pcs"] = n_pcs
+    mixscape["n_dims"] = n_dims
+
+
+def _validate_mixscape_fallback(config: dict[str, Any]) -> None:
+    """Keep mixscape.logfc_threshold and perturb.mixscape_logfc from drifting apart.
+
+    The primary key is ``mixscape.logfc_threshold`` (Seurat default 0.25).
+    ``perturb.mixscape_logfc`` is only a fallback when the primary key is absent.
+    """
+    mix = config.get("mixscape")
+    perturb = config.get("perturb")
+    if not isinstance(mix, dict) or not isinstance(perturb, dict):
+        return
+    primary = mix.get("logfc_threshold")
+    fallback = perturb.get("mixscape_logfc")
+    if primary is None or fallback is None:
+        return
+    if isinstance(primary, bool) or isinstance(fallback, bool):
+        return
+    if not isinstance(primary, int | float) or not isinstance(fallback, int | float):
+        return
+    if float(primary) != float(fallback):
+        raise ConfigError(
+            "mixscape.logfc_threshold 与 perturb.mixscape_logfc 不一致："
+            f"{primary} vs {fallback}。"
+            "请只改 mixscape.logfc_threshold，并把回退键改成相同数值"
+            "（Mixscape 默认 0.25，勿与 mixscale.logfc_threshold=0.2 混用）。"
+        )
 
 
 def _validate_statistics(statistics: dict[str, Any]) -> None:

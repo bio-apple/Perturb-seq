@@ -10,7 +10,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
-from perturbseq.config import mito_prefix
+from perturbseq.config import DEFAULT_EMBEDDING_NDIMS, mito_prefix
 
 
 def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
@@ -37,7 +37,11 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
     usable = int(adata.var["highly_variable"].sum())
     if usable < 2:
         raise ValueError("高变基因数不足以计算 PCA。")
-    n_comps = min(int(settings["n_pcs"]), usable - 1, adata.n_obs - 1)
+    n_comps = min(
+        int(settings.get("n_pcs", DEFAULT_EMBEDDING_NDIMS)),
+        usable - 1,
+        adata.n_obs - 1,
+    )
     if n_comps < 2:
         raise ValueError("细胞数或高变基因数不足以计算 PCA。")
     _pca_on_scaled_hvg(adata, n_comps, seed)

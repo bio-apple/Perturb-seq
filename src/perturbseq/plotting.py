@@ -1147,12 +1147,18 @@ def draw_umap(
     sns.scatterplot(data=table, x="umap_1", y="umap_2", hue=column, s=6, linewidth=0, ax=axis)
     axis.set_xlabel("UMAP 1")
     axis.set_ylabel("UMAP 2")
+    if embedding == "X_umap_mixscape":
+        axis.set_title(f"{column} on Mixscape signature UMAP (X_pert); not expression space")
+        space_note = "Mixscape signature space (X_umap_mixscape from X_pert)"
+    else:
+        axis.set_title(f"{column} on expression UMAP; descriptive, not a distance test")
+        space_note = f"descriptive expression UMAP from {embedding}"
     store.save(
         figure,
         name,
         "embedding",
         table,
-        f"descriptive UMAP from {embedding}; not used as a statistical distance",
+        f"{space_note}; not used as a statistical distance",
     )
 
 
@@ -1534,9 +1540,7 @@ def _pca_display_limits(
     y_span = max(float(y_hi - y_lo), 1e-9)
     xlim = (float(x_lo - pad * x_span), float(x_hi + pad * x_span))
     ylim = (float(y_lo - pad * y_span), float(y_hi + pad * y_span))
-    n_out = int(
-        ((x < xlim[0]) | (x > xlim[1]) | (y < ylim[0]) | (y > ylim[1])).sum()
-    )
+    n_out = int(((x < xlim[0]) | (x > xlim[1]) | (y < ylim[0]) | (y > ylim[1])).sum())
     return xlim, ylim, n_out
 
 
@@ -1724,7 +1728,7 @@ def draw_mixscape_class_global_umap(
         linewidth=0,
         ax=axis,
     )
-    axis.set_title("mixscape_class_global")
+    axis.set_title("mixscape_class_global on signature UMAP (X_pert); not expression space")
     axis.set_xlabel("UMAP1")
     axis.set_ylabel("UMAP2")
     counts = labels.value_counts()
@@ -1734,7 +1738,7 @@ def draw_mixscape_class_global_umap(
         name,
         "mixscape",
         table,
-        f"X_umap_mixscape signature space; classes kept: {summary}",
+        f"X_umap_mixscape signature space (control-relative X_pert); classes kept: {summary}",
     )
 
 
@@ -2199,7 +2203,11 @@ def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5
     return pd.DataFrame(
         {
             "key": ["n_targets", "n_targets_with_de", "n_targets_in_own_de"],
-            "label": ["靶基因总数", "有差异表达基因的靶基因", "差异基因包含对应靶基因"],
+            "label": [
+                "靶基因总数",
+                "通过 Mixscape DE 门槛",
+                "自身在 DE 名单中",
+            ],
             "n": [len(targets), len(with_de), len(in_own_list)],
         }
     )
@@ -2222,7 +2230,7 @@ def target_de_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
             fontsize=10,
         )
     axis.set_ylabel("靶基因数")
-    axis.set_title("靶基因差异表达统计")
+    axis.set_title("Mixscape DE 门槛计数（细胞级 Wilcoxon，非生物学重复检验）")
     return figure, frame
 
 
@@ -2243,7 +2251,8 @@ def draw_target_de_counts(
         name,
         "plot",
         frame,
-        "three target-DE counts; integer labels; blue bars; no flag line",
+        "Mixscape DE-gate target counts (cell-level Wilcoxon); not a biological-replicate test; "
+        "integer labels; blue bars",
     )
 
 
@@ -2291,8 +2300,8 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
             va="bottom",
             fontsize=10,
         )
-    axis.set_ylabel("差异基因数")
-    axis.set_title("差异基因名单包含自身的靶基因")
+    axis.set_ylabel("DE 基因数（Mixscape 门槛名单）")
+    axis.set_title("自身基因在 Mixscape DE 名单中的靶基因（非组间推断）")
     if len(frame) > 40:
         axis.set_xticks([])
         axis.set_xlabel(f"{len(frame)} 个靶基因，名称在表里")
@@ -2325,7 +2334,8 @@ def draw_target_in_de_gene_counts(
         name,
         "plot",
         frame,
-        "targets whose stored DE list contains their own symbol; label is full n_de_genes",
+        "Mixscape DE-gate targets whose stored DE list contains their own symbol; "
+        "bar height is full n_de_genes; not a biological-replicate test",
     )
 
 

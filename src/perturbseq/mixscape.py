@@ -6,25 +6,23 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 from anndata import AnnData
-from pertpy.tools import Mixscape
 from scipy import sparse
 
 from perturbseq.assign import STATUS_NT, STATUS_TARGET, control_cell_mask
-from perturbseq.config import ZERO_GUIDE_LABEL, control_spec
-from perturbseq.de_gate import SKIPPED_NO_DE, differential_gene_gate, stamp_control_label
+from perturbseq.config import DEFAULT_SIGNATURE_NDIMS, ZERO_GUIDE_LABEL, control_spec
 
 PERTURBED = "perturbed"
 NON_PERTURBED = "non_perturbed"
 AMBIGUOUS = "ambiguous"
 NOT_EVALUATED = "not_evaluated"
 
-# CalcPerturbSig in the Mixscape vignette uses ndims=40 and num.neighbors=20.
-# RunMixscape's call omits logfc.threshold; the function default is 0.25.
+# Seurat Mixscape vignette used CalcPerturbSig ndims=40; this pipeline keeps
+# preprocess PCA and signature width aligned at DEFAULT_SIGNATURE_NDIMS (30).
+# num.neighbors=20. RunMixscape omits logfc.threshold; function default is 0.25.
 # https://satijalab.org/seurat/articles/mixscape_vignette
 # https://satijalab.org/seurat/reference/runmixscape
-VIGNETTE_SIGNATURE_NDIMS = 40
+# DEFAULT_SIGNATURE_NDIMS is imported from config (re-exported for default checks).
 VIGNETTE_CONTROL_NEIGHBORS = 20
 
 
@@ -54,7 +52,7 @@ def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def signature_n_dims(n_obs: int, n_vars: int, requested: int = VIGNETTE_SIGNATURE_NDIMS) -> int:
+def signature_n_dims(n_obs: int, n_vars: int, requested: int = DEFAULT_SIGNATURE_NDIMS) -> int:
     """CalcPerturbSig ndims. Cap only when the matrix is smaller than the request."""
     return max(1, min(int(requested), int(n_obs) - 1, int(n_vars)))
 
@@ -68,6 +66,10 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     above 0.5 is the software's perturbed class. The signature UMAP is stored
     separately from the expression UMAP.
     """
+    from pertpy.tools import Mixscape
+
+    from perturbseq.de_gate import SKIPPED_NO_DE, differential_gene_gate, stamp_control_label
+
     spec = control_spec(config)
     control = spec["control_label"]
     control_cells = control_cell_mask(adata.obs, spec)
@@ -134,7 +136,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         return adata
     keep = labels.isin(passed | {control}).to_numpy()
     work = adata[keep, hvg].copy()
-    requested_dims = int(mixscape_settings.get("n_dims", VIGNETTE_SIGNATURE_NDIMS))
+    requested_dims = int(mixscape_settings.get("n_dims", DEFAULT_SIGNATURE_NDIMS))
     n_dims = _prepare_signature_dims(work, requested_dims, seed)
     n_nt = int((work.obs["target_gene"].astype(str) == control).sum())
     if n_nt < 1:
@@ -254,10 +256,12 @@ def _prepare_signature_dims(work: AnnData, requested: int, seed: int) -> int:
 
     Pertpy uses ``X_pca`` when the gene count exceeds Scanpy's PC threshold.
     A shorter preprocess PCA is rebuilt on a z-scored copy so the search can use
-    the vignette width. ``work.X`` stays log-normalized: the signature itself is
-    the difference of unscaled expression. The cap applies only when the matrix
-    itself is smaller.
+    the requested width (aligned with ``preprocess.n_pcs``, default 30).
+    ``work.X`` stays log-normalized: the signature itself is the difference of
+    unscaled expression. The cap applies only when the matrix itself is smaller.
     """
+    import scanpy as sc
+
     n_dims = signature_n_dims(work.n_obs, work.n_vars, requested)
     if work.n_vars <= int(sc.settings.N_PCS):
         return n_dims
@@ -279,10 +283,13 @@ def _signature_umap(work: AnnData, seed: int, n_dims: int) -> tuple[np.ndarray |
     """PCA and UMAP on the perturbation signature.
 
     Seurat Mixscape vignette runs ``ScaleData(do.scale=FALSE, do.center=TRUE)`` on
-    PRTB then ``RunPCA`` / ``RunUMAP`` on dims 1:40. Scanpy PCA zero-centers genes
-    (equivalent to center-only). Do not gene-scale here: that would add a global
-    Z-score on top of the control-neighbor signature and diverge from the vignette.
+    PRTB then ``RunPCA`` / ``RunUMAP`` on dims 1:40; this pipeline uses the shared
+    ``n_dims`` (default 30). Scanpy PCA zero-centers genes (equivalent to
+    center-only). Do not gene-scale here: that would add a global Z-score on top
+    of the control-neighbor signature and diverge from the vignette.
     """
+    import scanpy as sc
+
     if "X_pert" not in work.layers or work.n_obs < 4:
         return None, "not_run_too_few_cells"
     vis = work.copy()

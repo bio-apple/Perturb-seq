@@ -55,7 +55,7 @@
 | `barcode_differences.tsv`、`input_validation.json` | `io` / `--validate-only` | 集合一致时差异表仅表头 |
 | `tables/guide_reference_conflicts.tsv` | 参考表冲突 | 参考表通过 |
 | `tables/cell_calls.tsv`、`io_checks.json`、`multi_guide_composition.tsv`、`checkpoints/io.h5ad` | `io` 通过 | assignment-only 时提前退出 |
-| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI、mito≥20%、表达基因数 200–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
+| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（固定阈值：mito≥20%、表达基因数 200–6000；UMI / ribo 仅在显式给出时过滤；`low_library_no_guide` 已禁用） | 无 `io` checkpoint |
 | `qc/tables/qc_metrics.tsv` | UMI、基因数、mito、ribo、guide UMI、捕获效率 | 同上 |
 | `qc/tables/grna_capture_library_correlation.tsv` | Spearman；含低文库排除是否执行 | 缺列 / 细胞 < 2 / 方差 0 |
 | `qc/tables/assignment_summary.tsv` | 四类分配计数 | 同上 |
@@ -63,7 +63,7 @@
 
 过滤顺序：`low_library_no_guide` → `no_guide` → `multi_guide` → `low_guide_umi` → `qc_failed` → `low_cells_target` → `retained`。
 
-`low_library_no_guide` 仍在账本，状态 `no_guide`，`qc_pass=false`，不进对照。
+`low_library_no_guide` 阶段仍在账本，但规则已禁用（原 MAD 路径已移除），新增排除数为 0。
 
 ---
 
@@ -71,8 +71,8 @@
 
 | 路径 | 何时有 | 何时缺 |
 | --- | --- | --- |
-| `checkpoints/preprocess.h5ad` | 全基因归一化；PCA / neighbors / Leiden / UMAP 在 top 2000 HVG 上；可选 Harmony；scib 细胞周期；`uns['preprocess']` 记参数 | 无分析细胞 |
-| `checkpoints/mixscape.h5ad` | Mixscape 分类、`X_pert`、signature UMAP | `mixscape` 未跑 |
+| `checkpoints/preprocess.h5ad` | 全基因归一化；PCA（默认 `n_pcs=30`）/ neighbors / Leiden / UMAP 在 top 2000 HVG 上；可选 Harmony；scib 细胞周期；`uns['preprocess']` 记参数 | 无分析细胞 |
+| `checkpoints/mixscape.h5ad` | Mixscape 分类、`X_pert`、signature UMAP（`n_dims` 默认 30，与 `preprocess.n_pcs` 一致） | `mixscape` 未跑 |
 | `checkpoints/mixscale.h5ad` | Mixscale 分数（依赖 `X_pert`） | `mixscale` 未跑；缺 `X_pert` 时跳过并写 checkpoint |
 | `checkpoints/perturb.h5ad` | 描述性效应、伪批量与 E-distance 之后 | `perturb` 未跑 |
 | `DGE/Mixscape/tables/mixscape_de_gate.tsv` | Mixscape 门槛（默认 logfc 0.25） | `no_zero_guide_cells`；`mixscape.enabled=false` |
@@ -103,8 +103,8 @@
 | `qc/figures/assignment_status_bar.png` | 四类分配 | 无 `assignment_status` |
 | `qc/figures/cells_per_target_bar.png` | 靶基因细胞数 | 表空 |
 | `qc/figures/target_cell_counts.png` | 函数可画；`report` 当前不调用 | 未调用 |
-| `qc/figures/qc_scatter.png` | nCount vs mito / nFeature | 缺 QC 列 |
-| `qc/figures/qc_violin.png` | nFeature、nCount、percent.mt；有则加 percent.ribo | 缺 QC 列 |
+| `qc/figures/qc_scatter.png` | nCount vs mito / nFeature（全 annotated 账本优先；过滤前） | 缺 QC 列 |
+| `qc/figures/qc_violin.png` | nFeature、nCount、percent.mt；有则加 percent.ribo（同上） | 缺 QC 列 |
 | `qc/figures/temporary_control_qc.png` | 仅 zero-guide：对照 vs targeting 的 UMI / 基因数 / mt | 设计 NT；缺列或空组 |
 | `qc/figures/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA；`pca_scatter` 为 PC1–PC2（有 Leiden 则着色），图例在图下方多列，显示轴取 0.5–99.5% 百分位窗口（不改 `X_pca`） | 无预处理对象 |
 
@@ -136,8 +136,9 @@
 | `DGE/descriptive/figures/guide_consistency.png`、`pseudobulk_*.png` | guide 一致性 / 伪批量 | 表空；guide < 3 |
 | `DGE/descriptive/plot_data/volcano.skipped.txt` | `inference_not_available` | 单样本不画单独火山图 |
 | `DGE/descriptive/plot_data/target_effect_forest.skipped.txt` | `inference_not_available` | 同上 |
+| `E-distance/figures/edistance_etest.png` | 表达 `X_pca` 上相对对照的 E-test；着色为样本内校正显著；非生物学重复 | `no_zero_guide_cells` / `missing_X_pca` |
 | `E-distance/…/perturbation_distance_heatmap.png` 等 | guide 伪批量两两距离（标题标明非 E-test） | 无 `min_guide_replicates` |
-| `figures/summary/perturbation_summary.png` | 摘要条形图 | 表空或数值全 NA |
+| `figures/summary/perturbation_summary.png` | 摘要条形图；descriptive 模式不含显著计数 / FDR 阈值列 | 表空或数值全 NA |
 
 `report` 不调用 `save_target_log2fc_bar`，因此不会重画 `{靶基因}_log2fc.png`。
 

@@ -450,52 +450,6 @@ def capture_efficiency(guide_umi: np.ndarray, total_counts: np.ndarray) -> np.nd
     return efficiency
 
 
-def low_library_no_guide_rule(
-    total_counts: pd.Series | np.ndarray,
-    n_guides: pd.Series | np.ndarray,
-    n_mad: float,
-) -> dict[str, Any]:
-    """Library-size floor from cells with at least one detected guide.
-
-    The floor is expm1(median(log1p(total_counts)) - n_mad * 1.4826 * MAD) on
-    those cells, the same MAD definition as the UMI thresholds. No detected
-    guide, or zero variance of their library size, skips the exclusion.
-    """
-    total = pd.to_numeric(pd.Series(total_counts), errors="coerce").to_numpy(dtype=float)
-    guides = pd.to_numeric(pd.Series(n_guides), errors="coerce").to_numpy(dtype=float)
-    detected = np.isfinite(guides) & (guides >= 1) & np.isfinite(total)
-    values = total[detected]
-    definition = (
-        "检测到至少 1 条 guide 的细胞，"
-        "log1p(total_counts) 的 median - n_mad × 1.4826 × MAD，再 expm1"
-    )
-    payload: dict[str, Any] = {
-        "applied": False,
-        "reason": "no_cells_with_guide",
-        "min_total_counts": None,
-        "source": "skipped",
-        "n_cells_with_guide": int(values.size),
-        "n_mad": float(n_mad),
-        "definition": definition,
-        "note": "没有细胞检测到 guide，不排除 no_guide，也不把它们改成设计好的 NT。",
-    }
-    if values.size == 0:
-        return payload
-    if float(np.var(values)) == 0.0:
-        payload["reason"] = "library_size_variance_zero"
-        payload["note"] = "检测到 guide 的细胞文库大小方差为 0，跳过这条排除。"
-        return payload
-    payload["applied"] = True
-    payload["reason"] = ""
-    payload["min_total_counts"] = _cutoff(pd.Series(values), None, float(n_mad), "lower", log=True)
-    payload["source"] = "median_mad"
-    payload["note"] = (
-        "没检测到 guide 且 total_counts 低于该下限的细胞，"
-        "qc_pass 为 false，过滤阶段为 low_library_no_guide，不进入对照。"
-    )
-    return payload
-
-
 def capture_library_correlation(table: pd.DataFrame) -> pd.DataFrame:
     """Spearman correlation of capture efficiency and library size before QC pass.
 
@@ -587,63 +541,29 @@ def _gene_block_sum(counts: Any, mask: np.ndarray, n_obs: int) -> np.ndarray:
     return np.asarray(block.sum(axis=1)).ravel()
 
 
-def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str, float]:
-    """Use configured cutoffs, or median ± MAD on the observed distribution.
+def derive_qc_thresholds(qc: dict[str, Any]) -> dict[str, float]:
+    """Resolve QC cutoffs from fixed config / CLI values only.
 
-    Expressed-gene bounds and ``max_mito_frac`` come from software defaults or
-    the CLI. They are not derived by MAD. Ribosome fraction is a separate upper
-    bound and is also outside the UMI absolute set.
+    Gene bounds and ``max_mito_frac`` always come from software defaults or the
+    CLI. UMI bounds apply only when both ``min_umi`` and ``max_umi`` are set.
+    Ribosome fraction applies only when ``max_ribo_frac`` is set. There is no
+    MAD / distribution-derived fallback.
     """
-    n_mad = float(qc.get("n_mad", 3))
-    if "pct_counts_ribo" in metrics.columns:
-        ribo = metrics["pct_counts_ribo"]
-    elif "ribo_frac" in metrics.columns:
-        ribo = metrics["ribo_frac"]
-    else:
-        raise ValueError("缺少核糖体比例，不能把未计算的 QC 默认为通过。")
     if qc.get("min_genes") is None or qc.get("max_genes") is None:
         raise ValueError("缺少 qc.min_genes 或 qc.max_genes。")
     if qc.get("max_mito_frac") is None:
         raise ValueError("缺少 qc.max_mito_frac。")
-    return {
-        "min_umi": _cutoff(metrics["total_counts"], qc.get("min_umi"), n_mad, "lower", log=True),
-        "max_umi": _cutoff(metrics["total_counts"], qc.get("max_umi"), n_mad, "upper", log=True),
+    thresholds: dict[str, float] = {
         "min_genes": float(qc["min_genes"]),
         "max_genes": float(qc["max_genes"]),
         "max_mito_frac": float(qc["max_mito_frac"]),
-        "max_ribo_frac": _cutoff(ribo, qc.get("max_ribo_frac"), n_mad, "upper", log=False),
     }
-
-
-def _cutoff(
-    values: pd.Series,
-    configured: Any,
-    n_mad: float,
-    side: str,
-    *,
-    log: bool,
-) -> float:
-    if configured is not None:
-        return float(configured)
-    array = values.to_numpy(dtype=np.float64)
-    array = array[np.isfinite(array)]
-    if array.size == 0:
-        return 0.0
-    transformed = np.log1p(np.clip(array, 0, None)) if log else array
-    median = float(np.median(transformed))
-    mad = float(np.median(np.abs(transformed - median)))
-    sigma = 1.4826 * mad
-    if sigma == 0:
-        sigma = float(np.std(transformed))
-    if side == "lower":
-        bound = median - n_mad * sigma
-        raw = float(np.expm1(bound)) if log else bound
-        return float(max(0.0, raw))
-    bound = median + n_mad * sigma
-    raw = float(np.expm1(bound)) if log else bound
-    if not log:
-        return float(min(1.0, max(0.0, raw)))
-    return float(max(0.0, raw))
+    if qc.get("min_umi") is not None and qc.get("max_umi") is not None:
+        thresholds["min_umi"] = float(qc["min_umi"])
+        thresholds["max_umi"] = float(qc["max_umi"])
+    if qc.get("max_ribo_frac") is not None:
+        thresholds["max_ribo_frac"] = float(qc["max_ribo_frac"])
+    return thresholds
 
 
 def _low_library_no_guide_mask(
@@ -675,17 +595,15 @@ def apply_eligibility(
 ) -> pd.DataFrame:
     """Attach QC, every exclusion reason, and one primary reason per cell.
 
-    ``low_library_rule`` drops shallow cells with no detected guide. Cells that
-    already have a guide are not relabeled, and a real single_nt call is unchanged.
-    Retention uses unique target-gene count (``n_targets``), not guide count.
+    ``low_library_rule`` is retained for ledger compatibility but is disabled
+    after MAD-based QC removal (pass ``None`` or ``applied=False``). Retention
+    uses unique target-gene count (``n_targets``), not guide count.
     """
     table = annotated.copy()
     for column in ("total_counts", "n_genes_by_counts", "mito_frac", "ribo_frac"):
         if column not in table.columns:
             raise ValueError(f"缺少 {column}，不能把未计算的 QC 默认为通过。")
         table[column] = pd.to_numeric(table[column], errors="coerce")
-    if "max_ribo_frac" not in thresholds:
-        raise ValueError("缺少 max_ribo_frac，不能把未计算的核糖体 QC 默认为通过。")
     total = table["total_counts"].to_numpy(dtype=float)
     genes = table["n_genes_by_counts"].to_numpy(dtype=float)
     mito = table["mito_frac"].to_numpy(dtype=float)
@@ -693,14 +611,20 @@ def apply_eligibility(
     finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito) & np.isfinite(ribo)
     if "max_genes" not in thresholds:
         raise ValueError("缺少 max_genes，不能把未计算的基因数 QC 默认为通过。")
-    low_umi = finite & (total < float(thresholds["min_umi"]))
-    high_umi = finite & (total > float(thresholds["max_umi"]))
+    empty = np.zeros(len(table), dtype=bool)
+    umi_ready = "min_umi" in thresholds and "max_umi" in thresholds
+    low_umi = finite & (total < float(thresholds["min_umi"])) if umi_ready else empty
+    high_umi = finite & (total > float(thresholds["max_umi"])) if umi_ready else empty
     # Drop cells with ≤ min_genes or ≥ max_genes expressed genes.
     low_genes = finite & (genes <= float(thresholds["min_genes"]))
     high_genes = finite & (genes >= float(thresholds["max_genes"]))
     # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.2).
     high_mito = finite & (mito >= float(thresholds["max_mito_frac"]))
-    high_ribo = finite & (ribo > float(thresholds["max_ribo_frac"]))
+    high_ribo = (
+        finite & (ribo > float(thresholds["max_ribo_frac"]))
+        if "max_ribo_frac" in thresholds
+        else empty
+    )
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
     qc_pass = (
         finite

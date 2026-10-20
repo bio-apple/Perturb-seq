@@ -1,6 +1,6 @@
 # Perturb-seq 单样本三级分析
 
-从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 和扰动距离。一次运行一个生物学样本。
+从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 和扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
 
 文档索引见 [docs/README.md](docs/README.md)。
 
@@ -32,7 +32,7 @@ python -m perturbseq \
   --nt-control NT_NAME
 ```
 
-`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control` 时使用 `zero_guide` 临时对照。
+`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control` 时使用 `zero_guide` 临时对照。`--organism` 写入 `experiment.organism`（`human` / `mouse`）。`--crispr-mode` 取 `KO` / `i` / `a` / `other`（默认 `KO`）。
 
 ## 输出概览
 

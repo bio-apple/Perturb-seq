@@ -21,13 +21,14 @@
 
 ## 命令行与配置
 
-`config/config.yaml` 只放软件默认参数。样本名、物种、目录、guide 分隔符、非靶向对照和 CRISPR 模式由命令行传入。不传 `--config` 时读这份默认文件；命令行覆盖同名字段。
+`config/config.yaml` 只放软件默认参数。样本名、物种（`--organism` → `experiment.organism`）、目录、guide 分隔符、非靶向对照和 CRISPR 模式（`--crispr-mode`：`KO` / `i` / `a` / `other`）由命令行传入。不传 `--config` 时读这份默认文件；命令行覆盖同名字段。
 
 出现代码不读取的配置键会失败，错误为 `未识别的配置键` + 键路径。`labels.flag_guides_above` 一旦写出，会以「已停用」拒绝启动。
 
 | 参数 | 说明 |
 | --- | --- |
-| `--crispr-mode` | 默认 `CRISPR_KO`，也可 `i` / `a` / `other` |
+| `--organism` | 必填 `human` / `mouse`，写入 `experiment.organism` |
+| `--crispr-mode` | `KO` / `i` / `a` / `other`，默认 `KO`；内部映射见 [CRISPR 模式](#crispr-模式) |
 | `--steps` | 默认 `all`：`io` → `assign` → `preprocess` → `mixscape` → `mixscale` → `perturb` → `report` |
 | `--resume` | 从上一 checkpoint 继续 |
 | `--validate-only` | 只检查参考表和 barcode |
@@ -49,7 +50,7 @@
 
 ## 物种
 
-`--organism` 必填，只能是 `human` 或 `mouse`（大小写不敏感，加载后小写）。
+`--organism` 必填，写入配置键 `experiment.organism`；只能是 `human` 或 `mouse`（大小写不敏感，加载后小写）。
 
 | 物种 | 基因号 | 线粒体前缀 |
 | --- | --- | --- |
@@ -64,7 +65,9 @@
 
 ## CRISPR 模式
 
-| 输入 | 解析为 | 预期方向 |
+对外与命令行统一写 `KO` / `i` / `a` / `other`（`--crispr-mode`，配置键 `experiment.crispr_mode`）。解析后内部枚举为 `CRISPR_KO` / `CRISPRi` / `CRISPRa` / `other`（见下表）；完整名别名仍可接受，但错误信息与默认参数对外只写简写。
+
+| CLI / 配置输入 | 内部枚举 | 预期方向 |
 | --- | --- | --- |
 | 缺省 / `KO` | `CRISPR_KO` | `not_required` |
 | `i` | `CRISPRi` | `down` |
@@ -111,41 +114,35 @@
 
 ### UMI 绝对阈值
 
-命令行须同时给出 `--min-umi`、`--max-umi`，或全部留空。只给其中一个会失败。
+命令行须同时给出 `--min-umi`、`--max-umi`，或全部留空。只给其中一个会失败。默认配置不设 UMI 绝对阈值。
 
-全部留空时，在分配步骤用全部细胞计算，写入 `tables/qc_thresholds.json`，`source=median_mad`：
+- 成对给出时写入 `tables/qc_thresholds.json`，`source=command_line`，`umi_filter=absolute_cutoffs`
+- 全部留空时不做 UMI 绝对阈值过滤：`source=skipped`，`umi_filter=disabled`
 
-- UMI：`log1p` → median ± `qc.n_mad`（默认 3）× 1.4826 × MAD → `expm1`
-- MAD 为 0 时改用标准差
-
-命令行给齐这两个数时 `source=command_line`。
+不再用 median ± MAD 推导 UMI 上下限。
 
 ### 表达基因数
 
-默认剔除表达基因数 ≤ 200 或 ≥ 6000 的细胞：`qc.min_genes=200`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI 成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。靶基因 / guide 细胞数门槛默认 `min_cells_per_target=20`、`min_cells_per_guide=10`。
+默认剔除表达基因数 ≤ 200 或 ≥ 6000 的细胞：`qc.min_genes=200`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。不并入 UMI 成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。靶基因 / guide 细胞数门槛默认 `min_cells_per_target=20`、`min_cells_per_guide=10`。
 
 ### 线粒体比例
 
-默认剔除线粒体 reads 比例 ≥ 20% 的细胞：`qc.max_mito_frac=0.2`。可用 `--max-mito-frac` 覆盖。不由 MAD 推导。失败原因是 `high_mito`。
+默认剔除线粒体 reads 比例 ≥ 20% 的细胞：`qc.max_mito_frac=0.2`。可用 `--max-mito-frac` 覆盖。失败原因是 `high_mito`。
+
+> **方法学警示**：20% 是软件默认固定阈值，不是按本样本分布自适应的。肿瘤、高代谢或线粒体相关扰动研究应先看 `qc_violin` / `qc_scatter` 的线粒体分布，再决定是否用 `--max-mito-frac` 调整；过度过滤会丢掉真实生物学变异。
 
 ### 核糖体比例
 
 按基因符号前缀：人类 `RPL`/`RPS`，小鼠 `Rpl`/`Rps`（大小写不敏感）。这是核糖体蛋白，不是线粒体；`MRPL`/`Mrpl` 不计；不用 rRNA 基因集。比例 0–1，图上 `percent.ribo` 为 0–100。
 
-未给 `--max-ribo-frac` 时，上限为 median + `qc.n_mad` × 1.4826 × MAD（`ribo_frac_source=median_mad`）。单独给出（0–1）时用该值。超过则 QC 排除，原因 `high_ribo`，主过滤阶段仍是 `qc_failed`。
+须显式给出 `--max-ribo-frac` / `qc.max_ribo_frac`（0–1）才做 ribo 过滤（`ribo_frac_source=command_line`）。未给出时不做 ribo 过滤（`ribo_frac_source=disabled`）。超过则 QC 排除，原因 `high_ribo`，主过滤阶段仍是 `qc_failed`。不再用 MAD 推导上限。
 
 ### gRNA 捕获效率与文库大小
 
 - 效率 = CRISPR guide UMI 合计 / Gene Expression `total_counts`（guide UMI 为 0 则效率为 0）
 - Spearman（QC 前全部细胞）→ `qc/tables/grna_capture_library_correlation.tsv`（此 p 不进效应表）
 
-避免文库偏浅、未捕获 guide 的细胞被当作阴性对照：
-
-1. 在已检出 ≥1 条 guide 的细胞上，对 `log1p(total_counts)` 取 median − n_mad × 1.4826 × MAD，再 `expm1`
-2. 无 guide 且 `total_counts` 低于该下限 → `qc_pass=false`，阶段 `low_library_no_guide`
-3. 仍记在账本，分配状态仍是 `no_guide`，但不进对照
-
-无细胞有 guide，或有 guide 细胞文库方差为 0 时跳过该排除（`no_cells_with_guide` / `library_size_variance_zero`）。
+原 `low_library_no_guide`（按有 guide 细胞的 MAD 文库下限排除浅库无 guide 细胞）已移除，不再做该排除；过滤账本仍保留该阶段名，新增排除数为 0。
 
 ---
 
@@ -168,7 +165,7 @@
 low_library_no_guide → no_guide → multi_guide → low_guide_umi → qc_failed → low_cells_target → retained
 ```
 
-规则跳过时，`low_library_no_guide` 新增排除数为 0。
+`low_library_no_guide` 已禁用（不再用 MAD），该阶段新增排除数恒为 0。
 
 `guides_per_cell` 图：`qc/figures/guides_per_cell.png` 仍按 guide 条数分布作图（描述捕获），与资格判定用的 `n_targets` 不同。纵轴 `Cells`；分母含 `no_guide` 与 `multi_guide`；柱上标计数与一位小数百分比。
 
@@ -242,13 +239,17 @@ Mixscape 是敏感性分支。标签：`nt` / `perturbed` / `non_perturbed` / `a
 | | Mixscape | Mixscale |
 | --- | --- | --- |
 | 对齐 | Seurat Mixscape vignette | Mixscale 教程 |
-| `logfc_threshold` | 0.25 | 0.2 |
+| `logfc_threshold` | **0.25**（`mixscape.logfc_threshold`；勿与 Mixscale 的 0.2 混用） | **0.2**（`mixscale.logfc_threshold`） |
 | `min_de_genes` | 5 | 5 |
 | `max_de_genes` | 100 | 100 |
 | `pval_cutoff` | 0.05 | 0.05 |
-| 其他 | `n_dims=40`，`n_control_neighbors=20`，`iter_num=10` | 不读 Mixscape 的 0.25 / `n_dims` |
+| 其他 | `n_dims=30`（与 `preprocess.n_pcs` 一致），`n_control_neighbors=20`，`iter_num=10` | 不读 Mixscape 的 0.25 / `n_dims` |
+
+两套门槛独立：改 Mixscape 不会改 Mixscale，反之亦然。`perturb.mixscape_logfc` 仅在 `mixscape.logfc_threshold` 缺省时回退，须与 Mixscape 一致。
 
 仅通过对应门槛的靶基因进入 2×2 / 山脊图 / 散点图。2×2 还需 NP、NT、KO 与扰动分数齐全。Mixscale 把软件填的假分数 `1` 置为缺失；散点图再丢掉有限分数全为 1 的靶基因。
+
+> **口径**：Mixscape 的 KO/NP 是样本内分类（编辑成功与否的启发式），Mixscale 分数是连续扰动强度。二者都不是生物学重复水平上的推断；描述性 CPM log2FC 与 E-distance 见下文。
 
 散点图：`nbin=10`；横轴为该靶基因内分数分位数箱；纵轴为该基因 log 归一化均值；NT 不分面。
 
@@ -268,7 +269,7 @@ Mixscape 是敏感性分支。标签：`nt` / `perturbed` / `non_perturbed` / `a
 | Mixscape signature UMAP | `X_pert` → PCA（`zero_center=True`，不基因 scale）→ UMAP | 是 | 对齐 vignette `ScaleData(do.scale=F, do.center=T)` + `RunPCA`/`RunUMAP`；坐标在 `X_umap_mixscape` |
 | Mixscale | `X_pert`，`scale=True`；投影相对对照分布 z-score，对照细胞分数为 0 | 是 | 连续扰动强度，不是编辑成功与否 |
 | 描述性效应 | 原始 counts 加总 → CPM log2FC vs 对照 | 是（比值） | `log2((CPM_t+α)/(CPM_c+α))`；**不是**基因级 Z-score |
-| E-distance | 预处理 `X_pca`（表达空间） | 对比组是对照，嵌入不是签名 | 对齐 pertpy Distance Tests；**不用** `X_pert` |
+| E-distance | 预处理 `X_pca`（表达空间） | 对比组是对照，嵌入不是签名 | 对齐 pertpy Distance Tests；**不用** `X_pert`；置换单位是细胞 → 样本内距离检验，不是生物学重复 FDR |
 | 热图着色 | 展示时对所选细胞做行 z-score | 仅作图 | 不改 `X` / `X_pert` |
 
 无设计 NT 时，上表「对照」一律为临时 `zero_guide`；图与 `temporary_control_warning` 会标明。不要把表达 UMAP/Leiden 当作「已相对对照标准化后的扰动结构」。
@@ -281,7 +282,7 @@ PCA、邻居图、Leiden 聚类和 UMAP 都建立在 top `preprocess.n_hvg`（�
 
 1. 从 `layers['counts']` 对**全部基因**做文库大小归一化（`normalize_target_sum`，默认 10000）→ `log1p`。完整矩阵留给后续效应表；`layers['counts']` 仍是原始计数。
 2. 高变基因：Seurat flavor，取 top 2000；去掉本物种线粒体前缀后用后面的非线粒体基因补满。
-3. 只在这 2000 个 HVG 上做 z-score（相对**全部分析细胞**，不是相对 NT/`zero_guide`），再算 PCA（`n_pcs` 默认 40）；`X` 保持全基因 log 归一化稀疏矩阵。
+3. 只在这 2000 个 HVG 上做 z-score（相对**全部分析细胞**，不是相对 NT/`zero_guide`），再算 PCA（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致）；`X` 保持全基因 log 归一化稀疏矩阵。
 4. 邻居图、UMAP、Leiden（igraph，`leiden_resolution` 默认 **0.5**）都用这份 HVG-PCA（若跑了 Harmony 则用 `X_pca_harmony`）。这是描述性表达嵌入，不是扰动签名空间。
 5. `--batch-key` 空 → 不跑 Harmony；有键且水平 < 2 → `not_run_fewer_than_two_batch_levels`。
 

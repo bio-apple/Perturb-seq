@@ -1,4 +1,5 @@
-# 分析软件默认参数。样本、物种、输入输出目录、guide 分隔符、非靶向对照和 CRISPR 模式由命令行传入。
+# 分析软件默认参数。样本、物种（--organism → experiment.organism）、输入输出目录、
+# guide 分隔符、非靶向对照和 CRISPR 模式（--crispr-mode：KO / i / a / other → experiment.crispr_mode）由命令行传入。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
 input:
   barcode_policy: strict
@@ -12,8 +13,8 @@ labels:
 qc:
   # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
   # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。
-  # UMI 未在命令行给出时，用 median ± n_mad × 1.4826 × MAD。
-  n_mad: 3
+  # UMI：须同时给出 min_umi / max_umi（命令行或本文件），否则不做 UMI 绝对阈值过滤。
+  # 核糖体：须显式给出 max_ribo_frac，否则不做 ribo 过滤。不再使用 MAD。
   min_genes: 200
   max_genes: 6000
   max_mito_frac: 0.2
@@ -25,18 +26,20 @@ preprocess:
   normalize_target_sum: 10000
   # PCA / neighbors / Leiden / UMAP 建立在 top n_hvg 高变基因上；文库归一化仍用全部基因。
   n_hvg: 2000
-  n_pcs: 40
+  # 与 mixscape.n_dims 保持一致（默认 30；见 config.DEFAULT_EMBEDDING_NDIMS）。
+  n_pcs: 30
   n_neighbors: 15
   leiden_resolution: 0.5
 mixscape:
   enabled: true
   min_de_genes: 5
-  # RunMixscape / MixscapeHeatmap 的 logfc.threshold。教程调用没有改写，函数默认 0.25。
-  logfc_threshold: 0.2
+  # RunMixscape / MixscapeHeatmap 的 logfc.threshold。Seurat 函数默认 0.25（不是 Mixscale 的 0.2）。
+  logfc_threshold: 0.25
   pval_cutoff: 0.05
   max_de_genes: 100
-  # CalcPerturbSig：ndims=40，num.neighbors=20。矩阵比 40 小时才截断。
-  n_dims: 40
+  # CalcPerturbSig 维数；与 preprocess.n_pcs 一致（本流水线 30；Seurat vignette 曾用 40）。
+  # num.neighbors=20。矩阵比请求维数小时才截断。
+  n_dims: 30
   n_control_neighbors: 20
   # RunMixscape iter.num。
   iter_num: 10
@@ -59,12 +62,13 @@ statistics:
   # 百分位区间的水平，取 (0, 1) 内的数。
   bootstrap_ci: 0.95
   min_nt_cells: 20
+  # descriptive 模式下不用于效应表；保留键以免旧配置报未知键。更换后端前不要解读为组间 FDR。
   fdr_threshold: 0.05
   allow_random_split_replicates: false
 perturb:
   distance_metric: edistance
   mixscape_min_de_genes: 5
-  # Mixscape 的回退 logfc，与 mixscape.logfc_threshold 一致。Mixscale 不读这个键。
+  # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致。Mixscale 不读此键。
   mixscape_logfc: 0.25
   mixscape_pval: 0.05
 target_expression:
