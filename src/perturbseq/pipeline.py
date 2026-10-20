@@ -17,20 +17,24 @@ import yaml
 
 from perturbseq import __version__
 from perturbseq.assign import (
+    LOW_LIBRARY_NO_GUIDE,
     STATUS_NO_GUIDE,
     STATUS_NT,
     STATUS_RETAINED,
     STATUS_TARGET,
     GuideReferenceError,
     apply_eligibility,
+    capture_library_correlation,
     cells_per_guide,
     cells_per_target,
     derive_qc_thresholds,
     filter_stage_counts,
+    low_library_no_guide_rule,
     multi_guide_composition,
     validate_guide_targets,
 )
 from perturbseq.config import (
+    TEMPORARY_CONTROL_WARNING,
     ConfigError,
     apply_customer_arguments,
     control_spec,
@@ -38,6 +42,7 @@ from perturbseq.config import (
     output_dir,
     read_config,
     resolve_input_paths,
+    ribo_prefixes,
     software_config_path,
     validate_config,
     verify_species_consistency,
@@ -110,6 +115,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-umi", type=float, default=None)
     parser.add_argument("--min-genes", type=float, default=None)
     parser.add_argument("--max-mito-frac", type=float, default=None)
+    parser.add_argument(
+        "--max-ribo-frac",
+        type=float,
+        default=None,
+        help="核糖体蛋白基因比例上限，0 到 1。不填则用 median + n_mad × MAD，不并入四个绝对阈值。",
+    )
     parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -134,6 +145,7 @@ def main(argv: list[str] | None = None) -> None:
             "max_umi": args.max_umi,
             "min_genes": args.min_genes,
             "max_mito_frac": args.max_mito_frac,
+            "max_ribo_frac": args.max_ribo_frac,
         },
     )
     validate_config(config)
@@ -189,6 +201,8 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
     if resume:
         state["adata"] = _load_resume(folder, steps[0])
     started = time.time()
+    info["temporary_control_warning"] = _publish_temporary_control_warning(folder, config)
+    _write_info(folder, info, started)
     for step in steps:
         print(f"[{step}]", flush=True)
         step_started = time.time()
@@ -245,6 +259,7 @@ def _step_io(folder: Path, config: dict[str, Any]):
             guides_per_cell=int(config["labels"].get("guides_per_cell", 1)),
             min_guide_umi=None if min_guide_umi is None else float(min_guide_umi),
             mito_prefix=mito_prefix(config),
+            ribo_prefixes=ribo_prefixes(config),
         )
     except InputMismatch as exc:
         _write_barcode_differences(folder, exc.only_matrix, exc.only_assignment)
@@ -288,33 +303,63 @@ def _step_io(folder: Path, config: dict[str, Any]):
 def _step_assign(folder: Path, config: dict[str, Any], adata):
     calls = pd.read_csv(folder / "tables" / "cell_calls.tsv", sep="\t", keep_default_na=False)
     calls["guide_umi_pass"] = _as_bool(calls["guide_umi_pass"])
-    for column in ("total_counts", "n_genes_by_counts", "mito_frac"):
-        calls[column] = pd.to_numeric(calls[column], errors="coerce")
+    for column in (
+        "total_counts",
+        "n_genes_by_counts",
+        "mito_frac",
+        "ribo_frac",
+        "guide_umi_total",
+        "grna_capture_efficiency",
+    ):
+        if column in calls.columns:
+            calls[column] = pd.to_numeric(calls[column], errors="coerce")
     metrics = pd.DataFrame(
         {
             "total_counts": calls["total_counts"],
             "n_genes_by_counts": calls["n_genes_by_counts"],
             "pct_counts_mito": calls["mito_frac"],
+            "pct_counts_ribo": calls["ribo_frac"],
         }
     )
     thresholds = derive_qc_thresholds(metrics, config["qc"])
-    configured = all(config["qc"].get(key) is not None for key in (
-        "min_umi",
-        "max_umi",
-        "min_genes",
-        "max_mito_frac",
-    ))
+    n_mad = float(config["qc"].get("n_mad", 3))
+    four = ("min_umi", "max_umi", "min_genes", "max_mito_frac")
+    configured = all(config["qc"].get(key) is not None for key in four)
+    library_rule = low_library_no_guide_rule(calls["total_counts"], calls["n_guides"], n_mad)
+    correlation = capture_library_correlation(calls)
+    correlation["low_library_no_guide_applied"] = bool(library_rule["applied"])
+    correlation["low_library_no_guide_reason"] = library_rule["reason"]
+    correlation["low_library_min_total_counts"] = library_rule["min_total_counts"]
     recorded = {
         **thresholds,
-        "n_mad": float(config["qc"].get("n_mad", 3)),
+        "n_mad": n_mad,
         "source": "command_line" if configured else "median_mad",
+        "ribo_frac_source": (
+            "command_line" if config["qc"].get("max_ribo_frac") is not None else "median_mad"
+        ),
+        "ribo_prefixes": list(ribo_prefixes(config)),
+        "ribo_match": "gene_symbol_prefix_case_insensitive",
+        "low_library_no_guide": library_rule,
     }
-    (folder / "tables" / "qc_thresholds.json").write_text(json.dumps(recorded, indent=2) + "\n")
+    (folder / "tables" / "qc_thresholds.json").write_text(
+        json.dumps(recorded, indent=2, ensure_ascii=False) + "\n"
+    )
+    correlation.to_csv(
+        _qc_tables(folder) / "grna_capture_library_correlation.tsv", sep="\t", index=False
+    )
+    if library_rule["applied"]:
+        print(
+            f"  low_library_no_guide threshold: {library_rule['min_total_counts']}",
+            flush=True,
+        )
+    else:
+        print(f"  low_library_no_guide skipped: {library_rule['reason']}", flush=True)
     updated = apply_eligibility(
         calls,
         thresholds,
         min_cells_per_target=int(config["qc"]["min_cells_per_target"]),
         guides_per_cell=int(config["labels"].get("guides_per_cell", 1)),
+        low_library_rule=library_rule,
     )
     updated.insert(0, "sample_id", config["experiment"]["sample_id"])
     spec = control_spec(config)
@@ -324,6 +369,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
             updated["assignment_status"].astype(str).eq(STATUS_NO_GUIDE)
             & updated["n_guides"].astype(int).eq(0)
             & updated["qc_pass"].astype(bool)
+            & updated["exclusion_reason_primary"].astype(str).ne(LOW_LIBRARY_NO_GUIDE)
         )
     updated["temporary_control"] = temporary.to_numpy()
     updated["control_source"] = spec["control_source"]
@@ -349,16 +395,19 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         pass
     ledger = _cell_status(updated)
     ledger.to_csv(folder / "cell_status.tsv", sep="\t", index=False)
-    ledger[
-        [
-            "cell_barcode",
-            "total_counts",
-            "n_genes_by_counts",
-            "pct_counts_mito",
-            "exclusion_reason_primary",
-            "perturbation_status",
-        ]
-    ].to_csv(_qc_tables(folder) / "qc_metrics.tsv", sep="\t", index=False)
+    metric_columns = [
+        "cell_barcode",
+        "total_counts",
+        "n_genes_by_counts",
+        "pct_counts_mito",
+        "pct_counts_ribo",
+        "guide_umi_total",
+        "grna_capture_efficiency",
+        "n_guides",
+        "exclusion_reason_primary",
+        "perturbation_status",
+    ]
+    ledger[metric_columns].to_csv(_qc_tables(folder) / "qc_metrics.tsv", sep="\t", index=False)
     stages.to_csv(folder / "filter_stage_counts.tsv", sep="\t", index=False)
     assignment = (
         updated["assignment_status"]
@@ -431,7 +480,7 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     comparisons = []
     spec = control_spec(config)
     if spec["temporary"]:
-        print(f"  control: {spec['note']}", flush=True)
+        print(f"  temporary control warning: {spec['note']}", flush=True)
     if mixscape_on:
         if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
             "cell_type_key"
@@ -534,21 +583,15 @@ def _write_guide_distance(folder: Path, pseudobulk, config: dict[str, Any]) -> N
 
 
 def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
-    """Score human cell cycle on the log-normalized matrix. Do not alter ``X``.
+    """Score human or mouse cell cycle on the log-normalized matrix.
 
-    Mouse has no gene set in this code. Do not reuse the human Seurat lists.
+    Uses scib gene lists. Does not alter ``X`` or regress out the cycle.
     """
-    from perturbseq.plotting import score_human_cell_cycle_after_log1p
+    from perturbseq.plotting import score_cell_cycle_after_log1p
 
     organism = str(config["experiment"].get("organism", ""))
-    if organism != "human":
-        note = "代码只有人类 Seurat 细胞周期基因，没有小鼠基因集，因此跳过，不编造打分。"
-        adata.uns["cell_cycle_status"] = "skipped_no_mouse_cell_cycle_genes"
-        adata.uns["cell_cycle_note"] = note
-        print(f"  cell cycle skipped: {note}", flush=True)
-        return
     try:
-        status = score_human_cell_cycle_after_log1p(
+        status = score_cell_cycle_after_log1p(
             adata,
             organism=organism,
             random_state=int(config["runtime"]["seed"]),
@@ -556,8 +599,18 @@ def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
     except ValueError as exc:
         print(f"  cell cycle skipped: {exc}", flush=True)
         adata.uns["cell_cycle_status"] = "skipped"
+        adata.uns["cell_cycle_note"] = str(exc)
         return
     adata.uns["cell_cycle_status"] = status
+    notes = {
+        "scored_after_log1p": "scib Tirosh/Regev 基因集；写入 phase、S_score、G2M_score。",
+        "already_scored": "obs 已有 phase，跳过重复打分。",
+        "skipped_unsupported_organism": "organism 不是 human 或 mouse。",
+        "skipped_missing_log1p": "尚未 log1p，跳过打分。",
+        "skipped_missing_cell_cycle_genes": "矩阵里几乎找不到该物种的细胞周期基因。",
+        "skipped_scib_unavailable": "未安装 scib，无法读取细胞周期基因集。",
+    }
+    adata.uns["cell_cycle_note"] = notes.get(status, "")
     print(f"  cell cycle: {status}", flush=True)
 
 
@@ -666,6 +719,25 @@ def _control_summary(config: dict[str, Any], adata=None) -> dict[str, Any]:
     return summary
 
 
+def _publish_temporary_control_warning(folder: Path, config: dict[str, Any]) -> str:
+    """Record the zero-guide warning in the log and on disk.
+
+    A designed NT control removes that warning and the temporary-control QC figure.
+    """
+    path = folder / "tables" / "temporary_control_warning.txt"
+    if not control_spec(config)["temporary"]:
+        if path.is_file():
+            path.unlink()
+        from perturbseq.plotting import remove_temporary_control_qc
+
+        remove_temporary_control_qc(folder)
+        return ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(TEMPORARY_CONTROL_WARNING.strip() + "\n")
+    print(f"  temporary control warning: {TEMPORARY_CONTROL_WARNING}", flush=True)
+    return TEMPORARY_CONTROL_WARNING
+
+
 def _write_barcode_differences(
     folder: Path, only_matrix: list[str], only_assignment: list[str]
 ) -> None:
@@ -687,6 +759,8 @@ def _as_bool(values: pd.Series) -> pd.Series:
 def _cell_status(table: pd.DataFrame) -> pd.DataFrame:
     ledger = table.copy()
     ledger["pct_counts_mito"] = ledger["mito_frac"]
+    if "ribo_frac" in ledger.columns:
+        ledger["pct_counts_ribo"] = ledger["ribo_frac"]
     for column in (
         "mixscape_class_raw",
         "mixscape_class",

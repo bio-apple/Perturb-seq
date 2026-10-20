@@ -25,6 +25,7 @@ from perturbseq.plotting import (
     draw_distance_embedding,
     draw_distance_heatmap,
     draw_enrichment,
+    draw_grna_capture_library,
     draw_guide_consistency,
     draw_guides_per_cell,
     draw_library_size,
@@ -44,9 +45,11 @@ from perturbseq.plotting import (
     draw_target_de_counts,
     draw_target_expression,
     draw_target_in_de_gene_counts,
+    draw_temporary_control_qc,
     draw_umap,
     draw_variable_features,
     draw_waterfall,
+    remove_temporary_control_qc,
 )
 
 
@@ -87,6 +90,17 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
     else:
         draw_qc_violin(store, qc_table, population=qc_note)
         draw_qc_scatter(store, qc_table, int(config["runtime"]["seed"]), population=qc_note)
+    draw_grna_capture_library(
+        store,
+        cell_status,
+        correlation=_read(qc_tables / "grna_capture_library_correlation.tsv"),
+        low_library_rule=_low_library_rule(output_dir / "tables" / "qc_thresholds.json"),
+        seed=int(config["runtime"]["seed"]),
+    )
+    if control_spec(config)["temporary"]:
+        draw_temporary_control_qc(store, cell_status)
+    else:
+        remove_temporary_control_qc(output_dir)
 
     if adata is not None:
         draw_variable_features(store, adata)
@@ -182,6 +196,16 @@ def write_report(output_dir: Path, config: dict[str, Any], adata: AnnData | None
         adata.write_h5ad(output_dir / "adata_processed.h5ad", compression="lzf")
 
 
+def _low_library_rule(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text())
+    rule = payload.get("low_library_no_guide", {})
+    if not isinstance(rule, dict):
+        return {}
+    return rule
+
+
 def _qc_population(cell_status: pd.DataFrame, adata: AnnData | None) -> tuple[pd.DataFrame, str]:
     """Prefer the full annotated ledger, which is recorded before analysis filtering."""
     mito = {"mito_frac", "pct_counts_mito"}
@@ -200,21 +224,22 @@ def _qc_population(cell_status: pd.DataFrame, adata: AnnData | None) -> tuple[pd
 
 
 def _draw_cell_cycle(output_dir: Path, adata: AnnData | None, config: dict[str, Any]) -> None:
-    """Draw the existing cell-cycle UMAP after log-normalized scoring.
+    """Draw the cell-cycle UMAP after log-normalized scoring.
 
-    Human Seurat lists only. A matrix that has not been log-normalized is not scored.
+    Human and mouse use scib gene lists. A matrix that has not been log-normalized
+    is not scored.
     """
     if adata is None or "X_umap" not in adata.obsm:
         return
     from perturbseq.plotting import (
         draw_nt_perturbed_cell_cycle_umap,
-        score_human_cell_cycle_after_log1p,
+        score_cell_cycle_after_log1p,
     )
 
     organism = str(config["experiment"].get("organism", ""))
-    if "phase" not in adata.obs.columns and organism == "human" and "log1p" in adata.uns:
+    if "phase" not in adata.obs.columns and "log1p" in adata.uns:
         try:
-            status = score_human_cell_cycle_after_log1p(
+            status = score_cell_cycle_after_log1p(
                 adata,
                 organism=organism,
                 random_state=int(config["runtime"]["seed"]),
@@ -223,6 +248,8 @@ def _draw_cell_cycle(output_dir: Path, adata: AnnData | None, config: dict[str, 
             print(f"  cell cycle skipped: {exc}", flush=True)
             return
         adata.uns["cell_cycle_status"] = status
+        if status != "scored_after_log1p" and status != "already_scored":
+            return
     if "phase" not in adata.obs.columns:
         return
     draw_nt_perturbed_cell_cycle_umap(

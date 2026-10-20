@@ -15,8 +15,10 @@ from perturbseq.assign import (
     STATUS_SINGLE_NT,
     STATUS_SINGLE_TARGET,
     annotate_assignments,
+    capture_efficiency,
     disambiguate_shared_guides,
     mito_fraction,
+    ribo_symbol_mask,
 )
 
 
@@ -124,6 +126,7 @@ def load_sample(
     guides_per_cell: int = 1,
     min_guide_umi: float | None,
     mito_prefix: str,
+    ribo_prefixes: tuple[str, ...],
 ) -> tuple[AnnData, pd.DataFrame, dict[str, object]]:
     """Stream gene and CRISPR counts for cells that can enter QC.
 
@@ -169,7 +172,9 @@ def load_sample(
         )
     gex = (features["feature_type"] == feature_type_gex).to_numpy()
     crispr = (features["feature_type"] == feature_type_crispr).to_numpy()
-    mito_features = features["gene_symbol"].astype(str).str.startswith(mito_prefix).to_numpy() & gex
+    symbols = features["gene_symbol"].astype(str)
+    mito_features = symbols.str.startswith(mito_prefix).to_numpy() & gex
+    ribo_features = ribo_symbol_mask(symbols, ribo_prefixes) & gex
     if int(gex.sum()) == 0:
         raise ValueError("特征文件中没有 Gene Expression 行。")
     annotated = annotate_assignments(
@@ -219,7 +224,15 @@ def load_sample(
         f"  streaming {len(wanted):,} cells, {int(gex.sum()):,} genes, {int(crispr.sum()):,} guides",
         flush=True,
     )
-    gene_matrix, guide_matrix, total_counts, n_genes, mito_counts = _stream_counts(
+    (
+        gene_matrix,
+        guide_matrix,
+        total_counts,
+        n_genes,
+        mito_counts,
+        ribo_counts,
+        guide_umi_total,
+    ) = _stream_counts(
         paths["matrix"],
         gene_keep=gex,
         crispr_keep=crispr,
@@ -232,14 +245,19 @@ def load_sample(
         n_cells=len(wanted),
         n_barcodes=len(barcodes),
         mito_features=mito_features,
+        ribo_features=ribo_features,
     )
     mito_frac = mito_fraction(mito_counts, total_counts)
+    ribo_frac = mito_fraction(ribo_counts, total_counts)
     qc = pd.DataFrame(
         {
             "cell_barcode": barcodes.astype(str),
             "total_counts": total_counts,
             "n_genes_by_counts": n_genes,
             "mito_frac": mito_frac,
+            "ribo_frac": ribo_frac,
+            "guide_umi_total": guide_umi_total,
+            "grna_capture_efficiency": capture_efficiency(guide_umi_total, total_counts),
         }
     )
     annotated = annotated.merge(qc, on="cell_barcode", how="left")
@@ -344,10 +362,21 @@ def _stream_counts(
     n_cells: int,
     n_barcodes: int,
     mito_features: np.ndarray,
-) -> tuple[sparse.csr_matrix, sparse.csr_matrix, np.ndarray, np.ndarray, np.ndarray]:
+    ribo_features: np.ndarray,
+) -> tuple[
+    sparse.csr_matrix,
+    sparse.csr_matrix,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     total_counts = np.zeros(n_barcodes, dtype=np.float64)
     detected_genes = np.zeros(n_barcodes, dtype=np.int32)
     mito_counts = np.zeros(n_barcodes, dtype=np.float64)
+    ribo_counts = np.zeros(n_barcodes, dtype=np.float64)
+    guide_umi_total = np.zeros(n_barcodes, dtype=np.float64)
     gene_rows: list[np.ndarray] = []
     gene_cols: list[np.ndarray] = []
     gene_data: list[np.ndarray] = []
@@ -387,10 +416,14 @@ def _stream_counts(
                 detected_genes[cell_i] += 1
                 if mito_features[feature_i]:
                     mito_counts[cell_i] += value
+                if ribo_features[feature_i]:
+                    ribo_counts[cell_i] += value
                 if cell_keep[cell_i]:
                     chunk_gene.append((int(gene_out[feature_i]), int(cell_out[cell_i]), value))
-            elif crispr_keep[feature_i] and cell_keep[cell_i]:
-                chunk_guide.append((int(crispr_out[feature_i]), int(cell_out[cell_i]), value))
+            elif crispr_keep[feature_i]:
+                guide_umi_total[cell_i] += value
+                if cell_keep[cell_i]:
+                    chunk_guide.append((int(crispr_out[feature_i]), int(cell_out[cell_i]), value))
             if len(chunk_gene) >= 2_000_000 or len(chunk_guide) >= 2_000_000:
                 flush()
             seen += 1
@@ -399,7 +432,15 @@ def _stream_counts(
     flush()
     gene_matrix = _assemble(gene_data, gene_rows, gene_cols, n_genes, n_cells).T.tocsr()
     guide_matrix = _assemble(guide_data, guide_rows, guide_cols, n_guides, n_cells).T.tocsr()
-    return gene_matrix, guide_matrix, total_counts, detected_genes, mito_counts
+    return (
+        gene_matrix,
+        guide_matrix,
+        total_counts,
+        detected_genes,
+        mito_counts,
+        ribo_counts,
+        guide_umi_total,
+    )
 
 
 def _assemble(

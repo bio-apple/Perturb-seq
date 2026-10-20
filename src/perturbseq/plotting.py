@@ -20,11 +20,22 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
+from perturbseq.assign import STATUS_TARGET, capture_library_correlation, control_cell_mask
+from perturbseq.config import ZERO_GUIDE_LABEL
+
+TEMPORARY_CONTROL_QC_NAME = "temporary_control_qc"
+GRNA_CAPTURE_FIGURE = "grna_capture_vs_library_size"
+ZERO_GUIDE_QC_GROUP = "zero-guide cells（临时对照）"
+TARGETING_QC_GROUP = "targeting"
+_TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
+
 # mRNA and gRNA statistics. Section "plot" is shared with UMAPs, so routing is by name.
 _QC_FIGURES = frozenset(
     {
         "qc_violin",
         "qc_scatter",
+        GRNA_CAPTURE_FIGURE,
+        TEMPORARY_CONTROL_QC_NAME,
         "guides_per_cell",
         "assignment_status_bar",
         "cells_per_guide_bar",
@@ -81,6 +92,7 @@ class FigureStore:
     def __init__(self, output_dir: Path, config: dict[str, Any], context: dict[str, str]) -> None:
         self.output_dir = output_dir
         self.plotting = config["plotting"]
+        self.singler_enabled = config.get("singler", {}).get("enabled", True) is not False
         self.context = context
         self.plot_data = output_dir / "plot_data"
         self.plot_data.mkdir(parents=True, exist_ok=True)
@@ -459,29 +471,48 @@ def _mito_column(metrics: pd.DataFrame) -> str | None:
     return None
 
 
+def _ribo_column(metrics: pd.DataFrame) -> str | None:
+    if "ribo_frac" in metrics.columns:
+        return "ribo_frac"
+    if "pct_counts_ribo" in metrics.columns:
+        return "pct_counts_ribo"
+    return None
+
+
+def _as_percent(values: pd.Series) -> tuple[pd.Series, str]:
+    """Map a 0–1 fraction onto 0–100. Values already above 1 stay as they are."""
+    numeric = values.astype(float)
+    finite = numeric[np.isfinite(numeric)]
+    if finite.empty or float(finite.max()) <= 1:
+        return numeric * 100, "fraction_times_100"
+    return numeric, "already_percent"
+
+
 def percent_mt_values(metrics: pd.DataFrame) -> tuple[pd.Series, str]:
     """Return mitochondrial percentage on a 0–100 scale."""
     column = _mito_column(metrics)
     if column is None:
         raise KeyError("mito_frac")
-    values = metrics[column].astype(float)
-    finite = values[np.isfinite(values)]
-    if finite.empty or float(finite.max()) <= 1:
-        return values * 100, "fraction_times_100"
-    return values, "already_percent"
+    return _as_percent(metrics[column])
 
 
 def qc_identity_violin(metrics: pd.DataFrame, identity: str) -> Figure:
-    """Three Seurat-style violins: nFeature_RNA, nCount_RNA, percent.mt."""
+    """Seurat-style violins: nFeature_RNA, nCount_RNA, percent.mt, and percent.ribo when present."""
     scaled, _note = percent_mt_values(metrics)
     shown = metrics.copy()
     shown["percent.mt"] = scaled
-    figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-    panels = (
+    panels = [
         ("n_genes_by_counts", "nFeature_RNA"),
         ("total_counts", "nCount_RNA"),
         ("percent.mt", "percent.mt"),
-    )
+    ]
+    ribo = _ribo_column(metrics)
+    if ribo is not None:
+        shown["percent.ribo"] = _as_percent(metrics[ribo])[0]
+        panels.append(("percent.ribo", "percent.ribo"))
+    figure, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4))
+    if len(panels) == 1:
+        axes = [axes]
     identity_labels = [identity] * len(shown)
     for axis, (column, title) in zip(axes, panels, strict=True):
         sns.violinplot(
@@ -509,20 +540,199 @@ def draw_qc_violin(
     scaled, note = percent_mt_values(metrics)
     shown = metrics.copy()
     shown["percent.mt"] = scaled
+    value_vars = ["total_counts", "n_genes_by_counts", "percent.mt"]
+    method = f"VlnPlot nFeature, nCount, percent.mt ({note})"
+    ribo = _ribo_column(metrics)
+    if ribo is not None:
+        ribo_scaled, ribo_note = _as_percent(metrics[ribo])
+        shown["percent.ribo"] = ribo_scaled
+        value_vars.append("percent.ribo")
+        method += f", percent.ribo ({ribo_note})"
     long = shown.melt(
         id_vars=[column for column in ("cell_barcode",) if column in shown.columns],
-        value_vars=["total_counts", "n_genes_by_counts", "percent.mt"],
+        value_vars=value_vars,
         var_name="metric",
         value_name="value",
     )
     figure = qc_identity_violin(metrics, identity)
-    store.save(
-        figure,
-        "qc_violin",
-        "qc",
-        long,
-        f"VlnPlot nFeature, nCount, percent.mt ({note}); {population}",
+    store.save(figure, "qc_violin", "qc", long, f"{method}; {population}")
+
+
+def remove_temporary_control_qc(output_dir: Path) -> None:
+    """Delete a temporary-control comparison left by an earlier zero-guide run."""
+    name = TEMPORARY_CONTROL_QC_NAME
+    for path in (
+        output_dir / "qc" / "figures" / f"{name}.png",
+        output_dir / "qc" / "tables" / f"{name}.tsv",
+        output_dir / "qc" / "tables" / f"{name}.skipped.txt",
+    ):
+        if path.is_file():
+            path.unlink()
+
+
+def _flag(values: pd.Series) -> np.ndarray:
+    if pd.api.types.is_bool_dtype(values):
+        return values.fillna(False).to_numpy(dtype=bool)
+    return values.astype(str).str.strip().str.lower().isin(["true", "1"]).to_numpy()
+
+
+def _temporary_control_masks(ledger: pd.DataFrame) -> tuple[np.ndarray, np.ndarray] | str:
+    """QC-pass zero-guide cells versus analysis-eligible targeting cells."""
+    qc_columns = {"total_counts", "n_genes_by_counts"}
+    if not qc_columns.issubset(ledger.columns) or _mito_column(ledger) is None:
+        return "missing_qc_columns"
+    identity = {
+        "assignment_status",
+        "n_guides",
+        "qc_pass",
+        "perturbation_status",
+        "analysis_eligible",
+    }
+    if not identity.issubset(ledger.columns):
+        return "missing_fields"
+    control = control_cell_mask(ledger, _TEMPORARY_SPEC) & _flag(ledger["qc_pass"])
+    status = ledger["perturbation_status"].astype(str).eq(STATUS_TARGET).to_numpy()
+    targeting = status & _flag(ledger["analysis_eligible"])
+    reasons = []
+    if not bool(np.any(control)):
+        reasons.append("no_zero_guide_cells")
+    if not bool(np.any(targeting)):
+        reasons.append("no_targeting_cells")
+    if reasons:
+        return ";".join(reasons)
+    return control, targeting
+
+
+def _distribution_row(group: str, metric: str, values: np.ndarray, n_cells: int) -> dict[str, Any]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        median = mad = q1 = q3 = float("nan")
+    else:
+        median = float(np.median(finite))
+        mad = float(np.median(np.abs(finite - median)))
+        q1 = float(np.percentile(finite, 25))
+        q3 = float(np.percentile(finite, 75))
+    return {
+        "group": group,
+        "metric": metric,
+        "n_cells": n_cells,
+        "median": median,
+        "mad": mad,
+        "q1": q1,
+        "q3": q3,
+    }
+
+
+def _qc_distribution_summary(shown: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for group in (ZERO_GUIDE_QC_GROUP, TARGETING_QC_GROUP):
+        block = shown[shown["group"].astype(str) == group]
+        n_cells = int(len(block))
+        for metric in ("total_counts", "n_genes_by_counts", "percent.mt"):
+            values = pd.to_numeric(block[metric], errors="coerce").to_numpy(dtype=float)
+            rows.append(_distribution_row(group, metric, values, n_cells))
+    return pd.DataFrame(rows)
+
+
+def _draw_grouped_metric(
+    axis: Axes,
+    panel: pd.DataFrame,
+    column: str,
+    order: list[str],
+    palette: dict[str, str],
+) -> None:
+    kwargs: dict[str, Any] = {
+        "data": panel,
+        "x": "group",
+        "y": column,
+        "order": order,
+        "hue": "group",
+        "hue_order": order,
+        "palette": palette,
+        "ax": axis,
+    }
+    try:
+        try:
+            sns.violinplot(**kwargs, inner="quartile", cut=0, legend=False)
+        except TypeError:
+            sns.violinplot(**kwargs, inner="quartile", cut=0)
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.remove()
+    except Exception:
+        try:
+            sns.boxplot(**kwargs, legend=False)
+        except TypeError:
+            sns.boxplot(**kwargs)
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.remove()
+
+
+def _temporary_control_qc_figure(store: FigureStore, shown: pd.DataFrame) -> Figure:
+    order = [ZERO_GUIDE_QC_GROUP, TARGETING_QC_GROUP]
+    palette = {
+        ZERO_GUIDE_QC_GROUP: store.palette("no_guide", "#BDBDBD"),
+        TARGETING_QC_GROUP: store.palette("targeting", "#1F77B4"),
+    }
+    figure, axes = plt.subplots(1, 3, figsize=(13, 4.6))
+    panels = (
+        ("total_counts", "UMI (total_counts)"),
+        ("n_genes_by_counts", "genes (n_genes_by_counts)"),
+        ("percent.mt", "percent.mt"),
     )
+    for axis, (column, title) in zip(axes, panels, strict=True):
+        numeric = pd.to_numeric(shown[column], errors="coerce")
+        panel = shown.loc[np.isfinite(numeric), ["group", column]].copy()
+        panel[column] = pd.to_numeric(panel[column], errors="coerce")
+        axis.set_title(title)
+        axis.set_ylabel(column)
+        if not panel.empty:
+            _draw_grouped_metric(axis, panel, column, order, palette)
+        axis.set_xlabel("")
+        axis.tick_params(axis="x", labelrotation=18)
+        for label in axis.get_xticklabels():
+            label.set_ha("right")
+    return figure
+
+
+def draw_temporary_control_qc(store: FigureStore, ledger: pd.DataFrame) -> None:
+    """Compare temporary zero-guide cells with targeting cells. Descriptive only."""
+    name = TEMPORARY_CONTROL_QC_NAME
+    try:
+        masks = _temporary_control_masks(ledger)
+        if isinstance(masks, str):
+            remove_temporary_control_qc(store.output_dir)
+            store.skip(name, masks)
+            return
+        control, targeting = masks
+        mito = _mito_column(ledger)
+        if mito is None:
+            remove_temporary_control_qc(store.output_dir)
+            store.skip(name, "missing_qc_columns")
+            return
+        keep = control | targeting
+        shown = ledger.loc[keep, ["total_counts", "n_genes_by_counts", mito]].copy()
+        for column in ("total_counts", "n_genes_by_counts", mito):
+            shown[column] = pd.to_numeric(shown[column], errors="coerce")
+        shown.insert(0, "group", np.where(control[keep], ZERO_GUIDE_QC_GROUP, TARGETING_QC_GROUP))
+        scaled, note = percent_mt_values(shown)
+        shown["percent.mt"] = scaled.to_numpy()
+        figure = _temporary_control_qc_figure(store, shown)
+        store.save(
+            figure,
+            name,
+            "qc",
+            _qc_distribution_summary(shown),
+            (
+                "descriptive QC; zero-guide cells (temporary control) vs targeting; "
+                f"percent.mt {note}; no pass/fail threshold"
+            ),
+        )
+    except Exception as exc:
+        print(f"  temporary control QC comparison failed: {exc}", flush=True)
+        remove_temporary_control_qc(store.output_dir)
+        store.skip(name, f"comparison_failed: {exc}")
 
 
 _SINGLER_REFERENCES = {
@@ -789,6 +999,9 @@ def leiden_resolution(adata: AnnData) -> float | None:
 def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
     """One figure: Leiden clusters and their SingleR labels on the same UMAP."""
     name = "umap_cluster_annotation"
+    if not store.singler_enabled:
+        store.skip(name, "singler_disabled")
+        return
     if "leiden" not in adata.obs or "X_umap" not in adata.obsm:
         store.skip(name, "missing_fields")
         return
@@ -913,6 +1126,144 @@ def draw_qc_scatter(
         shown,
         f"FeatureScatter nCount vs percent.mt ({note}) and nFeature; {population}; seed={seed}",
     )
+
+
+def draw_grna_capture_library(
+    store: FigureStore,
+    ledger: pd.DataFrame,
+    *,
+    correlation: pd.DataFrame | None = None,
+    low_library_rule: dict[str, Any] | None = None,
+    seed: int = 0,
+) -> None:
+    """Scatter library size against gRNA capture efficiency and mark cells with no guide."""
+    name = GRNA_CAPTURE_FIGURE
+    needed = {"total_counts", "grna_capture_efficiency"}
+    if ledger.empty or not needed.issubset(ledger.columns):
+        store.skip(name, "missing_fields")
+        return
+    if "n_guides" not in ledger.columns and "assignment_status" not in ledger.columns:
+        store.skip(name, "missing_fields")
+        return
+    detected = _guide_detected(ledger)
+    frame = ledger.copy()
+    frame["total_counts"] = pd.to_numeric(frame["total_counts"], errors="coerce")
+    frame["grna_capture_efficiency"] = pd.to_numeric(
+        frame["grna_capture_efficiency"], errors="coerce"
+    )
+    finite = np.asarray(
+        np.isfinite(frame["total_counts"]) & np.isfinite(frame["grna_capture_efficiency"]),
+        dtype=bool,
+    )
+    frame = frame.loc[finite].copy()
+    detected = detected[finite]
+    if frame.empty:
+        store.skip(name, "no_finite_points")
+        return
+    limit = int(store.plotting.get("scatter_max_points", 50000))
+    if len(frame) > limit:
+        chosen = frame.sample(limit, random_state=seed).index
+        detected = detected[frame.index.get_indexer(chosen)]
+        frame = frame.loc[chosen]
+    if correlation is None or correlation.empty:
+        correlation = capture_library_correlation(ledger)
+    rule = low_library_rule or {}
+    figure, axis = store._figure(width=8, height=6)
+    _scatter_guide_groups(axis, frame, detected)
+    threshold = rule.get("min_total_counts")
+    if rule.get("applied") and threshold is not None and np.isfinite(float(threshold)):
+        axis.axvline(
+            float(threshold),
+            color="#E45756",
+            linestyle="--",
+            linewidth=1,
+            label="low_library_no_guide",
+        )
+    axis.set_xlabel("文库大小 (total_counts)")
+    axis.set_ylabel("gRNA 捕获效率")
+    axis.set_title(_capture_title(correlation, rule))
+    axis.legend(frameon=False, fontsize=8)
+    columns = [
+        column
+        for column in (
+            "cell_barcode",
+            "total_counts",
+            "grna_capture_efficiency",
+            "guide_umi_total",
+            "n_guides",
+            "assignment_status",
+        )
+        if column in frame.columns
+    ]
+    plotted = frame[columns].copy()
+    plotted["guide_detected"] = detected
+    store.save(
+        figure,
+        name,
+        "qc",
+        plotted,
+        (
+            "gRNA capture efficiency = guide UMI sum / total_counts; "
+            "cells before QC pass; no-guide cells marked; "
+            "Spearman p stays in the QC table"
+        ),
+    )
+
+
+def _guide_detected(ledger: pd.DataFrame) -> np.ndarray:
+    if "n_guides" in ledger.columns:
+        guides = pd.to_numeric(ledger["n_guides"], errors="coerce").fillna(0)
+        return (guides >= 1).to_numpy()
+    return ~ledger["assignment_status"].astype(str).eq("no_guide").to_numpy()
+
+
+def _scatter_guide_groups(axis: Axes, frame: pd.DataFrame, detected: np.ndarray) -> None:
+    library = frame["total_counts"].to_numpy(dtype=float)
+    efficiency = frame["grna_capture_efficiency"].to_numpy(dtype=float)
+    if np.any(detected):
+        axis.scatter(
+            library[detected],
+            efficiency[detected],
+            s=8,
+            linewidths=0,
+            c="#1F77B4",
+            rasterized=True,
+            label="检测到 guide",
+        )
+    missed = ~detected
+    if np.any(missed):
+        axis.scatter(
+            library[missed],
+            efficiency[missed],
+            s=16,
+            c="#E45756",
+            marker="x",
+            linewidths=0.6,
+            rasterized=True,
+            label="未检测到 guide",
+        )
+
+
+def _capture_title(correlation: pd.DataFrame, rule: dict[str, Any]) -> str:
+    lines = ["gRNA 捕获效率与文库大小的关系"]
+    if correlation.empty:
+        lines.append("Spearman 未计算")
+    else:
+        row = correlation.iloc[0]
+        if str(row.get("status", "")) == "computed":
+            lines.append(
+                f"Spearman r={float(row['spearman_r']):.3f}，"
+                f"n={int(row['n_cells'])}，p={float(row['spearman_pvalue']):.3g}"
+            )
+        else:
+            lines.append(f"Spearman 未计算：{row.get('reason', 'skipped')}")
+    if rule.get("applied") and rule.get("min_total_counts") is not None:
+        lines.append(
+            f"low_library_no_guide 下限 {float(rule['min_total_counts']):g}（median_mad）"
+        )
+    elif rule.get("reason"):
+        lines.append(f"low_library_no_guide 未执行：{rule['reason']}")
+    return "\n".join(lines)
 
 
 def draw_waterfall(store: FigureStore, waterfall: pd.DataFrame) -> None:
@@ -2805,19 +3156,9 @@ def _safe(value: str) -> str:
     )
 
 
-# Seurat cc.genes.updated.2019. The original Tirosh 2016 symbols are aliases.
-SEURAT_S_GENES = (
-    "MCM5 PCNA TYMS FEN1 MCM2 MCM4 RRM1 UNG GINS2 MCM6 CDCA7 DTL PRIM1 UHRF1 CENPU "
-    "HELLS RFC2 RPA2 NASP RAD51AP1 GMNN WDR76 SLBP CCNE2 UBR7 POLD3 MSH2 ATAD2 RAD51 "
-    "RRM2 CDC45 CDC6 EXO1 TIPIN DSCC1 BLM CASP8AP2 USP1 CLSPN POLA1 CHAF1B BRIP1 E2F8"
-).split()
-SEURAT_G2M_GENES = (
-    "HMGB2 CDK1 NUSAP1 UBE2C BIRC5 TPX2 TOP2A NDC80 CKS2 NUF2 CKS1B MKI67 TMPO CENPF "
-    "TACC3 PIMREG SMC4 CCNB2 CKAP2L CKAP2 AURKB BUB1 KIF11 ANP32E TUBB4B GTSE1 KIF20B "
-    "HJURP CDCA3 JPT1 CDC20 TTK CDC25C KIF2C RANGAP1 NCAPD2 DLGAP5 CDCA2 CDCA8 ECT2 "
-    "KIF23 HMMR AURKA PSRC1 ANLN LBR CKAP5 CENPE CTCF NEK2 G2E3 GAS2L3 CBX5 CENPA"
-).split()
-SEURAT_CC_ALIASES = {"CENPU": "MLF1IP", "PIMREG": "FAM64A", "JPT1": "HN1"}
+# Cell-cycle gene sets come from scib (Tirosh / Regev lab lists). Human symbols are
+# uppercase; mouse symbols are title case. See scib.preprocessing.get_cell_cycle_genes.
+_SUPPORTED_CELL_CYCLE_ORGANISMS = frozenset({"human", "mouse"})
 
 _NT_COLOR = "#5C5C5C"
 _PERTURBED_COLOR = "#C9A035"
@@ -2840,51 +3181,44 @@ def _uniquify_symbols(symbols: pd.Index) -> tuple[pd.Index, list[str]]:
     return pd.Index(names), duplicated
 
 
-def _resolve_cycle_genes(
-    genes: list[str], present: set[str]
-) -> tuple[list[str], list[str], list[str], dict[str, str]]:
-    """Map one Seurat set onto symbols stored in the object.
-
-    A renamed gene is scored only under the symbol that is present. A symbol
-    that is absent is kept in the query so Scanpy drops it, and is listed as
-    missing. No stand-in gene is added.
-    """
-    query: list[str] = []
-    found: list[str] = []
-    missing: list[str] = []
-    aliases: dict[str, str] = {}
-    for gene in genes:
-        alias = SEURAT_CC_ALIASES.get(gene)
-        if gene in present:
-            query.append(gene)
-            found.append(gene)
-        elif alias and alias in present:
-            query.append(alias)
-            found.append(alias)
-            aliases[gene] = alias
-        else:
-            query.append(gene)
-            missing.append(gene)
-    return query, found, missing, aliases
+def _scib_phase_genes(gene_map: pd.DataFrame, phase: str, present: set[str]) -> list[str]:
+    """Pick gene_name or gene_id with the largest overlap, matching scib's filter."""
+    frame = gene_map.query("phase == @phase")
+    best: list[str] = []
+    for column in ("gene_name", "gene_id"):
+        genes = [str(gene) for gene in frame[column] if str(gene) in present]
+        if len(genes) > len(best):
+            best = genes
+    return best
 
 
-def assign_human_cell_cycle(
+def assign_cell_cycle(
     adata: AnnData,
     *,
+    organism: str,
     symbol_column: str = "gene_symbol",
     random_state: int = 0,
 ) -> dict[str, Any]:
-    """Score G1/S/G2M with Scanpy's Seurat/Tirosh cell-cycle scorer.
+    """Score G1/S/G2M with scib cell-cycle genes after log-normalization.
 
-    Uses the log-normalized matrix in ``X`` (``use_raw=False``). Refuses to score
-    when Scanpy has not recorded ``log1p``, so raw counts are not treated as
-    log expression. Genes from the Seurat updated-2019 lists that are not in the
-    object are omitted from the score and counted in the returned coverage.
+    Gene lists come from ``scib.preprocessing.get_cell_cycle_genes`` (Tirosh /
+    Regev lab markers packaged by scib). Scoring mirrors
+    ``scib.preprocessing.score_cell_cycle`` via ``scanpy.tl.score_genes_cell_cycle``,
+    but always uses ``X`` with ``use_raw=False``, does not regress out the cycle,
+    and honors ``random_state``. Temporary unique symbols are used for matching,
+    then original ``var_names`` are restored. Writes ``S_score``, ``G2M_score``,
+    and ``phase``.
     """
     import scanpy as sc
+    from scib.preprocessing import get_cell_cycle_genes
 
+    species = str(organism).strip().lower()
+    if species not in _SUPPORTED_CELL_CYCLE_ORGANISMS:
+        raise ValueError(f"细胞周期只支持 human 或 mouse，收到 {organism}")
     if "log1p" not in adata.uns:
         raise ValueError("细胞周期打分必须在 log-normalization 之后，不能在原始 counts 上计算。")
+
+    gene_map = get_cell_cycle_genes(species)
     original_names = pd.Index(adata.var_names.astype(str))
     if symbol_column in adata.var.columns:
         symbols = pd.Index(adata.var[symbol_column].astype(str))
@@ -2892,14 +3226,42 @@ def assign_human_cell_cycle(
         symbols = original_names
     unique_names, duplicated = _uniquify_symbols(symbols)
     present = set(unique_names)
-    s_query, s_found, s_missing, s_alias = _resolve_cycle_genes(SEURAT_S_GENES, present)
-    g2m_query, g2m_found, g2m_missing, g2m_alias = _resolve_cycle_genes(SEURAT_G2M_GENES, present)
-    gene_pool = unique_names
+    if "gene_id" in adata.var.columns:
+        # Allow Ensembl ids when symbols miss; scoring still needs them on var_names.
+        present |= set(adata.var["gene_id"].astype(str))
+
+    s_genes = _scib_phase_genes(gene_map, "S", present)
+    g2m_genes = _scib_phase_genes(gene_map, "G2/M", present)
+    if not s_genes or not g2m_genes:
+        raise ValueError(
+            f"cell cycle genes not in adata\n organism: {species}\n"
+            f"s_found={len(s_genes)} g2m_found={len(g2m_genes)}"
+        )
+
+    score_names = unique_names
+    if any(gene not in set(unique_names) for gene in s_genes + g2m_genes):
+        if "gene_id" not in adata.var.columns:
+            raise ValueError(
+                f"cell cycle genes not in adata\n organism: {species}\n"
+                f"s_found={len(s_genes)} g2m_found={len(g2m_genes)}"
+            )
+        score_names, _ = _uniquify_symbols(pd.Index(adata.var["gene_id"].astype(str)))
+
+    gene_pool = score_names
     if "feature_type" in adata.var.columns:
         gex = adata.var["feature_type"].astype(str).eq("Gene Expression").to_numpy()
-        gene_pool = unique_names[gex]
+        gene_pool = score_names[gex]
+
     try:
-        adata.var_names = unique_names
+        adata.var_names = score_names
+        present_names = set(score_names)
+        s_query = [gene for gene in s_genes if gene in present_names]
+        g2m_query = [gene for gene in g2m_genes if gene in present_names]
+        if not s_query or not g2m_query:
+            raise ValueError(
+                f"cell cycle genes not in adata\n organism: {species}\n"
+                f"s_found={len(s_query)} g2m_found={len(g2m_query)}"
+            )
         sc.tl.score_genes_cell_cycle(
             adata,
             s_genes=s_query,
@@ -2910,46 +3272,67 @@ def assign_human_cell_cycle(
         )
     finally:
         adata.var_names = original_names
+
     phase = adata.obs["phase"].astype(str)
     unexpected = sorted(set(phase.unique()) - {"G1", "G2M", "S"})
     if unexpected:
         raise ValueError(f"细胞周期标签超出 G1/G2M/S: {unexpected}")
-    duplicated_cycle = [
-        gene
-        for gene in duplicated
-        if gene in set(s_found) | set(g2m_found) | set(SEURAT_CC_ALIASES)
-    ]
+    s_set = gene_map.query("phase == 'S'")
+    g2m_set = gene_map.query("phase == 'G2/M'")
     return {
-        "s_set_size": len(SEURAT_S_GENES),
-        "s_found": len(s_found),
-        "s_found_symbols": s_found,
-        "s_missing_symbols": s_missing,
-        "s_alias_used": s_alias,
-        "g2m_set_size": len(SEURAT_G2M_GENES),
-        "g2m_found": len(g2m_found),
-        "g2m_found_symbols": g2m_found,
-        "g2m_missing_symbols": g2m_missing,
-        "g2m_alias_used": g2m_alias,
-        "duplicated_symbols_kept_once": duplicated_cycle,
+        "s_set_size": int(len(s_set)),
+        "s_found": len(s_query),
+        "s_found_symbols": s_query,
+        "s_missing_symbols": [
+            str(name) for name in s_set["gene_name"] if str(name) not in present_names
+        ],
+        "g2m_set_size": int(len(g2m_set)),
+        "g2m_found": len(g2m_query),
+        "g2m_found_symbols": g2m_query,
+        "g2m_missing_symbols": [
+            str(name) for name in g2m_set["gene_name"] if str(name) not in present_names
+        ],
+        "duplicated_symbols_kept_once": [
+            gene for gene in duplicated if gene in set(s_query) | set(g2m_query)
+        ],
         "phase_counts": {label: int((phase == label).sum()) for label in ("G1", "G2M", "S")},
+        "source": "scib.preprocessing.get_cell_cycle_genes",
     }
 
 
-def score_human_cell_cycle_after_log1p(
+def score_cell_cycle_after_log1p(
     adata: AnnData,
     *,
     organism: str,
     random_state: int = 0,
 ) -> str:
-    """Score human G1/S/G2M only after log-normalization. Does not change ``X``."""
-    if organism != "human":
-        return "skipped_not_human"
+    """Score human or mouse G1/S/G2M after log-normalization. Does not change ``X``."""
+    species = str(organism).strip().lower()
+    if species not in _SUPPORTED_CELL_CYCLE_ORGANISMS:
+        return "skipped_unsupported_organism"
     if "phase" in adata.obs.columns:
         return "already_scored"
-    coverage = assign_human_cell_cycle(adata, random_state=random_state)
+    if "log1p" not in adata.uns:
+        return "skipped_missing_log1p"
+    try:
+        coverage = assign_cell_cycle(adata, organism=species, random_state=random_state)
+    except ImportError:
+        return "skipped_scib_unavailable"
+    except ValueError as exc:
+        message = str(exc)
+        if "cell cycle genes not in adata" in message:
+            return "skipped_missing_cell_cycle_genes"
+        if "log-normalization" in message:
+            return "skipped_missing_log1p"
+        raise
     adata.uns["cell_cycle_s_found"] = int(coverage["s_found"])
     adata.uns["cell_cycle_g2m_found"] = int(coverage["g2m_found"])
+    adata.uns["cell_cycle_source"] = str(coverage.get("source", "scib"))
     return "scored_after_log1p"
+
+
+# Backward-compatible alias used by older call sites / notebooks.
+score_human_cell_cycle_after_log1p = score_cell_cycle_after_log1p
 
 
 def _prepare_umap_axis(axis: Axes, xlim: tuple[float, float], ylim: tuple[float, float]) -> None:

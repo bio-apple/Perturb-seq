@@ -22,14 +22,18 @@ _ORGANISM_ERROR = "experiment.organism 只能填 human 或 mouse。"
 DIRECTIONS = ("down", "up", "bidirectional", "unknown")
 POLICIES = ("drop",)
 MITO_PREFIX_BY_ORGANISM = {"human": "MT-", "mouse": "mt-"}
+RIBO_PREFIXES_BY_ORGANISM = {"human": ("RPL", "RPS"), "mouse": ("Rpl", "Rps")}
 NO_NT_CONTROL = "no_nt_control"
 ZERO_GUIDE_LABEL = "zero_guide"
 CONTROL_SOURCE_ZERO = "zero_guide_cells"
 CONTROL_SOURCE_DESIGNED = "designed_nt"
-TEMPORARY_CONTROL_NOTE = (
-    "临时对照，不是设计好的 Non-Targeting。"
-    "对照细胞是没有检测到 guide RNA 的 zero-guide cells。"
+TEMPORARY_CONTROL_WARNING = (
+    "当前对照是临时 zero-guide cells，这不是设计好的非靶向对照。"
+    "zero-guide 细胞可能在 UMI、基因数、线粒体比例、环境 RNA 和细胞状态上与靶向细胞不同。"
+    "后续 log2FC、Mixscape、Mixscale、E-distance 都是相对这组临时对照。"
+    "UMI、基因数和线粒体比例的对比只作描述，分布差异不会中止分析。"
 )
+TEMPORARY_CONTROL_NOTE = TEMPORARY_CONTROL_WARNING
 _OTHER_ORGANELLE_SYMBOLS = (
     ("pt-", "叶绿体"),
     ("PT-", "叶绿体"),
@@ -112,11 +116,19 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
     if not isinstance(qc, dict):
         qc = {}
         config["qc"] = qc
-    for key in (*_QC_CUTOFFS, "thresholds_confirmed", "mito_gene_prefix", "mito_prefix"):
+    for key in (
+        *_QC_CUTOFFS,
+        "thresholds_confirmed",
+        "mito_gene_prefix",
+        "mito_prefix",
+        "max_ribo_frac",
+    ):
         qc.pop(key, None)
     provided = {key: customer.get(key) for key in _QC_CUTOFFS}
     if any(value is not None for value in provided.values()):
         qc.update(provided)
+    if customer.get("max_ribo_frac") is not None:
+        qc["max_ribo_frac"] = customer["max_ribo_frac"]
 
     cell_type_key = _blank_to_none(customer.get("cell_type_key"))
     batch_key = _blank_to_none(customer.get("batch_key"))
@@ -130,7 +142,180 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
     return config
 
 
+# Leaf values, including lists, are not walked. ``plotting.palette`` is a color map:
+# any name under it is read by lookup, so those names are not unknown keys.
+_ANY_KEYS = object()
+_ALLOWED_KEYS: dict[str, Any] = {
+    "_config_path": None,
+    "document_version": None,
+    "experiment": {
+        "sample_id": None,
+        "organism": None,
+        "crispr_mode": None,
+        "crispr_mode_description": None,
+        "expected_target_direction": None,
+        "resolved_expected_direction": None,
+        "biological_sample_count": None,
+        "resolved_organism": None,
+        "resolved_mito_prefix": None,
+        "species_check": None,
+        "organism_evidence": None,
+        "other_organelle_prefixes": None,
+    },
+    "input": {
+        "barcode_policy": None,
+        "input_dir": None,
+        "guide_separator": None,
+        "matrix": None,
+        "barcodes": None,
+        "features": None,
+        "feature_reference": None,
+        "assignments": None,
+        "cell_annotations": None,
+    },
+    "output": {"output_dir": None},
+    "labels": {
+        "feature_type_crispr": None,
+        "feature_type_gex": None,
+        "multi_guide_policy": None,
+        "guides_per_cell": None,
+        "nt_control": None,
+        "flag_guides_above": None,
+    },
+    "qc": {
+        "n_mad": None,
+        "min_cells_per_target": None,
+        "min_cells_per_guide": None,
+        "min_guide_umi": None,
+        "min_umi": None,
+        "max_umi": None,
+        "min_genes": None,
+        "max_mito_frac": None,
+        "max_ribo_frac": None,
+        "mito_gene_prefix": None,
+        "mito_prefix": None,
+    },
+    "preprocess": {
+        "normalize_target_sum": None,
+        "n_hvg": None,
+        "n_pcs": None,
+        "n_neighbors": None,
+        "leiden_resolution": None,
+        "batch_key": None,
+        "cell_type_key": None,
+    },
+    "mixscape": {
+        "enabled": None,
+        "min_de_genes": None,
+        "logfc_threshold": None,
+        "pval_cutoff": None,
+        "max_de_genes": None,
+        "n_dims": None,
+        "n_control_neighbors": None,
+        "iter_num": None,
+        "cell_type_key": None,
+    },
+    "mixscale": {
+        "min_de_genes": None,
+        "logfc_threshold": None,
+        "pval_cutoff": None,
+        "max_de_genes": None,
+    },
+    "statistics": {
+        "mode": None,
+        "aggregation": None,
+        "pseudocount_cpm": None,
+        "bootstrap_n": None,
+        "bootstrap_ci": None,
+        "min_nt_cells": None,
+        "fdr_threshold": None,
+        "allow_random_split_replicates": None,
+    },
+    "perturb": {
+        "distance_metric": None,
+        "mixscape_min_de_genes": None,
+        "mixscape_logfc": None,
+        "mixscape_pval": None,
+        "cell_type_key": None,
+        "min_guide_replicates": None,
+    },
+    "target_expression": {
+        "min_nt_detection_fraction": None,
+        "min_nt_mean_cpm": None,
+        "direction_log2fc_tolerance": None,
+    },
+    "augur": {
+        "classifier": None,
+        "n_folds": None,
+        "n_subsamples": None,
+        "subsample_size": None,
+        "n_estimators": None,
+        "feature_perc": None,
+        "n_threads": None,
+        "branch": None,
+        "select_variance_features": None,
+    },
+    "enrichment": {
+        "enabled": None,
+        "database": None,
+        "gene_sets": None,
+        "min_genes": None,
+        "max_targets": None,
+    },
+    "singler": {"enabled": None},
+    "plotting": {
+        "formats": None,
+        "mixscape_heatmap_max_genes": None,
+        "mixscape_heatmap_max_cells": None,
+        "dpi": None,
+        "width": None,
+        "height": None,
+        "theme": None,
+        "top_n_guides": None,
+        "max_legend_categories": None,
+        "scatter_max_points": None,
+        "volcano_lfc": None,
+        "heatmap_max_genes": None,
+        "enrichment_top_n": None,
+        "save_plot_data": None,
+        "palette": _ANY_KEYS,
+    },
+    "run": {"random_seed": None, "output_dir": None},
+    "runtime": {"seed": None},
+}
+
+
+def _reject_unknown_keys(config: dict[str, Any]) -> None:
+    """Stop when a mapping contains a key the analysis does not read."""
+    unknown = _unknown_key_paths(config, _ALLOWED_KEYS, "")
+    if unknown:
+        raise ConfigError("未识别的配置键 " + "、".join(unknown) + "。")
+
+
+def _unknown_key_paths(node: Any, allowed: Any, prefix: str) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    if allowed is _ANY_KEYS:
+        found: list[str] = []
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                found.extend(_unknown_key_paths(value, {}, path))
+        return found
+    if not isinstance(allowed, dict):
+        return [f"{prefix}.{key}" if prefix else str(key) for key in node]
+    found = []
+    for key, value in node.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if key not in allowed:
+            found.append(path)
+            continue
+        found.extend(_unknown_key_paths(value, allowed[key], path))
+    return found
+
+
 def validate_config(config: dict[str, Any]) -> None:
+    _reject_unknown_keys(config)
     experiment = _section(config, "experiment")
     sample_id = _required_text(experiment, "sample_id", "experiment.sample_id")
     if any(separator in sample_id for separator in ("/", "\\", "\n")):
@@ -344,6 +529,18 @@ def verify_species_consistency(
     return config
 
 
+def ribo_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
+    """Ribosomal-protein symbol prefixes. Human is RPL/RPS, mouse is Rpl/Rps.
+
+    Matching is case-insensitive. These are not mitochondrial prefixes and not an rRNA gene set.
+    """
+    organism = str(config["experiment"].get("organism", ""))
+    prefixes = RIBO_PREFIXES_BY_ORGANISM.get(organism)
+    if prefixes is None:
+        raise ConfigError(_ORGANISM_ERROR)
+    return prefixes
+
+
 def mito_prefix(config: dict[str, Any]) -> str:
     """Mitochondrial symbol prefix. Human is MT-, mouse is mt-."""
     organism = str(config["experiment"].get("organism", ""))
@@ -484,6 +681,7 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     if isinstance(n_mad, bool) or not isinstance(n_mad, int | float) or float(n_mad) <= 0:
         raise ConfigError("qc.n_mad 必须是正数。")
     qc["n_mad"] = float(n_mad)
+    _optional_fraction(qc, "max_ribo_frac", "qc.max_ribo_frac")
     present = [key for key in _QC_CUTOFFS if qc.get(key) is not None]
     if not present:
         return
@@ -501,6 +699,18 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     mito = float(qc["max_mito_frac"])
     if not 0 <= mito <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")
+
+
+def _optional_fraction(section: dict[str, Any], key: str, label: str) -> None:
+    """Validate one optional 0–1 cutoff. Absence is allowed."""
+    if section.get(key) is None:
+        return
+    value = section.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(f"{label} 必须是数值。")
+    if not 0 <= float(value) <= 1:
+        raise ConfigError(f"{label} 必须在 0 到 1 之间。")
+    section[key] = float(value)
 
 
 def _blank_to_none(value: Any) -> str | None:
@@ -521,6 +731,14 @@ def _validate_statistics(statistics: dict[str, Any]) -> None:
     alpha = statistics.get("pseudocount_cpm", 1.0)
     if isinstance(alpha, bool) or not isinstance(alpha, int | float) or float(alpha) <= 0:
         raise ConfigError("statistics.pseudocount_cpm 必须是正数。")
+    n_boot = statistics.get("bootstrap_n", 200)
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise ConfigError("statistics.bootstrap_n 必须是正整数。")
+    statistics["bootstrap_n"] = n_boot
+    level = statistics.get("bootstrap_ci", 0.95)
+    if isinstance(level, bool) or not isinstance(level, int | float) or not (0 < float(level) < 1):
+        raise ConfigError("statistics.bootstrap_ci 必须是 (0, 1) 内的数。")
+    statistics["bootstrap_ci"] = float(level)
 
 
 def _normalize_runtime(config: dict[str, Any]) -> None:

@@ -25,6 +25,7 @@ NON_PERTURBED = "non_perturbed"
 AMBIGUOUS = "ambiguous"
 NOT_EVALUATED = "not_evaluated"
 SKIPPED_NO_DE = "skipped_no_de_genes"
+DESCRIPTIVE_UNCERTAINTY = "descriptive_estimate_uncertainty_not_significance_test"
 
 
 def perturbation_type(config: dict[str, Any]) -> str:
@@ -1049,13 +1050,177 @@ def _pseudobulk_contrast(
     return result
 
 
+def _bootstrap_parameters(config: dict[str, Any]) -> tuple[int, float, int]:
+    statistics = config.get("statistics", {})
+    if not isinstance(statistics, dict):
+        statistics = {}
+    runtime = config.get("runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+    return (
+        int(statistics.get("bootstrap_n", 200)),
+        float(statistics.get("bootstrap_ci", 0.95)),
+        int(runtime.get("seed", 0)),
+    )
+
+
+def _bootstrap_rng(seed: int, branch: str, role: str, label: str) -> np.random.Generator:
+    tokens = [int(seed), *role.encode(), 0, *branch.encode(), 0, *label.encode()]
+    return np.random.default_rng(np.random.SeedSequence(tokens))
+
+
+def _bootstrap_pool(
+    counts: sparse.spmatrix | np.ndarray,
+    obs: pd.DataFrame,
+    positions: np.ndarray,
+    *,
+    cell_only: bool,
+) -> tuple[str, int, sparse.spmatrix | np.ndarray]:
+    """Raw-count libraries for one side of the contrast.
+
+    At least two distinct guide ids become one row per guide. A single guide, and
+    every zero-guide control, stays one row per cell.
+    """
+    n_genes = int(counts.shape[1])
+    positions = np.asarray(positions, dtype=int)
+    if positions.size == 0:
+        return "cell", 0, np.zeros((0, n_genes), dtype=np.float64)
+    guide_ids = obs["guide_id"].astype(str).to_numpy()[positions]
+    distinct = pd.unique(guide_ids[guide_ids != ""])
+    if cell_only or int(distinct.size) < 2:
+        block = counts[positions]
+        if sparse.issparse(block) and not sparse.isspmatrix_csr(block):
+            block = block.tocsr()
+        return "cell", int(positions.size), block
+    keep = guide_ids != ""
+    summed, _guide_ids = sum_by_group(counts[positions[keep]], pd.Series(guide_ids[keep]))
+    return "guide", int(summed.shape[0]), summed
+
+
+def _resample_count_sums(
+    libraries: sparse.spmatrix | np.ndarray,
+    n_boot: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw the observed number of units with replacement and sum their counts."""
+    n_units = int(libraries.shape[0])
+    n_genes = int(libraries.shape[1])
+    draws = rng.integers(0, n_units, size=(n_boot, n_units))
+    weights = np.zeros((n_boot, n_units), dtype=np.float64)
+    np.add.at(weights, (np.arange(n_boot)[:, None], draws), 1.0)
+    if sparse.issparse(libraries):
+        summed = weights @ libraries
+    else:
+        summed = weights @ np.asarray(libraries, dtype=np.float64)
+    summed = np.reshape(np.asarray(summed, dtype=np.float64), (n_boot, n_genes))
+    return summed, summed.sum(axis=1)
+
+
+def _replicate_log2fc(
+    target_counts: np.ndarray,
+    target_library: np.ndarray,
+    control_counts: np.ndarray,
+    control_library: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """CPM log2FC of each replicate. Both-zero raw counts stay missing."""
+    target_cpm = np.zeros(target_counts.shape, dtype=np.float64)
+    control_cpm = np.zeros(control_counts.shape, dtype=np.float64)
+    target_ok = target_library > 0
+    control_ok = control_library > 0
+    target_cpm[target_ok] = (1e6 * target_counts[target_ok]) / target_library[target_ok, None]
+    control_cpm[control_ok] = (1e6 * control_counts[control_ok]) / control_library[control_ok, None]
+    missing = (target_counts == 0) & (control_counts == 0)
+    missing |= (~target_ok)[:, None] | (~control_ok)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log2fc = np.log2((target_cpm + alpha) / (control_cpm + alpha))
+    return np.where(missing, np.nan, log2fc)
+
+
+def _missing_bootstrap(
+    n_genes: int, status: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        np.full(n_genes, np.nan),
+        np.full(n_genes, np.nan),
+        np.full(n_genes, status, dtype=object),
+    )
+
+
+def _percentile_bounds(
+    replicates: np.ndarray, point: np.ndarray, level: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    tail = (1.0 - float(level)) / 2.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        lower, upper = np.nanpercentile(replicates, [100.0 * tail, 100.0 * (1.0 - tail)], axis=0)
+    lower = np.asarray(lower, dtype=np.float64).reshape(point.shape)
+    upper = np.asarray(upper, dtype=np.float64).reshape(point.shape)
+    point_missing = ~np.isfinite(np.asarray(point, dtype=np.float64))
+    undefined = ~point_missing & ~(np.isfinite(lower) & np.isfinite(upper))
+    lower = np.where(point_missing | undefined, np.nan, lower)
+    upper = np.where(point_missing | undefined, np.nan, upper)
+    status = np.full(point.shape, "computed", dtype=object)
+    status[point_missing] = "point_estimate_missing"
+    status[undefined] = "bootstrap_interval_undefined"
+    return lower, upper, status
+
+
+def _effect_bootstrap(
+    counts: sparse.spmatrix | np.ndarray,
+    obs: pd.DataFrame,
+    positions: np.ndarray,
+    point: np.ndarray,
+    control_libraries: sparse.spmatrix | np.ndarray,
+    control_n_units: int,
+    control_cache: list[tuple[np.ndarray, np.ndarray] | None],
+    *,
+    alpha: float,
+    n_boot: int,
+    level: float,
+    seed: int,
+    branch: str,
+    target_name: str,
+) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+    """Percentile interval for one target. Both sides are redrawn each replicate."""
+    target_unit, target_n_units, target_libraries = _bootstrap_pool(
+        counts, obs, positions, cell_only=False
+    )
+    n_genes = int(np.asarray(point).shape[0])
+    if target_n_units < 2 and control_n_units < 2:
+        lower, upper, status = _missing_bootstrap(
+            n_genes, "fewer_than_2_target_and_control_sampling_units"
+        )
+        return lower, upper, target_unit, status
+    if target_n_units < 2:
+        lower, upper, status = _missing_bootstrap(n_genes, "fewer_than_2_target_sampling_units")
+        return lower, upper, target_unit, status
+    if control_n_units < 2:
+        lower, upper, status = _missing_bootstrap(n_genes, "fewer_than_2_control_sampling_units")
+        return lower, upper, target_unit, status
+    if control_cache[0] is None:
+        control_cache[0] = _resample_count_sums(
+            control_libraries, n_boot, _bootstrap_rng(seed, branch, "control", "control")
+        )
+    control_counts, control_library = control_cache[0]
+    target_counts, target_library = _resample_count_sums(
+        target_libraries, n_boot, _bootstrap_rng(seed, branch, "target", target_name)
+    )
+    replicates = _replicate_log2fc(
+        target_counts, target_library, control_counts, control_library, alpha
+    )
+    lower, upper, status = _percentile_bounds(replicates, np.asarray(point, dtype=np.float64), level)
+    return lower, upper, target_unit, status
+
+
 def descriptive_effects(
     adata: AnnData, config: dict[str, Any], *, branch: str
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """CPM log2 fold changes. A single sample does not produce p values or intervals.
+    """CPM log2 fold changes for one biological sample.
 
+    p-values, FDR, and the inferential ``ci_lower`` / ``ci_upper`` stay missing.
+    A within-sample bootstrap percentile interval is written beside them.
     Without a designed NT, the denominator is the pooled CPM of zero-guide cells.
-    p-values, FDR and intervals stay missing.
     """
     spec = control_spec(config)
     control = spec["control_label"]
@@ -1128,6 +1293,15 @@ def descriptive_effects(
     n_nt_cells = int(len(nt_obs))
     nt_guide_sizes = nt_obs.groupby(nt_obs["guide_id"].astype(str)).size()
     n_nt_eligible = int((nt_guide_sizes[nt_guide_sizes.index != ""] >= min_guide_cells).sum())
+    n_boot, ci_level, seed = _bootstrap_parameters(config)
+    control_positions = np.flatnonzero(selected.obs["target_gene"].astype(str).to_numpy() == control)
+    _unit, control_n_units, control_libraries = _bootstrap_pool(
+        counts,
+        selected.obs,
+        control_positions,
+        cell_only=bool(spec["temporary"]),
+    )
+    control_cache: list[tuple[np.ndarray, np.ndarray] | None] = [None]
     frames = []
     guide_rows: list[dict[str, Any]] = []
     comparisons: list[dict[str, Any]] = []
@@ -1175,6 +1349,22 @@ def descriptive_effects(
         both_zero = (target_counts == 0) & (nt_counts == 0)
         log2fc = np.log2((target_cpm + alpha) / (nt_cpm + alpha))
         log2fc = np.where(both_zero, np.nan, log2fc)
+        positions = selected.obs_names.get_indexer(group.index)
+        boot_lower, boot_upper, boot_unit, boot_status = _effect_bootstrap(
+            counts,
+            selected.obs,
+            positions,
+            log2fc,
+            control_libraries,
+            control_n_units,
+            control_cache,
+            alpha=alpha,
+            n_boot=n_boot,
+            level=ci_level,
+            seed=seed,
+            branch=branch,
+            target_name=target_name,
+        )
         frames.append(
             pd.DataFrame(
                 {
@@ -1198,6 +1388,13 @@ def descriptive_effects(
                     "fdr": pd.NA,
                     "ci_lower": pd.NA,
                     "ci_upper": pd.NA,
+                    "log2fc_bootstrap_ci_lower": boot_lower,
+                    "log2fc_bootstrap_ci_upper": boot_upper,
+                    "bootstrap_unit": boot_unit,
+                    "bootstrap_n": n_boot,
+                    "bootstrap_ci_level": ci_level,
+                    "uncertainty_meaning": DESCRIPTIVE_UNCERTAINTY,
+                    "bootstrap_status": boot_status,
                     "inference_status": "not_run_single_sample_descriptive",
                     "reason": "",
                     "effect_status": np.where(both_zero, "not_detected_both", "descriptive"),
@@ -1459,6 +1656,13 @@ def _effect_columns() -> list[str]:
         "fdr",
         "ci_lower",
         "ci_upper",
+        "log2fc_bootstrap_ci_lower",
+        "log2fc_bootstrap_ci_upper",
+        "bootstrap_unit",
+        "bootstrap_n",
+        "bootstrap_ci_level",
+        "uncertainty_meaning",
+        "bootstrap_status",
         "inference_status",
         "reason",
         "effect_status",

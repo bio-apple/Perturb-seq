@@ -17,8 +17,10 @@ STATUS_MULTI = "multi_guide"
 STATUS_TARGET = "targeting"
 STATUS_NT = "nt"
 STATUS_RETAINED = "retained"
+LOW_LIBRARY_NO_GUIDE = "low_library_no_guide"
 
 EXCLUSION_PRIORITY = (
+    LOW_LIBRARY_NO_GUIDE,
     "no_guide",
     "multi_guide",
     "low_guide_umi",
@@ -293,26 +295,54 @@ def _multi_subtype(parts: list[str], nt_control: str, target_by_name: dict[str, 
 def control_cell_mask(obs: pd.DataFrame, spec: dict[str, Any]) -> np.ndarray:
     """Cells used as the contrast. Designed NT and zero-guide cells stay separate.
 
-    Temporary control cells are assignment ``no_guide`` with zero guides. That
-    covers an empty assignment call and a matrix barcode missing from the
-    positive assignment table. ``multi_guide`` and ``single_targeting`` are not
-    controls. A configured NT label does not recruit zero-guide cells.
+    Temporary control cells are assignment ``no_guide`` with zero guides and
+    ``qc_pass``. That covers an empty assignment call and a matrix barcode
+    missing from the positive assignment table. ``multi_guide`` and
+    ``single_targeting`` are not controls. A configured NT label does not
+    recruit zero-guide cells. Cells excluded as ``low_library_no_guide`` stay
+    out of both contrasts. A real ``single_nt`` cell is not removed by that rule.
     """
     n = len(obs)
     if n == 0:
         return np.zeros(0, dtype=bool)
+    shallow = _low_library_no_guide_rows(obs)
     if spec.get("temporary"):
         if "assignment_status" in obs.columns and "n_guides" in obs.columns:
             assignment = obs["assignment_status"].astype(str)
             n_guides = pd.to_numeric(obs["n_guides"], errors="coerce").fillna(0)
-            return (assignment.eq(STATUS_NO_GUIDE) & n_guides.eq(0)).to_numpy()
-        label = str(spec.get("control_label", ""))
-        return _obs_eq(obs, "target_gene", label) | _obs_eq(obs, "perturbation_status", label)
+            mask = (assignment.eq(STATUS_NO_GUIDE) & n_guides.eq(0)).to_numpy()
+        else:
+            label = str(spec.get("control_label", ""))
+            mask = _obs_eq(obs, "target_gene", label) | _obs_eq(obs, "perturbation_status", label)
+        qc_pass = _flag_column(obs, "qc_pass")
+        if qc_pass is not None:
+            mask &= qc_pass
+        return mask & ~shallow
     label = str(spec.get("control_label", ""))
     designed = _obs_eq(obs, "perturbation_status", STATUS_NT) | _obs_eq(obs, "target_gene", label)
     if "assignment_status" in obs.columns:
         designed &= ~_obs_eq(obs, "assignment_status", STATUS_NO_GUIDE)
-    return designed
+    return designed & ~(shallow & ~_single_nt_rows(obs))
+
+
+def _flag_column(obs: pd.DataFrame, column: str) -> np.ndarray | None:
+    if column not in obs.columns:
+        return None
+    values = obs[column]
+    if pd.api.types.is_bool_dtype(values):
+        return values.fillna(False).to_numpy(dtype=bool)
+    return values.astype(str).str.strip().str.lower().isin(["true", "1"]).to_numpy()
+
+
+def _low_library_no_guide_rows(obs: pd.DataFrame) -> np.ndarray:
+    if "exclusion_reason_primary" not in obs.columns:
+        return np.zeros(len(obs), dtype=bool)
+    return obs["exclusion_reason_primary"].astype(str).eq(LOW_LIBRARY_NO_GUIDE).to_numpy()
+
+
+def _single_nt_rows(obs: pd.DataFrame) -> np.ndarray:
+    status = _obs_eq(obs, "assignment_status", STATUS_SINGLE_NT)
+    return status | _obs_eq(obs, "perturbation_status", STATUS_NT)
 
 
 def _obs_eq(obs: pd.DataFrame, column: str, value: str) -> np.ndarray:
@@ -365,18 +395,144 @@ def multi_guide_composition(
 
 
 def mito_fraction(mito_counts: np.ndarray, total_counts: np.ndarray) -> np.ndarray:
-    """Mitochondrial share of library size, on the same 0–1 scale as max_mito_frac.
+    """Share of library size on a 0–1 scale.
 
     A library size of 0 has no denominator, so the value is missing rather than 0.
+    Mitochondrial and ribosomal fractions both use this scale.
     """
-    mito = np.asarray(mito_counts, dtype=np.float64).ravel()
+    part = np.asarray(mito_counts, dtype=np.float64).ravel()
     total = np.asarray(total_counts, dtype=np.float64).ravel()
     fraction = np.full(total.shape, np.nan, dtype=np.float64)
-    np.divide(mito, total, out=fraction, where=total > 0)
+    np.divide(part, total, out=fraction, where=total > 0)
     return fraction
 
 
-def qc_metrics(adata: AnnData, mito_prefix: str) -> pd.DataFrame:
+def ribo_symbol_mask(symbols: pd.Series, prefixes: tuple[str, ...]) -> np.ndarray:
+    """Ribosomal-protein genes by symbol prefix. Matching is case-insensitive.
+
+    Human prefixes are RPL and RPS. Mouse prefixes are Rpl and Rps. This is not
+    a mitochondrial test and it is not an rRNA gene set. MRPL/Mrpl do not match.
+    """
+    folded = symbols.astype(str).str.casefold()
+    mask = np.zeros(len(folded), dtype=bool)
+    for prefix in prefixes:
+        text = str(prefix).casefold()
+        if text:
+            mask |= folded.str.startswith(text).to_numpy()
+    return mask
+
+
+def capture_efficiency(guide_umi: np.ndarray, total_counts: np.ndarray) -> np.ndarray:
+    """CRISPR guide UMI sum divided by Gene Expression library size.
+
+    A guide-UMI sum of 0 is efficiency 0, including when the library size is 0.
+    A positive guide-UMI sum with library size 0 has no denominator and is missing.
+    """
+    guide = np.asarray(guide_umi, dtype=np.float64).ravel()
+    total = np.asarray(total_counts, dtype=np.float64).ravel()
+    efficiency = np.full(guide.shape, np.nan, dtype=np.float64)
+    finite_guide = np.isfinite(guide)
+    efficiency[finite_guide & (guide == 0)] = 0.0
+    positive = finite_guide & (guide > 0) & np.isfinite(total) & (total > 0)
+    np.divide(guide, total, out=efficiency, where=positive)
+    return efficiency
+
+
+def low_library_no_guide_rule(
+    total_counts: pd.Series | np.ndarray,
+    n_guides: pd.Series | np.ndarray,
+    n_mad: float,
+) -> dict[str, Any]:
+    """Library-size floor from cells with at least one detected guide.
+
+    The floor is expm1(median(log1p(total_counts)) - n_mad * 1.4826 * MAD) on
+    those cells, the same MAD definition as the UMI thresholds. No detected
+    guide, or zero variance of their library size, skips the exclusion.
+    """
+    total = pd.to_numeric(pd.Series(total_counts), errors="coerce").to_numpy(dtype=float)
+    guides = pd.to_numeric(pd.Series(n_guides), errors="coerce").to_numpy(dtype=float)
+    detected = np.isfinite(guides) & (guides >= 1) & np.isfinite(total)
+    values = total[detected]
+    definition = (
+        "检测到至少 1 条 guide 的细胞，"
+        "log1p(total_counts) 的 median - n_mad × 1.4826 × MAD，再 expm1"
+    )
+    payload: dict[str, Any] = {
+        "applied": False,
+        "reason": "no_cells_with_guide",
+        "min_total_counts": None,
+        "source": "skipped",
+        "n_cells_with_guide": int(values.size),
+        "n_mad": float(n_mad),
+        "definition": definition,
+        "note": "没有细胞检测到 guide，不排除 no_guide，也不把它们改成设计好的 NT。",
+    }
+    if values.size == 0:
+        return payload
+    if float(np.var(values)) == 0.0:
+        payload["reason"] = "library_size_variance_zero"
+        payload["note"] = "检测到 guide 的细胞文库大小方差为 0，跳过这条排除。"
+        return payload
+    payload["applied"] = True
+    payload["reason"] = ""
+    payload["min_total_counts"] = _cutoff(pd.Series(values), None, float(n_mad), "lower", log=True)
+    payload["source"] = "median_mad"
+    payload["note"] = (
+        "没检测到 guide 且 total_counts 低于该下限的细胞，"
+        "qc_pass 为 false，过滤阶段为 low_library_no_guide，不进入对照。"
+    )
+    return payload
+
+
+def capture_library_correlation(table: pd.DataFrame) -> pd.DataFrame:
+    """Spearman correlation of capture efficiency and library size before QC pass.
+
+    The p-value stays in this QC table. It is not an effect-table p-value.
+    """
+    row: dict[str, Any] = {
+        "x": "total_counts",
+        "y": "grna_capture_efficiency",
+        "population": "before_qc_pass",
+        "n_cells_input": int(len(table)),
+        "n_cells": 0,
+        "spearman_r": np.nan,
+        "spearman_pvalue": np.nan,
+        "status": "skipped",
+        "reason": "",
+    }
+    needed = {"total_counts", "grna_capture_efficiency"}
+    if not needed.issubset(table.columns):
+        row["reason"] = "missing_capture_columns"
+        return pd.DataFrame([row])
+    library = pd.to_numeric(table["total_counts"], errors="coerce").to_numpy(dtype=float)
+    efficiency = pd.to_numeric(table["grna_capture_efficiency"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    ok = np.isfinite(library) & np.isfinite(efficiency)
+    row["n_cells"] = int(ok.sum())
+    if int(ok.sum()) < 2:
+        row["reason"] = "fewer_than_2_cells"
+        return pd.DataFrame([row])
+    if float(np.var(library[ok])) == 0.0 or float(np.var(efficiency[ok])) == 0.0:
+        row["reason"] = "zero_variance"
+        return pd.DataFrame([row])
+    from scipy.stats import spearmanr
+
+    result = spearmanr(library[ok], efficiency[ok])
+    statistic = getattr(result, "statistic", None)
+    if statistic is None:
+        statistic = result.correlation
+    row["spearman_r"] = float(statistic)
+    row["spearman_pvalue"] = float(result.pvalue)
+    row["status"] = "computed"
+    return pd.DataFrame([row])
+
+
+def qc_metrics(
+    adata: AnnData,
+    mito_prefix: str,
+    ribo_prefixes: tuple[str, ...] = ("RPL", "RPS"),
+) -> pd.DataFrame:
     counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
     if sparse.issparse(counts):
         total = np.asarray(counts.sum(axis=1)).ravel()
@@ -386,29 +542,52 @@ def qc_metrics(adata: AnnData, mito_prefix: str) -> pd.DataFrame:
         detected = np.asarray((counts > 0).sum(axis=1)).ravel()
     symbols = adata.var["gene_symbol"].astype(str)
     mito = symbols.str.startswith(mito_prefix).to_numpy()
-    if mito.any():
-        block = counts[:, mito]
-        mito_sum = (
-            np.asarray(block.sum(axis=1)).ravel()
-            if sparse.issparse(block)
-            else np.asarray(block.sum(axis=1)).ravel()
-        )
+    ribo = ribo_symbol_mask(symbols, ribo_prefixes)
+    mito_sum = _gene_block_sum(counts, mito, adata.n_obs)
+    ribo_sum = _gene_block_sum(counts, ribo, adata.n_obs)
+    if "guide_umi" in adata.obsm:
+        guide_block = adata.obsm["guide_umi"]
+        guide_total = np.asarray(guide_block.sum(axis=1)).ravel()
     else:
-        mito_sum = np.zeros(adata.n_obs, dtype=np.float64)
+        guide_total = np.zeros(adata.n_obs, dtype=np.float64)
     mito_frac = mito_fraction(mito_sum, total)
+    ribo_frac = mito_fraction(ribo_sum, total)
     return pd.DataFrame(
         {
             "cell_barcode": adata.obs_names.astype(str),
             "total_counts": total,
             "n_genes_by_counts": detected,
             "pct_counts_mito": mito_frac,
+            "pct_counts_ribo": ribo_frac,
+            "ribo_frac": ribo_frac,
+            "guide_umi_total": guide_total,
+            "grna_capture_efficiency": capture_efficiency(guide_total, total),
         }
     )
 
 
+def _gene_block_sum(counts: Any, mask: np.ndarray, n_obs: int) -> np.ndarray:
+    if not np.any(mask):
+        return np.zeros(n_obs, dtype=np.float64)
+    block = counts[:, mask]
+    if sparse.issparse(block):
+        return np.asarray(block.sum(axis=1)).ravel()
+    return np.asarray(block.sum(axis=1)).ravel()
+
+
 def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str, float]:
-    """Use configured cutoffs, or median ± MAD on the observed distribution."""
+    """Use configured cutoffs, or median ± MAD on the observed distribution.
+
+    Ribosome fraction is a separate upper bound. It is not one of the four
+    absolute thresholds that must be supplied together.
+    """
     n_mad = float(qc.get("n_mad", 3))
+    if "pct_counts_ribo" in metrics.columns:
+        ribo = metrics["pct_counts_ribo"]
+    elif "ribo_frac" in metrics.columns:
+        ribo = metrics["ribo_frac"]
+    else:
+        raise ValueError("缺少核糖体比例，不能把未计算的 QC 默认为通过。")
     return {
         "min_umi": _cutoff(metrics["total_counts"], qc.get("min_umi"), n_mad, "lower", log=True),
         "max_umi": _cutoff(metrics["total_counts"], qc.get("max_umi"), n_mad, "upper", log=True),
@@ -418,6 +597,7 @@ def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str,
         "max_mito_frac": _cutoff(
             metrics["pct_counts_mito"], qc.get("max_mito_frac"), n_mad, "upper", log=False
         ),
+        "max_ribo_frac": _cutoff(ribo, qc.get("max_ribo_frac"), n_mad, "upper", log=False),
     }
 
 
@@ -452,6 +632,24 @@ def _cutoff(
     return float(max(0.0, raw))
 
 
+def _low_library_no_guide_mask(
+    table: pd.DataFrame,
+    total_counts: np.ndarray,
+    rule: dict[str, Any] | None,
+) -> np.ndarray:
+    """Shallow cells with no detected guide. Cells that have a guide are left alone."""
+    empty = np.zeros(len(table), dtype=bool)
+    if not rule or not rule.get("applied") or rule.get("min_total_counts") is None:
+        return empty
+    if "assignment_status" not in table.columns or "n_guides" not in table.columns:
+        return empty
+    status = table["assignment_status"].astype(str).to_numpy()
+    n_guides = pd.to_numeric(table["n_guides"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    no_guide = (status == STATUS_NO_GUIDE) & (n_guides == 0)
+    floor = float(rule["min_total_counts"])
+    return no_guide & np.isfinite(total_counts) & (total_counts < floor)
+
+
 def apply_eligibility(
     annotated: pd.DataFrame,
     thresholds: dict[str, float],
@@ -459,22 +657,34 @@ def apply_eligibility(
     min_cells_per_target: int,
     cell_type: str = "ALL",
     guides_per_cell: int = 1,
+    low_library_rule: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """Attach QC, every exclusion reason, and one primary reason per cell."""
+    """Attach QC, every exclusion reason, and one primary reason per cell.
+
+    ``low_library_rule`` drops shallow cells with no detected guide. Cells that
+    already have a guide are not relabeled, and a real single_nt call is unchanged.
+    """
     table = annotated.copy()
-    for column in ("total_counts", "n_genes_by_counts", "mito_frac"):
+    for column in ("total_counts", "n_genes_by_counts", "mito_frac", "ribo_frac"):
         if column not in table.columns:
             raise ValueError(f"缺少 {column}，不能把未计算的 QC 默认为通过。")
         table[column] = pd.to_numeric(table[column], errors="coerce")
+    if "max_ribo_frac" not in thresholds:
+        raise ValueError("缺少 max_ribo_frac，不能把未计算的核糖体 QC 默认为通过。")
     total = table["total_counts"].to_numpy(dtype=float)
     genes = table["n_genes_by_counts"].to_numpy(dtype=float)
     mito = table["mito_frac"].to_numpy(dtype=float)
-    finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito)
+    ribo = table["ribo_frac"].to_numpy(dtype=float)
+    finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito) & np.isfinite(ribo)
     low_umi = finite & (total < float(thresholds["min_umi"]))
     high_umi = finite & (total > float(thresholds["max_umi"]))
     low_genes = finite & (genes < float(thresholds["min_genes"]))
     high_mito = finite & (mito > float(thresholds["max_mito_frac"]))
-    qc_pass = finite & ~low_umi & ~high_umi & ~low_genes & ~high_mito
+    high_ribo = finite & (ribo > float(thresholds["max_ribo_frac"]))
+    low_library = _low_library_no_guide_mask(table, total, low_library_rule)
+    qc_pass = (
+        finite & ~low_umi & ~high_umi & ~low_genes & ~high_mito & ~high_ribo & ~low_library
+    )
     qc_reasons = []
     for index in range(len(table)):
         reasons = []
@@ -488,6 +698,10 @@ def apply_eligibility(
             reasons.append("low_genes")
         if high_mito[index]:
             reasons.append("high_mito")
+        if high_ribo[index]:
+            reasons.append("high_ribo")
+        if low_library[index]:
+            reasons.append(LOW_LIBRARY_NO_GUIDE)
         qc_reasons.append(json.dumps(reasons))
     table["qc_pass"] = qc_pass
     table["qc_fail_reasons_json"] = qc_reasons
@@ -507,6 +721,8 @@ def apply_eligibility(
     primary = []
     for index, record in enumerate(table.itertuples(index=False)):
         reasons = []
+        if low_library[index]:
+            reasons.append(LOW_LIBRARY_NO_GUIDE)
         if record.assignment_status == STATUS_NO_GUIDE:
             reasons.append("no_guide")
         if record.assignment_status == STATUS_MULTI or int(record.n_guides) > int(guides_per_cell):
