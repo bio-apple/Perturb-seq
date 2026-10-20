@@ -91,7 +91,7 @@
 
 | 路径 | 内容 | 会缺 |
 | --- | --- | --- |
-| `qc/figures/guides_per_cell.png` | 每细胞 guide 数；含 no_guide / multi | 无 `n_guides` |
+| `qc/figures/guides_per_cell.png` | 每细胞 guide 条数分布（描述用；资格看 `n_targets`） | 无 `n_guides` |
 | `qc/figures/assignment_status_bar.png` | 四类分配 | 无 `assignment_status` |
 | `qc/figures/cells_per_guide_bar.png` | guide 细胞数（虚线 = 门槛） | 表空 |
 | `qc/figures/cells_per_target_bar.png` | 靶基因细胞数 | 表空 |

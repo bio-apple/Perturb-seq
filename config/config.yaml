@@ -6,8 +6,9 @@ labels:
   feature_type_crispr: CRISPR Direct Capture
   feature_type_gex: Gene Expression
   multi_guide_policy: drop
-  # 下游分析只保留恰好这么多条 guide 的细胞。默认 1。
-  guides_per_cell: 1
+  # 下游分析只保留恰好这么多个唯一靶基因的细胞。默认 1。
+  # 同一靶基因的多条 guide（如双 guide 文库）仍算单靶，不进 multi_guide。
+  targets_per_cell: 1
 qc:
   # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
   # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。

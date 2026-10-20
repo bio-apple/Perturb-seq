@@ -151,14 +151,14 @@
 
 ## 分配
 
-`labels.guides_per_cell` 默认 1：下游只保留恰好 1 条 guide 的细胞。
+`labels.targets_per_cell` 默认 1：下游只保留恰好 1 个唯一靶基因的细胞。判定按靶基因数，不按 guide 条数；同一靶基因的多条 guide（双 guide 文库）仍是 `single_targeting`。
 
 | 状态 | 含义 |
 | --- | --- |
-| `no_guide` | 0 条 |
-| `single_targeting` | 1 条靶向 |
-| `single_nt` | 1 条设计 NT |
-| `multi_guide` | 多于 1 条 |
+| `no_guide` | 0 条 guide |
+| `single_targeting` | 恰好 1 个靶向基因（可有多条 guide） |
+| `single_nt` | 恰好 1 个设计 NT 标签（可有多条 NT guide） |
+| `multi_guide` | 唯一靶基因数 > 1（不同靶，或靶向与 NT 混打） |
 
 `labels.multi_guide_policy` 只能是 `drop`。`--guide-separator` 必须非空；guide 名内部含分隔符时按参考库最长匹配切分。
 
@@ -170,7 +170,7 @@ low_library_no_guide → no_guide → multi_guide → low_guide_umi → qc_faile
 
 规则跳过时，`low_library_no_guide` 新增排除数为 0。
 
-`guides_per_cell` 图：`qc/figures/guides_per_cell.png`。纵轴 `Cells`；分母含 `no_guide` 与 `multi_guide`；柱上标计数与一位小数百分比。不画 guide 数 > 5 的红线。
+`guides_per_cell` 图：`qc/figures/guides_per_cell.png` 仍按 guide 条数分布作图（描述捕获），与资格判定用的 `n_targets` 不同。纵轴 `Cells`；分母含 `no_guide` 与 `multi_guide`；柱上标计数与一位小数百分比。
 
 ---
 

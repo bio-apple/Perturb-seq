@@ -201,12 +201,18 @@ def _pca_view(
 ) -> tuple[AnnData, dict[str, int]]:
     labels = adata.obs[groupby].astype(str)
     mask = np.ones(adata.n_obs, dtype=bool)
-    if "n_guides" in adata.obs.columns:
-        n_guides = pd.to_numeric(adata.obs["n_guides"], errors="coerce")
-        keep_guides = n_guides.eq(1)
+    if "n_targets" in adata.obs.columns:
+        n_targets = pd.to_numeric(adata.obs["n_targets"], errors="coerce")
+        keep_cells = n_targets.eq(1)
         if contrast == ZERO_GUIDE_LABEL:
-            keep_guides = keep_guides | labels.eq(contrast)
-        mask &= keep_guides.to_numpy()
+            keep_cells = keep_cells | labels.eq(contrast)
+        mask &= keep_cells.to_numpy()
+    elif "n_guides" in adata.obs.columns:
+        n_guides = pd.to_numeric(adata.obs["n_guides"], errors="coerce")
+        keep_cells = n_guides.eq(1)
+        if contrast == ZERO_GUIDE_LABEL:
+            keep_cells = keep_cells | labels.eq(contrast)
+        mask &= keep_cells.to_numpy()
     if groups is not None:
         mask &= labels.isin(set(groups) | {contrast}).to_numpy()
     indices = np.flatnonzero(mask)

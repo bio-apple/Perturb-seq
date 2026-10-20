@@ -2404,9 +2404,9 @@ def single_targeting_cell_counts(
     catalog: list[str] | None = None,
     control: str = "",
 ) -> pd.DataFrame:
-    """Count cells with exactly one guide assigned to each targeting gene.
+    """Count single-target cells assigned to each targeting gene.
 
-    NT, no-guide, and multi-guide cells are not added to a target. Targets listed
+    NT, no-guide, and multi-target cells are not added to a target. Targets listed
     in ``catalog`` but absent here stay at 0 so the zero count can be reported.
     """
     excluded = set(_EXCLUDED_TARGET_LABELS)
@@ -2415,8 +2415,14 @@ def single_targeting_cell_counts(
     if "assignment_status" in frame.columns:
         frame = frame[frame["assignment_status"].astype(str).eq("single_targeting")]
     else:
-        if "n_guides" in frame.columns:
-            frame = frame[pd.to_numeric(frame["n_guides"], errors="coerce").fillna(0).astype(int).eq(1)]
+        if "n_targets" in frame.columns:
+            frame = frame[
+                pd.to_numeric(frame["n_targets"], errors="coerce").fillna(0).astype(int).eq(1)
+            ]
+        elif "n_guides" in frame.columns:
+            frame = frame[
+                pd.to_numeric(frame["n_guides"], errors="coerce").fillna(0).astype(int).eq(1)
+            ]
         if "perturbation_status" in frame.columns:
             frame = frame[~frame["perturbation_status"].astype(str).isin(_NOT_SINGLE_TARGET_STATUS)]
     if frame.empty or "target_gene" not in frame.columns:

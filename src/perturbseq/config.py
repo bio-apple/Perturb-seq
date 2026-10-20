@@ -186,6 +186,8 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "feature_type_crispr": None,
         "feature_type_gex": None,
         "multi_guide_policy": None,
+        "targets_per_cell": None,
+        # Rejected in validate_config with a rename message.
         "guides_per_cell": None,
         "nt_control": None,
         "flag_guides_above": None,
@@ -327,18 +329,24 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("labels.multi_guide_policy 只能是 drop。")
     if labels.get("flag_guides_above") is not None:
         raise ConfigError(
-            "labels.flag_guides_above 已停用，不能作为剔除阈值。请使用 labels.guides_per_cell。"
+            "labels.flag_guides_above 已停用，不能作为剔除阈值。请使用 labels.targets_per_cell。"
         )
-    guides_per_cell = labels.get("guides_per_cell", 1)
+    if "guides_per_cell" in labels:
+        raise ConfigError(
+            "labels.guides_per_cell 已改为 labels.targets_per_cell："
+            "按每个细胞的唯一靶基因数判定，不再按 guide 条数。"
+        )
+    targets_per_cell = labels.get("targets_per_cell", 1)
     if (
-        not isinstance(guides_per_cell, int)
-        or isinstance(guides_per_cell, bool)
-        or guides_per_cell < 1
+        not isinstance(targets_per_cell, int)
+        or isinstance(targets_per_cell, bool)
+        or targets_per_cell < 1
     ):
         raise ConfigError(
-            "labels.guides_per_cell 必须是正整数。默认 1，表示每个细胞恰好一条 guide。"
+            "labels.targets_per_cell 必须是正整数。默认 1，表示每个细胞恰好一个靶基因"
+            "（同一靶基因的多条 guide 仍算单靶）。"
         )
-    labels["guides_per_cell"] = guides_per_cell
+    labels["targets_per_cell"] = targets_per_cell
 
     qc = _section(config, "qc")
     for key in ("min_cells_per_target", "min_cells_per_guide"):

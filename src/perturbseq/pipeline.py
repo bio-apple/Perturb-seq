@@ -260,7 +260,7 @@ def _step_io(folder: Path, config: dict[str, Any]):
             feature_type_gex=config["labels"].get("feature_type_gex", "Gene Expression"),
             feature_type_crispr=config["labels"]["feature_type_crispr"],
             multi_guide_policy=config["labels"]["multi_guide_policy"],
-            guides_per_cell=int(config["labels"].get("guides_per_cell", 1)),
+            targets_per_cell=int(config["labels"].get("targets_per_cell", 1)),
             min_guide_umi=None if min_guide_umi is None else float(min_guide_umi),
             mito_prefix=mito_prefix(config),
             ribo_prefixes=ribo_prefixes(config),
@@ -366,7 +366,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         calls,
         thresholds,
         min_cells_per_target=int(config["qc"]["min_cells_per_target"]),
-        guides_per_cell=int(config["labels"].get("guides_per_cell", 1)),
+        targets_per_cell=int(config["labels"].get("targets_per_cell", 1)),
         low_library_rule=library_rule,
     )
     updated.insert(0, "sample_id", config["experiment"]["sample_id"])
@@ -412,6 +412,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         "guide_umi_total",
         "grna_capture_efficiency",
         "n_guides",
+        "n_targets",
         "exclusion_reason_primary",
         "perturbation_status",
     ]

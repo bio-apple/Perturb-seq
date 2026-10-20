@@ -169,17 +169,20 @@ def annotate_assignments(
     multi_guide_policy: str,
     min_guide_umi: float | None,
     matrix_barcodes: set[str],
-    guides_per_cell: int = 1,
+    targets_per_cell: int = 1,
 ) -> pd.DataFrame:
     """Classify every assignment row into four exclusive categories.
 
-    ``guides_per_cell`` is the count kept for later analysis. It does not add a
-    fifth assignment class. Cells with more guides stay ``multi_guide``.
+    Classification uses the number of unique target genes, not the number of
+    guides. Two guides aimed at the same gene are ``single_targeting``.
+    ``targets_per_cell`` is the unique-target count kept for later analysis; it
+    does not add a fifth assignment class. Cells with more unique targets stay
+    ``multi_guide``.
     """
     if multi_guide_policy != "drop":
         raise ValueError("本版只支持 multi_guide_policy=drop。")
-    if guides_per_cell < 1:
-        raise ValueError("guides_per_cell 必须是正整数。")
+    if targets_per_cell < 1:
+        raise ValueError("targets_per_cell 必须是正整数。")
     catalog = validate_guide_targets(reference, nt_control=nt_control)
     names = set(catalog["guide_name"])
     max_tokens = name_token_width(reference)
@@ -220,11 +223,13 @@ def annotate_assignments(
             STATUS_SINGLE_TARGET: STATUS_TARGET,
             STATUS_SINGLE_NT: STATUS_NT,
         }.get(status, status)
+        unique_targets = list(dict.fromkeys(target for target in targets if target))
         rows.append(
             {
                 "cell_barcode": barcode,
                 "n_guides_called": int(record.num_features),
                 "n_guides": len(parts),
+                "n_targets": len(unique_targets),
                 "feature_call": call,
                 "guide_list": "|".join(parts),
                 "guide_list_json": json.dumps(parts),
@@ -253,18 +258,22 @@ def _assignment_for_call(
     nt_control: str,
     target_by_name: dict[str, str],
 ) -> tuple[str, str, str, list[str]]:
-    targets = [_target_of(part, nt_control, target_by_name) for part in parts]
+    """Assign by unique target genes. Same-gene dual guides stay single-target."""
     if not parts:
         return STATUS_NO_GUIDE, "", "", []
-    if len(parts) > 1:
+    targets = [_target_of(part, nt_control, target_by_name) for part in parts]
+    for guide_name, target in zip(parts, targets, strict=True):
+        if target == "":
+            raise ValueError(f"guide 没有靶基因: {guide_name}")
+    unique = list(dict.fromkeys(targets))
+    if len(unique) > 1:
         return STATUS_MULTI, "", "", targets
+    target = unique[0]
     guide_name = parts[0]
-    target = targets[0]
-    if target == "":
-        raise ValueError(f"guide 没有靶基因: {guide_name}")
-    if _is_nt(guide_name, target_by_name.get(guide_name, ""), nt_control):
-        return STATUS_SINGLE_NT, guide_name, nt_control, [nt_control]
-    return STATUS_SINGLE_TARGET, guide_name, target, [target]
+    label = nt_control.strip() if isinstance(nt_control, str) else ""
+    if label and target == label:
+        return STATUS_SINGLE_NT, guide_name, label, targets
+    return STATUS_SINGLE_TARGET, guide_name, target, targets
 
 
 def _target_of(guide_name: str, nt_control: str, target_by_name: dict[str, str]) -> str:
@@ -364,13 +373,16 @@ def multi_guide_composition(
     nt_control: str,
     reference: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Classify multi-guide calls before they are dropped."""
+    """Classify true multi-target calls before they are dropped.
+
+    Same-gene dual guides are ``single_targeting`` and are not counted here.
+    """
     catalog = validate_guide_targets(reference, nt_control=nt_control)
     target_by_name = target_by_guide_name(catalog)
     names = set(catalog["guide_name"])
     max_tokens = name_token_width(reference)
     counts = {MULTI_ALL_NT: 0, MULTI_SAME_TARGET: 0, MULTI_MIXED_NT: 0, MULTI_DIFFERENT_TARGETS: 0}
-    multi = annotated[annotated["n_guides_called"] > 1]
+    multi = annotated[annotated["assignment_status"].astype(str).eq(STATUS_MULTI)]
     for record in multi.itertuples(index=False):
         parts = segment_feature_call(str(record.feature_call), names, max_tokens)
         if len(parts) < 2 or any(part not in names for part in parts):
@@ -658,13 +670,14 @@ def apply_eligibility(
     *,
     min_cells_per_target: int,
     cell_type: str = "ALL",
-    guides_per_cell: int = 1,
+    targets_per_cell: int = 1,
     low_library_rule: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Attach QC, every exclusion reason, and one primary reason per cell.
 
     ``low_library_rule`` drops shallow cells with no detected guide. Cells that
     already have a guide are not relabeled, and a real single_nt call is unchanged.
+    Retention uses unique target-gene count (``n_targets``), not guide count.
     """
     table = annotated.copy()
     for column in ("total_counts", "n_genes_by_counts", "mito_frac", "ribo_frac"):
@@ -722,8 +735,10 @@ def apply_eligibility(
     table["qc_pass"] = qc_pass
     table["qc_fail_reasons_json"] = qc_reasons
     table["cell_type"] = cell_type
+    if "n_targets" not in table.columns:
+        raise ValueError("缺少 n_targets，不能按靶基因数判定资格。")
     single = table["assignment_status"].isin([STATUS_SINGLE_TARGET, STATUS_SINGLE_NT])
-    allowed_count = table["n_guides"].astype(int) == int(guides_per_cell)
+    allowed_count = table["n_targets"].astype(int) == int(targets_per_cell)
     base = single & allowed_count & table["guide_umi_pass"].astype(bool) & table["qc_pass"]
     table["base_eligible"] = base.to_numpy()
     targeting_base = base & (table["assignment_status"] == STATUS_SINGLE_TARGET)
@@ -741,7 +756,7 @@ def apply_eligibility(
             reasons.append(LOW_LIBRARY_NO_GUIDE)
         if record.assignment_status == STATUS_NO_GUIDE:
             reasons.append("no_guide")
-        if record.assignment_status == STATUS_MULTI or int(record.n_guides) > int(guides_per_cell):
+        if record.assignment_status == STATUS_MULTI or int(record.n_targets) > int(targets_per_cell):
             reasons.append("multi_guide")
         if not bool(record.guide_umi_pass):
             reasons.append("low_guide_umi")
@@ -818,6 +833,9 @@ def disambiguate_shared_guides(
         for name in set(table.loc[table["shared_guide_name"], "guide_name"].astype(str))
     }
     id_to_column = {guide_id: index for index, guide_id in enumerate(crispr_ids)}
+    name_to_columns = {
+        name: np.flatnonzero(names == name) for name in set(names.tolist()) if name
+    }
     resolved: list[str] = []
     umis: list[float] = []
     for row_index, record in enumerate(table.itertuples(index=False)):
@@ -826,6 +844,24 @@ def disambiguate_shared_guides(
         if matrix_row < 0 or status not in {STATUS_NT, STATUS_TARGET}:
             resolved.append(str(record.guide_id))
             umis.append(np.nan)
+            continue
+        parts = _record_guide_names(record)
+        if len(parts) > 1:
+            columns = np.concatenate(
+                [name_to_columns.get(part, np.array([], dtype=int)) for part in parts]
+            )
+            if columns.size == 0:
+                resolved.append("")
+                umis.append(0.0)
+                continue
+            values = _row_values(guide_umi, matrix_row, columns)
+            if values.size == 0 or float(np.nanmax(values)) <= 0:
+                resolved.append("")
+                umis.append(0.0)
+                continue
+            winner = int(np.argmax(values))
+            resolved.append(str(ids[columns[winner]]))
+            umis.append(float(values[winner]))
             continue
         if bool(record.shared_guide_name):
             columns = columns_by_name.get(str(record.guide_name), np.array([], dtype=int))
@@ -848,6 +884,16 @@ def disambiguate_shared_guides(
     table["guide_id"] = resolved
     table["guide_umi_observed"] = umis
     return table
+
+
+def _record_guide_names(record: Any) -> list[str]:
+    names = getattr(record, "guide_names", None)
+    if names is None:
+        name = str(getattr(record, "guide_name", "") or "")
+        return [name] if name else []
+    if isinstance(names, str):
+        return [names] if names else []
+    return [str(name) for name in list(names) if str(name)]
 
 
 def _row_values(matrix: sparse.spmatrix, row: int, columns: np.ndarray) -> np.ndarray:

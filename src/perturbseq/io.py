@@ -123,7 +123,7 @@ def load_sample(
     feature_type_gex: str,
     feature_type_crispr: str,
     multi_guide_policy: str,
-    guides_per_cell: int = 1,
+    targets_per_cell: int = 1,
     min_guide_umi: float | None,
     mito_prefix: str,
     ribo_prefixes: tuple[str, ...],
@@ -182,7 +182,7 @@ def load_sample(
         reference,
         nt_control=nt_control,
         multi_guide_policy=multi_guide_policy,
-        guides_per_cell=guides_per_cell,
+        targets_per_cell=targets_per_cell,
         min_guide_umi=min_guide_umi,
         matrix_barcodes=set(barcodes.astype(str)),
     )
@@ -192,7 +192,7 @@ def load_sample(
         )
     keep_status = annotated["assignment_status"].isin(
         [STATUS_SINGLE_TARGET, STATUS_SINGLE_NT]
-    ) & (annotated["n_guides"].astype(int) == int(guides_per_cell))
+    ) & (annotated["n_targets"].astype(int) == int(targets_per_cell))
     zero_guide = annotated["assignment_status"].eq(STATUS_NO_GUIDE) & annotated["n_guides"].astype(
         int
     ).eq(0)
@@ -303,6 +303,7 @@ def _no_guide_rows(barcodes: list[str]) -> pd.DataFrame:
                 "cell_barcode": barcode,
                 "n_guides_called": 0,
                 "n_guides": 0,
+                "n_targets": 0,
                 "feature_call": "",
                 "guide_list": "",
                 "guide_list_json": "[]",
@@ -327,6 +328,7 @@ def _obs_frame(annotated: pd.DataFrame, wanted: pd.Index) -> pd.DataFrame:
     columns = [
         "n_guides_called",
         "n_guides",
+        "n_targets",
         "feature_call",
         "guide_list",
         "guide_name",
@@ -343,6 +345,7 @@ def _obs_frame(annotated: pd.DataFrame, wanted: pd.Index) -> pd.DataFrame:
     obs["cell_barcode"] = pd.Index(wanted)
     obs["n_guides_called"] = obs["n_guides_called"].astype(int)
     obs["n_guides"] = obs["n_guides"].astype(int)
+    obs["n_targets"] = obs["n_targets"].astype(int)
     obs["shared_guide_name"] = obs["shared_guide_name"].astype(bool)
     obs["in_matrix"] = obs["in_matrix"].astype(bool)
     return obs
