@@ -1,8 +1,8 @@
 # Perturb-seq 单样本三级分析
 
-从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 和扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
+从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 与扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
 
-文档索引见 [docs/README.md](docs/README.md)。
+步骤：`io` → `assign` → `preprocess` → `mixscape` → `mixscale` → `perturb` → `report`。细则见 [docs/](docs/README.md)。
 
 ## 环境搭建
 
@@ -32,17 +32,25 @@ python -m perturbseq \
   --nt-control NT_NAME
 ```
 
-`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control` 时使用 `zero_guide` 临时对照。`--organism` 写入 `experiment.organism`（`human` / `mouse`）。`--crispr-mode` 取 `KO` / `i` / `a` / `other`（默认 `KO`）。
+`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control` 时使用 `zero_guide` 临时对照。
+
+| 常用参数 | 说明 |
+| --- | --- |
+| `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
+| `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
+| `--steps` | 默认 `all`；可逗号子集，如 `mixscape` 或 `mixscale --resume` |
+| UMI / ribo | 须显式 `--min-umi`+`--max-umi` 或 `--max-ribo-frac`；默认不做这两项过滤 |
+| 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
 
 ## 输出概览
 
-- `qc/`：mRNA / gRNA 统计
-- `UMAP/`：表达 UMAP、簇注释、细胞周期、Mixscape signature
-- `DGE/Mixscape/`：Mixscape 门槛、摘要、class / 2x2 / fraction
-- `DGE/mixscale/`：Mixscale ridge / scatter、门槛
-- `DGE/descriptive/`：描述性 CPM log2FC 与相关效应表
-- `E-distance/`：对当前对照的能量距离与 guide 伪批量距离
+| 目录 | 内容 |
+| --- | --- |
+| `qc/` | mRNA / gRNA 统计 |
+| `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
+| `DGE/Mixscape/` | Mixscape 门槛、摘要、class / 2x2 / fraction |
+| `DGE/mixscale/` | Mixscale ridge / scatter、门槛 |
+| `DGE/descriptive/` | 描述性 CPM log2FC 与相关效应表 |
+| `E-distance/` | 对当前对照的 E-test；可选 guide 伪批量距离 |
 
-图只写 PNG（无 PDF、无同名图旁 txt）。细节见 [docs/](docs/README.md)。
-
-
+图只写 PNG（`plotting.dpi` 默认 300）；无 PDF、无同名图旁 txt。配置与规则见 [docs/analysis.md](docs/analysis.md)，路径与跳过条件见 [docs/outputs.md](docs/outputs.md)。

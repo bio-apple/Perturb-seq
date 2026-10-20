@@ -1,6 +1,10 @@
-# 分析软件默认参数。样本、物种（--organism → experiment.organism）、输入输出目录、
-# guide 分隔符、非靶向对照和 CRISPR 模式（--crispr-mode：KO / i / a / other → experiment.crispr_mode）由命令行传入。
+# 分析软件默认参数。
+# 步骤：io → assign → preprocess → mixscape → mixscale → perturb → report。
+# 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
+# 非靶向对照和 CRISPR 模式（--crispr-mode：KO / i / a / other → experiment.crispr_mode）由命令行传入。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
+# 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可保留但实现不切换格式。
+# guide 伪批量距离须显式写 perturb.min_guide_replicates；默认不写则跳过。
 input:
   barcode_policy: strict
 labels:
@@ -71,6 +75,8 @@ perturb:
   # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致。Mixscale 不读此键。
   mixscape_logfc: 0.25
   mixscape_pval: 0.05
+  # 可选：取消下一行注释并设正整数后，才写 E-distance 下的 guide 伪批量距离。
+  # min_guide_replicates: 2
 target_expression:
   min_nt_detection_fraction: 0.05
   min_nt_mean_cpm: 1.0
@@ -79,6 +85,7 @@ target_expression:
 singler:
   enabled: true
 plotting:
+  # 实现只写 PNG；保留 formats 以免旧配置报未知键。
   formats:
     - png
   mixscape_heatmap_max_genes: 20
