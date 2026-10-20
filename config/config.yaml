@@ -14,7 +14,7 @@ qc:
   max_mito_frac: 0.2
   min_cells_per_target: 20
   min_cells_per_guide: 10
-  min_guide_umi: null
+
 preprocess:
   normalize_target_sum: 10000
   # PCA / neighbors / Leiden / UMAP 建立在 top n_hvg 高变基因上；文库归一化仍用全部基因。
