@@ -578,9 +578,9 @@ def _gene_block_sum(counts: Any, mask: np.ndarray, n_obs: int) -> np.ndarray:
 def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str, float]:
     """Use configured cutoffs, or median ± MAD on the observed distribution.
 
-    Expressed-gene bounds (``min_genes`` / ``max_genes``) come from software
-    defaults or the CLI. They are not derived by MAD. Ribosome fraction is a
-    separate upper bound and is also outside the UMI/mito absolute set.
+    Expressed-gene bounds and ``max_mito_frac`` come from software defaults or
+    the CLI. They are not derived by MAD. Ribosome fraction is a separate upper
+    bound and is also outside the UMI absolute set.
     """
     n_mad = float(qc.get("n_mad", 3))
     if "pct_counts_ribo" in metrics.columns:
@@ -591,14 +591,14 @@ def derive_qc_thresholds(metrics: pd.DataFrame, qc: dict[str, Any]) -> dict[str,
         raise ValueError("缺少核糖体比例，不能把未计算的 QC 默认为通过。")
     if qc.get("min_genes") is None or qc.get("max_genes") is None:
         raise ValueError("缺少 qc.min_genes 或 qc.max_genes。")
+    if qc.get("max_mito_frac") is None:
+        raise ValueError("缺少 qc.max_mito_frac。")
     return {
         "min_umi": _cutoff(metrics["total_counts"], qc.get("min_umi"), n_mad, "lower", log=True),
         "max_umi": _cutoff(metrics["total_counts"], qc.get("max_umi"), n_mad, "upper", log=True),
         "min_genes": float(qc["min_genes"]),
         "max_genes": float(qc["max_genes"]),
-        "max_mito_frac": _cutoff(
-            metrics["pct_counts_mito"], qc.get("max_mito_frac"), n_mad, "upper", log=False
-        ),
+        "max_mito_frac": float(qc["max_mito_frac"]),
         "max_ribo_frac": _cutoff(ribo, qc.get("max_ribo_frac"), n_mad, "upper", log=False),
     }
 
@@ -685,7 +685,8 @@ def apply_eligibility(
     # Drop cells with ≤ min_genes or ≥ max_genes expressed genes.
     low_genes = finite & (genes <= float(thresholds["min_genes"]))
     high_genes = finite & (genes >= float(thresholds["max_genes"]))
-    high_mito = finite & (mito > float(thresholds["max_mito_frac"]))
+    # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.2).
+    high_mito = finite & (mito >= float(thresholds["max_mito_frac"]))
     high_ribo = finite & (ribo > float(thresholds["max_ribo_frac"]))
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
     qc_pass = (

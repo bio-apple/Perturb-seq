@@ -14,25 +14,29 @@ from perturbseq.config import mito_prefix
 
 
 def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
-    """Normalize counts, then HVG, scaled PCA, neighbors, UMAP and Leiden.
+    """Normalize all genes, then PCA / neighbors / Leiden / UMAP on top HVGs.
 
-    ``X`` is replaced from ``layers['counts']`` before normalization, so a
-    previously log-transformed matrix is not normalized again. The counts layer
-    stays raw. PCA is fit on z-scored highly variable genes only; ``X`` stays
-    sparse and log-normalized for later expression summaries. Mitochondrial
-    genes are removed from the HVG set and replaced by the next non-mitochondrial
-    genes. The embedding is descriptive. Perturbation statistics do not use the
-    UMAP coordinates. Harmony runs only when ``batch_key`` names a column with
-    more than one level. A missing Harmony install stops that run instead of
-    skipping the correction. This sample has no batch column.
+    Library-size normalization and ``log1p`` run on the full gene matrix so
+    later effect tables still see every gene. Highly variable genes are then
+    selected (default ``n_hvg=2000``, Seurat flavor). Mitochondrial genes are
+    dropped from that set and replaced by the next non-mitochondrial genes.
+    PCA is fit on the z-scored HVG slice only; neighbors, Leiden clustering and
+    UMAP use that PCA. ``X`` stays sparse and log-normalized. The embedding is
+    descriptive. Perturbation statistics do not use the UMAP coordinates.
+    Harmony runs only when ``batch_key`` names a column with more than one
+    level. A missing Harmony install stops that run instead of skipping the
+    correction.
     """
     settings = config["preprocess"]
     seed = int(config["runtime"]["seed"])
-    _normalize_from_counts(adata, float(settings["normalize_target_sum"]))
+    target_sum = float(settings["normalize_target_sum"])
     n_hvg = min(int(settings["n_hvg"]), adata.n_vars)
+    _normalize_from_counts(adata, target_sum)
     sc.pp.highly_variable_genes(adata, n_top_genes=n_hvg, flavor="seurat")
     _drop_mitochondrial_hvg(adata, config, n_hvg)
     usable = int(adata.var["highly_variable"].sum())
+    if usable < 2:
+        raise ValueError("高变基因数不足以计算 PCA。")
     n_comps = min(int(settings["n_pcs"]), usable - 1, adata.n_obs - 1)
     if n_comps < 2:
         raise ValueError("细胞数或高变基因数不足以计算 PCA。")
@@ -65,6 +69,21 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
         random_state=seed,
         key_added="leiden",
     )
+    adata.uns["preprocess"] = {
+        "normalize_target_sum": target_sum,
+        "n_hvg_requested": int(settings["n_hvg"]),
+        "n_hvg_used": usable,
+        "hvg_flavor": "seurat",
+        "pca_on": "scaled_highly_variable_genes",
+        "neighbors_umap_leiden_on": representation,
+        "n_pcs": n_comps,
+        "n_neighbors": n_neighbors,
+        "leiden_resolution": float(settings["leiden_resolution"]),
+        "note": (
+            "Library-size normalization and log1p use all genes; "
+            "PCA, neighbors, Leiden and UMAP use the top highly variable genes."
+        ),
+    }
     assign_cell_type(adata, config)
     return adata
 

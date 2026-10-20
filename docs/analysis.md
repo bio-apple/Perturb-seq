@@ -108,21 +108,24 @@
 
 ## QC
 
-### UMI 与线粒体绝对阈值
+### UMI 绝对阈值
 
-命令行须同时给出 `--min-umi`、`--max-umi`、`--max-mito-frac`，或全部留空。部分给出会失败。
+命令行须同时给出 `--min-umi`、`--max-umi`，或全部留空。只给其中一个会失败。
 
 全部留空时，在分配步骤用全部细胞计算，写入 `tables/qc_thresholds.json`，`source=median_mad`：
 
 - UMI：`log1p` → median ± `qc.n_mad`（默认 3）× 1.4826 × MAD → `expm1`
-- 线粒体比例：原分数上同一公式，限制在 \[0, 1\]
 - MAD 为 0 时改用标准差
 
-命令行给齐这三个数时 `source=command_line`。
+命令行给齐这两个数时 `source=command_line`。
 
 ### 表达基因数
 
-默认剔除表达基因数 ≤ 100 或 ≥ 6000 的细胞：`qc.min_genes=100`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI / 线粒体的成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。
+默认剔除表达基因数 ≤ 100 或 ≥ 6000 的细胞：`qc.min_genes=100`，`qc.max_genes=6000`。保留区间是开区间 `(min_genes, max_genes)`。可用 `--min-genes` / `--max-genes` 覆盖。这两项不由 MAD 推导，也不并入 UMI 成套绝对阈值。超过上限的原因是 `high_genes`，低于等于下限的原因是 `low_genes`。
+
+### 线粒体比例
+
+默认剔除线粒体 reads 比例 ≥ 20% 的细胞：`qc.max_mito_frac=0.2`。可用 `--max-mito-frac` 覆盖。不由 MAD 推导。失败原因是 `high_mito`。
 
 ### 核糖体比例
 
@@ -253,11 +256,15 @@ Mixscape 是敏感性分支。标签：`nt` / `perturbed` / `non_perturbed` / `a
 
 ## 预处理与簇注释
 
-1. 从 `layers['counts']` 归一化到 `normalize_target_sum`（10000）→ `log1p`
-2. HVG：Seurat flavor，`n_hvg=2000`；去掉本物种线粒体前缀后补非线粒体基因
-3. PCA 在标准化 HVG 上，`n_pcs=30`；`X` 保持 log 归一化
-4. Leiden：igraph，分辨率来自配置
-5. `--batch-key` 空 → 不跑 Harmony；有键且水平 < 2 → `not_run_fewer_than_two_batch_levels`
+PCA、邻居图、Leiden 聚类和 UMAP 都建立在 top `preprocess.n_hvg`（默认 **2000**）高变基因上。
+
+1. 从 `layers['counts']` 对**全部基因**做文库大小归一化（`normalize_target_sum`，默认 10000）→ `log1p`。完整矩阵留给后续效应表；`layers['counts']` 仍是原始计数。
+2. 高变基因：Seurat flavor，取 top 2000；去掉本物种线粒体前缀后用后面的非线粒体基因补满。
+3. 只在这 2000 个 HVG 上做 z-score，再算 PCA（`n_pcs` 默认 40）；`X` 保持全基因 log 归一化稀疏矩阵。
+4. 邻居图、UMAP、Leiden（igraph）都用这份 HVG-PCA（若跑了 Harmony 则用 `X_pca_harmony`）。
+5. `--batch-key` 空 → 不跑 Harmony；有键且水平 < 2 → `not_run_fewer_than_two_batch_levels`。
+
+参数记在 `adata.uns['preprocess']`。
 
 ### 细胞周期
 

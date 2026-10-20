@@ -51,7 +51,7 @@
 | `barcode_differences.tsv`、`input_validation.json` | `io` / `--validate-only` | 集合一致时差异表仅表头 |
 | `tables/guide_reference_conflicts.tsv` | 参考表冲突 | 参考表通过 |
 | `tables/cell_calls.tsv`、`io_checks.json`、`multi_guide_composition.tsv`、`checkpoints/io.h5ad` | `io` 通过 | assignment-only 时提前退出 |
-| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI/mito、表达基因数 100–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
+| `cell_status.tsv`、`filter_stage_counts.tsv`、`tables/qc_thresholds.json`、`checkpoints/assign.h5ad` | `assign` 完成（含 UMI、mito≥20%、表达基因数 100–6000、ribo、`low_library_no_guide`） | 无 `io` checkpoint |
 | `qc/tables/qc_metrics.tsv` | UMI、基因数、mito、ribo、guide UMI、捕获效率 | 同上 |
 | `qc/tables/grna_capture_library_correlation.tsv` | Spearman；含低文库排除是否执行 | 缺列 / 细胞 < 2 / 方差 0 |
 | `qc/tables/assignment_summary.tsv` | 四类分配计数 | 同上 |
@@ -67,7 +67,7 @@
 
 | 路径 | 何时有 | 何时缺 |
 | --- | --- | --- |
-| `checkpoints/preprocess.h5ad` | 归一化、HVG、PCA、可选 Harmony；scib 细胞周期 | 无分析细胞 |
+| `checkpoints/preprocess.h5ad` | 全基因归一化；PCA / neighbors / Leiden / UMAP 在 top 2000 HVG 上；可选 Harmony；scib 细胞周期；`uns['preprocess']` 记参数 | 无分析细胞 |
 | `DGE/tables/mixscape_de_gate.tsv` | Mixscape 门槛（默认 logfc 0.25） | `no_zero_guide_cells`；`mixscape.enabled=false` |
 | `DGE/tables/mixscape_summary.tsv` | 每靶 gene 的 KO/NP/ambiguous 比例 | Mixscape 未跑 |
 | `effect_main.tsv`、`effect_sensitivity.tsv` | 描述性 CPM log2FC + bootstrap 区间；`pvalue`/`fdr`/`ci_*` 为 NA | 无对照 / 整支跳过时仅表头 |

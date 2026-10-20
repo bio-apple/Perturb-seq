@@ -22,6 +22,7 @@ qc:
   min_guide_umi: null
 preprocess:
   normalize_target_sum: 10000
+  # PCA / neighbors / Leiden / UMAP 建立在 top n_hvg 高变基因上；文库归一化仍用全部基因。
   n_hvg: 2000
   n_pcs: 40
   n_neighbors: 15
@@ -30,7 +31,7 @@ mixscape:
   enabled: true
   min_de_genes: 5
   # RunMixscape / MixscapeHeatmap 的 logfc.threshold。教程调用没有改写，函数默认 0.25。
-  logfc_threshold: 0.1
+  logfc_threshold: 0.2
   pval_cutoff: 0.05
   max_de_genes: 100
   # CalcPerturbSig：ndims=40，num.neighbors=20。矩阵比 40 小时才截断。
@@ -43,7 +44,7 @@ mixscape:
 # pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
 mixscale:
   min_de_genes: 5
-  logfc_threshold: 0.1
+  logfc_threshold: 0.2
   pval_cutoff: 0.05
   max_de_genes: 100
 statistics:
