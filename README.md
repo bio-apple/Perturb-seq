@@ -17,7 +17,7 @@ conda install -y -c conda-forge r-base=4.4.3
 Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org"); BiocManager::install(version = "3.20", ask = FALSE, update = FALSE); BiocManager::install(c("SingleR", "celldex"), version = "3.20", ask = FALSE, update = FALSE)'
 ```
 
-Python 包以 `requirements.lock` 为准。入口：`python -m perturbseq` 或 `perturbseq-tertiary`。簇注释用 R 4.4.3 + Bioconductor 3.20 的 SingleR / celldex；`singler.enabled: false` 可跳过。celldex 首次下载参考与 Enrichr 需联网。
+簇注释用 R 4.4.3 + Bioconductor 3.20 的 SingleR / celldex；`singler.enabled: false` 可跳过。celldex 首次下载参考与 Enrichr 需联网。
 
 ## 最小运行示例
 
