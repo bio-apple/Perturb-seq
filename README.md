@@ -4,14 +4,41 @@
 
 各目录的输出契约见 [docs/outputs.md](docs/outputs.md)。
 
+## 流程安装
+
+### 1）安装 conda
+
+macOS（Apple 芯片）：
+
+```bash
+curl -fsSL -o /tmp/Miniconda3.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
+bash /tmp/Miniconda3.sh -b -p "$HOME/miniconda3"
+"$HOME/miniconda3/bin/conda" init zsh
+```
+
+执行完后重新打开终端，使 `conda` 进入当前 shell。Intel Mac 将安装包换成 `Miniconda3-latest-MacOSX-x86_64.sh`。Linux x86_64 换成 `Miniconda3-latest-Linux-x86_64.sh`，并把 `conda init zsh` 换成 `conda init bash`。本机已经有 conda 时，直接做下一步。
+
+### 2）基于 conda 安装流程所需依赖
+
+在本仓库根目录执行。Python 包只以 `requirements.lock` 为准。环境名是 `perturbseq-tertiary`，Python 3.12。
+
+```bash
+conda create -y -n perturbseq-tertiary python=3.12 pip
+conda activate perturbseq-tertiary
+pip install -r requirements.lock
+pip install -e . --no-deps
+```
+
+`pip install -e . --no-deps` 把本仓库装进该环境。入口是 `python -m perturbseq`，console script 是 `perturbseq-tertiary`。包版本以 `requirements.lock` 为准。
+
 ## 运行
 
-环境是 `/opt/miniconda3/envs/perturbseq-tertiary/`（Python 3.12）。运行所需的 Python 包只以 `requirements.lock` 为准，用 `pip install -r requirements.lock` 安装。入口是 `python -m perturbseq`（`perturbseq.__main__` 调用 `perturbseq.cli.main`）。`pyproject.toml` 里的 console script `perturbseq-tertiary` 指向同一个函数，安装本包时也从这份锁定文件读取依赖。
+先执行 `conda activate perturbseq-tertiary`。
 
 `config/config.yaml` 只放分析软件的默认参数，例如 Mixscape、Mixscale、预处理、Augur 和作图。样本名、物种、输入目录、输出目录、guide 分隔符、非靶向对照和 CRISPR 模式在命令行输入。不传 `--config` 时读取这份默认参数文件。命令行会覆盖文件里的同名字段。
 
 ```bash
-/opt/miniconda3/envs/perturbseq-tertiary/bin/python -m perturbseq \
+python -m perturbseq \
   --sample-id SAMPLE \
   --organism human \
   --input-dir /path/to/sample \
