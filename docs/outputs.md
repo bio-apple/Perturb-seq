@@ -7,7 +7,7 @@
 | 保留 | 说明 |
 | --- | --- |
 | `checkpoints/*.h5ad` | `--resume` 所需；表 / 门槛 / 效应等在对应 checkpoint 的 `uns` |
-| `**/*.png` | 各步分析目录下的 PNG（无 `figures/` 二级目录） |
+| `**/*.png` | 各步分析目录下的 PNG（直接写在目录根，如 `qc/*.png`、`DGE/*.png`） |
 
 跑程中可能短暂写出 TSV / JSON / YAML 等中间文件；结束时的 lean cleanup 只留下上述两类。`--validate-only` 不做 cleanup（校验文件留在输出目录）。
 
@@ -65,7 +65,7 @@
 | --- | --- |
 | `qc/guides_per_cell.png` | 每细胞 guide 条数 |
 | `qc/cells_per_target_bar.png` | 靶基因细胞数 |
-| `qc/qc_metrics_panel.png` | 2×3 QC：上行 Seurat 风格 violin（nFeature / nCount / percent.mt）+ jitter；下行 Library-D 直方图（同三指标）。轴标签英文；Identity=`sample_id`。不再单独写 `hist_ncount` 等三张图 |
+| `qc/qc_metrics_panel.png` | 2×3 QC：上行 Seurat 风格 violin（nFeature / nCount / percent.mt）+ jitter；下行 Library-D 直方图（同三指标）。轴标签英文；Identity=`sample_id` |
 | `qc/qc_scatter.png` / `scatter_ncount_nfeature_gex.png` | QC 散点 |
 | `qc/temporary_control_qc.png` | 仅临时 zero-guide 对照时；组标签 `zero-guide` / `targeting`（纯英文） |
 
@@ -76,7 +76,7 @@
 | `qc/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA |
 | `qc/marker_detection_heatmap.png`、`dotplot_markers.png` | marker |
 | `UMAP/umap_cell_type.png` | 真实细胞类型（有注释时） |
-| `UMAP/umap_annotation_cell_cycle_panel.png` | 2 行组合：上行 Leiden + SingleR；下行 Perturbed / 对照 / Cell Cycle。不再单独写 `umap_cluster_annotation` 与 `umap_nt_perturbed_cell_cycle` |
+| `UMAP/umap_annotation_cell_cycle_panel.png` | 2 行组合：上行 Leiden + SingleR；下行 Perturbed / 对照 / Cell Cycle |
 
 ### mixscape → `Mixscape/` + `UMAP/`
 

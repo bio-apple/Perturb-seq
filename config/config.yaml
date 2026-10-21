@@ -1,14 +1,14 @@
 # 分析软件默认参数。
-# 步骤：io → assign → preprocess → dge → mixscape → mixscale → perturb。
-# dge / mixscape / mixscale 三者互不依赖（均只依赖 preprocess），结果分目录：
-#   wilcoxon/  Mixscape/  mixscale/
+# 步骤：io → assign → preprocess → {dge ‖ mixscape ‖ mixscale} → perturb。
+# dge / mixscape / mixscale 互不依赖（均只依赖 preprocess）；≥2 步时进程池并发。
+# 图目录：Mixscape/、mixscale/、DGE/、E-distance/、qc/、UMAP/；Wilcoxon 表在 checkpoints/dge.h5ad。
 # 参考：pertpy WilcoxonTest；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
 # 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
 # 未给 --nt-control，或给了但数据中无可用 NT 细胞时，assign 解析为临时 zero_guide 对照
 # （control_source=zero_guide_cells；见 docs/analysis.md § 对照）。不宜当作设计 NT 解读。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
-# 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可保留但实现不切换格式。
+# 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可存在，实现固定写 PNG。
 input:
   barcode_policy: strict
 labels:
@@ -19,10 +19,10 @@ labels:
   # 同一靶基因的多条 guide（如双 guide 文库）仍算单靶，不进 multi_guide。
   targets_per_cell: 1
 qc:
-  # QC 指标：n_genes（nFeature）、mito_frac（percent.mt）；可选成对 UMI（nCount）。
+  # QC 过滤：n_genes（nFeature）、mito_frac（percent.mt）。
+  # nCount（total_counts）只计算并画在 QC 图上，不做文库 UMI 绝对阈值过滤。
   # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
   # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。
-  # UMI：须同时给出 min_umi / max_umi（命令行或本文件），否则不做 UMI 绝对阈值过滤。
   min_genes: 200
   max_genes: 6000
   max_mito_frac: 0.2
@@ -41,7 +41,7 @@ preprocess:
 mixscape:
   enabled: true
   min_de_genes: 5
-  # |logFC| 门槛（项目统一 0.1）。Seurat RunMixscape / MixscapeHeatmap 函数默认曾为 0.25。
+  # DE 门槛 |logFC|≥0.1（与 mixscale.logfc_threshold / perturb.mixscape_logfc 一致）。
   logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
@@ -51,9 +51,9 @@ mixscape:
   n_control_neighbors: 20
   # RunMixscape iter.num。
   iter_num: 10
-# RunMixscale 教程实参：https://satijalab.github.io/Mixscale/
-# 教程原为 logfc.threshold = 0.2；本项目统一 |logFC|≥0.1。min.de.genes = 5，max.de.genes = 100，fine.mode = F。
-# pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
+# Mixscale DE 门槛：https://satijalab.github.io/Mixscale/
+# |logFC|≥0.1；min_de_genes=5；max_de_genes=100；fine_mode=false；pval_cutoff=0.05。
+# 不读取 mixscape.logfc_threshold。
 mixscale:
   min_de_genes: 5
   logfc_threshold: 0.1

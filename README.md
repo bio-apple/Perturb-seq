@@ -39,9 +39,8 @@ python -m perturbseq \
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
 | `--steps` | 默认 `all`（preprocess 后三步并行）；可逗号子集，如 `mixscape --resume`；子集里含 ≥2 个 `dge`/`mixscape`/`mixscale` 时同样并行 |
-| UMI | 须显式 `--min-umi`+`--max-umi`；默认不做 UMI 绝对阈值过滤 |
 | 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
-| QC 指标 | `nCount` / `nFeature` / `percent.mt`（及可选 UMI 绝对阈值） |
+| QC 指标 | `nCount` / `nFeature` / `percent.mt`（`nCount` 只作图，不按 UMI 绝对阈值过滤细胞） |
 
 ## 输出概览
 

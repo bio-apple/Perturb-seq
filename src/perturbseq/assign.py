@@ -495,24 +495,20 @@ def capture_library_correlation(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def derive_qc_thresholds(qc: dict[str, Any]) -> dict[str, float]:
-    """Resolve QC cutoffs from fixed config / CLI values only.
+    """Resolve QC cutoffs from config / CLI: gene bounds and mito fraction only.
 
-    Gene bounds and ``max_mito_frac`` always come from software defaults or the
-    CLI. UMI bounds apply only when both ``min_umi`` and ``max_umi`` are set.
+    Library UMI / nCount (``total_counts``) is computed for metrics and plots
+    but is not used as an absolute cell filter.
     """
     if qc.get("min_genes") is None or qc.get("max_genes") is None:
         raise ValueError("缺少 qc.min_genes 或 qc.max_genes。")
     if qc.get("max_mito_frac") is None:
         raise ValueError("缺少 qc.max_mito_frac。")
-    thresholds: dict[str, float] = {
+    return {
         "min_genes": float(qc["min_genes"]),
         "max_genes": float(qc["max_genes"]),
         "max_mito_frac": float(qc["max_mito_frac"]),
     }
-    if qc.get("min_umi") is not None and qc.get("max_umi") is not None:
-        thresholds["min_umi"] = float(qc["min_umi"])
-        thresholds["max_umi"] = float(qc["max_umi"])
-    return thresholds
 
 
 def _low_library_no_guide_mask(
@@ -559,34 +555,18 @@ def apply_eligibility(
     finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito)
     if "max_genes" not in thresholds:
         raise ValueError("缺少 max_genes，不能把未计算的基因数 QC 默认为通过。")
-    empty = np.zeros(len(table), dtype=bool)
-    umi_ready = "min_umi" in thresholds and "max_umi" in thresholds
-    low_umi = finite & (total < float(thresholds["min_umi"])) if umi_ready else empty
-    high_umi = finite & (total > float(thresholds["max_umi"])) if umi_ready else empty
     # Drop cells with ≤ min_genes or ≥ max_genes expressed genes.
     low_genes = finite & (genes <= float(thresholds["min_genes"]))
     high_genes = finite & (genes >= float(thresholds["max_genes"]))
     # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.2).
     high_mito = finite & (mito >= float(thresholds["max_mito_frac"]))
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
-    qc_pass = (
-        finite
-        & ~low_umi
-        & ~high_umi
-        & ~low_genes
-        & ~high_genes
-        & ~high_mito
-        & ~low_library
-    )
+    qc_pass = finite & ~low_genes & ~high_genes & ~high_mito & ~low_library
     qc_reasons = []
     for index in range(len(table)):
         reasons = []
         if not finite[index]:
             reasons.append("qc_not_computable")
-        if low_umi[index]:
-            reasons.append("low_umi")
-        if high_umi[index]:
-            reasons.append("high_umi")
         if low_genes[index]:
             reasons.append("low_genes")
         if high_genes[index]:

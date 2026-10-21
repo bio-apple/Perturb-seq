@@ -67,8 +67,10 @@ flowchart TD
   CP_PRE --> PT
   CP_MX -.->|"合并 mixscape 标签"| PT
   CP_DGE -.->|"合并 wilcoxon uns"| PT
-  PT["perturb<br/>描述性 CPM · E-test · 描述性图"] --> CP_PT["checkpoint perturb.h5ad"]
-  CP_PT --> OUT["checkpoints + PNGs"]
+  PT["perturb<br/>描述性 CPM · E-test"] --> CP_PT["checkpoint perturb.h5ad"]
+  CP_PT --> OUT_DGE["DGE/"]
+  CP_PT --> OUT_ED["E-distance/"]
+  CP_PT --> OUT["checkpoints/*.h5ad + **/*.png"]
 ```
 
 | 步骤 | 作用 | 输出目录 | checkpoint |
@@ -113,7 +115,6 @@ flowchart TD
 | `--resume` | 从上一 checkpoint 继续 |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
-| `--min-umi` / `--max-umi` | 成对给出才做 UMI 绝对阈值；都不填则跳过 |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
 | `--max-mito-frac` | 覆盖默认 `0.2` |
 
@@ -198,16 +199,9 @@ flowchart TD
 
 ## QC
 
-QC 指标为文库大小（`nCount` / `total_counts`）、表达基因数（`nFeature` / `n_genes`）与线粒体比例（`percent.mt` / `mito_frac`）；可选成对 UMI 绝对阈值。
+QC **指标**（均计算并画在 `qc/`）：文库大小（`nCount` / `total_counts`）、表达基因数（`nFeature` / `n_genes`）、线粒体比例（`percent.mt` / `mito_frac`）。
 
-### UMI
-
-须同时给出 `--min-umi` 与 `--max-umi`（或配置成对），或全部留空。只给其中一个会失败。默认配置不设绝对阈值。
-
-- 成对给出 → `umi_filter=absolute_cutoffs`（记入 `assign` checkpoint 的 `qc_thresholds`）
-- 全部留空 → 不做 UMI 绝对过滤：`umi_filter=disabled`
-
-UMI 阈值仅来自配置 / CLI，不做分布自适应。
+QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount 绝对阈值过滤（无 `min_umi` / `max_umi` / `min_counts` / `max_counts`）。
 
 ### 表达基因数
 
@@ -218,6 +212,10 @@ UMI 阈值仅来自配置 / CLI，不做分布自适应。
 默认剔除 mito 比例 ≥ 20%：`qc.max_mito_frac=0.2`。`--max-mito-frac` 可覆盖。原因码 `high_mito`。
 
 > **警示**：20% 是软件固定默认，不是按本样本自适应。肿瘤、高代谢或线粒体相关扰动应先看 `qc_metrics_panel`（含 percent.mt violin/直方图）/ `qc_scatter` / `scatter_ncount_nfeature_gex`，再决定是否调低/调高；过度过滤会丢掉真实生物学变异。
+
+### 文库大小（nCount）
+
+`total_counts` 写入账本并出现在 `qc_metrics_panel` / 散点图；不按绝对上下限剔除细胞。guide 级 `qc.min_guide_umi`（单条 guide 的 UMI 是否过线）与文库大小过滤无关。
 
 ### GEX marker 图
 
@@ -339,12 +337,14 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 | 参考 | [Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette) | [Mixscale](https://satijalab.github.io/Mixscale/) | [pertpy WilcoxonTest](https://pertpy.scverse.org/en/stable/tutorials/notebooks/differential_gene_expression.html) |
 | 输出目录 | `Mixscape/` | `mixscale/` | `checkpoints/dge.h5ad` |
 | 签名层 | `X_pert` | `X_pert_mixscale` | — |
-| `logfc_threshold` | **0.1** | **0.1** | — |
+| `logfc_threshold`（\|logFC\|） | **0.1** | **0.1** | — |
+| `min_de_genes` | 5 | 5 | — |
+| `pval_cutoff` | 0.05 | 0.05 | — |
 | 主要产物 | KO/NP 分类、signature UMAP | `mixscale_score` | 靶 vs 对照 DE 表 |
 
 Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscale 假分数 `1` 置缺失。
 
-**无 ridge / scatter 是否合理**：门槛里 `passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` 会记 `no_targets_passed_de_gate` 并跳过 PNG——这是预期行为。临时 `zero_guide` 对照、弱效应或细胞数偏少时，常出现「全部靶 `n_de_genes=0`」。先看 `mixscale.h5ad` 的 `uns['mixscale_de_gate']` 的 `passed` / `n_de_genes`，再决定是否调 `mixscale.logfc_threshold` / `min_de_genes`。
+**无 ridge / scatter**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` 记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。查 `mixscale.h5ad` 的 `uns['mixscale_de_gate']`，再决定是否调 `mixscale.logfc_threshold` / `min_de_genes`。
 
 > **口径**：三者独立；KO/NP 与 Mixscale 分数都不是生物学重复推断；Wilcoxon p 为细胞级。
 

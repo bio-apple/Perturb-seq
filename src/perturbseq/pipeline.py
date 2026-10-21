@@ -136,18 +136,6 @@ def main(argv: list[str] | None = None) -> None:
         "--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL"
     )
     parser.add_argument(
-        "--min-umi",
-        type=float,
-        default=None,
-        help="文库 UMI 下限。须与 --max-umi 成对给出；都不填则不做 UMI 绝对阈值过滤。",
-    )
-    parser.add_argument(
-        "--max-umi",
-        type=float,
-        default=None,
-        help="文库 UMI 上限。须与 --min-umi 成对给出；都不填则不做 UMI 绝对阈值过滤。",
-    )
-    parser.add_argument(
         "--max-mito-frac",
         type=float,
         default=None,
@@ -185,8 +173,6 @@ def main(argv: list[str] | None = None) -> None:
             "expected_target_direction": args.expected_direction,
             "batch_key": args.batch_key,
             "cell_type_key": args.cell_type_key,
-            "min_umi": args.min_umi,
-            "max_umi": args.max_umi,
             "max_mito_frac": args.max_mito_frac,
             "min_genes": args.min_genes,
             "max_genes": args.max_genes,
@@ -548,8 +534,6 @@ def _load_cell_calls(folder: Path, adata) -> pd.DataFrame:
 def _step_assign(folder: Path, config: dict[str, Any], adata):
     calls = _load_cell_calls(folder, adata)
     thresholds = derive_qc_thresholds(config["qc"])
-    umi_pair = ("min_umi", "max_umi")
-    umi_configured = all(config["qc"].get(key) is not None for key in umi_pair)
     # low_library_no_guide stage retained in ledger; exclusion count stays 0.
     library_rule = {
         "applied": False,
@@ -565,8 +549,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     correlation["low_library_min_total_counts"] = np.nan
     recorded = {
         **thresholds,
-        "source": "command_line" if umi_configured else "skipped",
-        "umi_filter": "absolute_cutoffs" if umi_configured else "disabled",
+        "library_umi_filter": "none",
         "gene_bounds_source": "configured",
         "gene_filter": "drop_n_genes_le_min_or_ge_max",
         "mito_frac_source": "configured",

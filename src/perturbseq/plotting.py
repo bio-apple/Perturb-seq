@@ -33,8 +33,7 @@ _TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
 _QC_FIGURES = frozenset(
     {
         "qc_metrics_panel",
-        "qc_scatter",
-        "scatter_ncount_nfeature_gex",
+        "qc_scatter_panel",
         "marker_detection_heatmap",
         "dotplot_markers",
         TEMPORARY_CONTROL_QC_NAME,
@@ -54,7 +53,9 @@ _GRID_MINOR = "#F0F0F0"
 # Seurat pbmc3k VlnPlot default (ggplot2 hue 1 / salmon).
 _SEURAT_VIOLIN_FILL = "#F8766D"
 _QC_PANEL_NAME = "qc_metrics_panel"
+_QC_SCATTER_PANEL_NAME = "qc_scatter_panel"
 _LEGACY_QC_HIST_NAMES = ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex")
+_LEGACY_QC_SCATTER_NAMES = ("qc_scatter", "scatter_ncount_nfeature_gex")
 _MARKER_HEATMAP_CMAP = "Blues"
 _DOTPLOT_CMAP = "Purples"
 # Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
@@ -914,70 +915,6 @@ def draw_qc_histograms(
     draw_qc_metrics_panel(store, metrics, config, population=population)
 
 
-def draw_scatter_ncount_nfeature_gex(
-    store: FigureStore,
-    metrics: pd.DataFrame,
-    seed: int,
-    *,
-    population: str = "qc metrics",
-) -> None:
-    """Library-D GEX nFeature vs nCount, colored by percent.mt (log10 axes)."""
-    mito = _mito_column(metrics)
-    needed = {"total_counts", "n_genes_by_counts"}
-    name = "scatter_ncount_nfeature_gex"
-    if metrics.empty or mito is None or not needed.issubset(metrics.columns):
-        store.skip(name, "missing_fields")
-        return
-    limit = int(store.plotting.get("scatter_max_points", 50000))
-    shown = metrics
-    if len(metrics) > limit:
-        shown = metrics.sample(limit, random_state=seed)
-    scaled_all, note = percent_mt_values(metrics)
-    scaled = scaled_all.loc[shown.index]
-    x = pd.to_numeric(shown["total_counts"], errors="coerce").to_numpy(dtype=float)
-    y = pd.to_numeric(shown["n_genes_by_counts"], errors="coerce").to_numpy(dtype=float)
-    color = scaled.to_numpy(dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(color) & (x > 0) & (y > 0)
-    if not bool(np.any(ok)):
-        store.skip(name, "missing_fields")
-        return
-    figure, axis = store._figure(width=9.8, height=7.0)
-    points = axis.scatter(
-        x[ok],
-        y[ok],
-        c=color[ok],
-        cmap="YlOrRd",
-        s=8,
-        alpha=0.55,
-        linewidths=0,
-        rasterized=True,
-        zorder=2,
-    )
-    axis.set_xscale("log")
-    axis.set_yscale("log")
-    axis.set_xlabel("nCount_RNA")
-    axis.set_ylabel("nFeature_RNA")
-    axis.set_title("GEX nFeature vs nCount", loc="left", fontsize=12)
-    colorbar = figure.colorbar(points, ax=axis, fraction=0.046, pad=0.04)
-    colorbar.set_label("% MT")
-    _style_library_d(axis)
-    table = pd.DataFrame(
-        {
-            "nCount_RNA": x[ok],
-            "nFeature_RNA": y[ok],
-            "percent.mt": color[ok],
-        }
-    )
-    store.save(
-        figure,
-        name,
-        "qc",
-        table,
-        f"FeatureScatter nFeature vs nCount colored by percent.mt ({note}); "
-        f"log10 axes; {population}; seed={seed}",
-    )
-
-
 def _remove_legacy_qc_hists(output_dir: Path) -> None:
     """Drop standalone hist_*.png replaced by qc_metrics_panel."""
     root = Path(output_dir)
@@ -995,10 +932,32 @@ def _remove_legacy_qc_hists(output_dir: Path) -> None:
                 path.unlink()
 
 
-def remove_qc_violin_products(output_dir: Path) -> None:
-    """Delete retired qc_violin / assignment_status_bar / standalone hist products."""
+def _remove_legacy_qc_scatters(output_dir: Path) -> None:
+    """Drop standalone qc_scatter / scatter_ncount_nfeature_gex replaced by panel."""
     root = Path(output_dir)
-    for name in ("qc_violin", "assignment_status_bar", *_LEGACY_QC_HIST_NAMES):
+    for name in _LEGACY_QC_SCATTER_NAMES:
+        for path in (
+            root / "qc" / f"{name}.png",
+            root / "qc" / "figures" / f"{name}.png",
+            root / "qc" / "tables" / f"{name}.tsv",
+            root / "qc" / "tables" / f"{name}.skipped.txt",
+            root / "figures" / "plot" / f"{name}.png",
+            root / "plot_data" / f"{name}.tsv",
+            root / "plot_data" / f"{name}.skipped.txt",
+        ):
+            if path.is_file():
+                path.unlink()
+
+
+def remove_qc_violin_products(output_dir: Path) -> None:
+    """Delete retired qc_violin / assignment_status_bar / standalone hist/scatter products."""
+    root = Path(output_dir)
+    for name in (
+        "qc_violin",
+        "assignment_status_bar",
+        *_LEGACY_QC_HIST_NAMES,
+        *_LEGACY_QC_SCATTER_NAMES,
+    ):
         for path in (
             root / "qc" / f"{name}.png",
             root / "qc" / "figures" / f"{name}.png",

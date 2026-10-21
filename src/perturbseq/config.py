@@ -71,8 +71,6 @@ class ConfigError(RuntimeError):
     """The run is not allowed to start."""
 
 
-# UMI absolute cutoffs: both set on the CLI/config, or both omitted (filter skipped).
-_QC_CUTOFFS = ("min_umi", "max_umi")
 # Gene bounds and mito fraction are software defaults (optional CLI overrides).
 _GENE_CUTOFFS = ("min_genes", "max_genes")
 
@@ -138,16 +136,16 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
         qc = {}
         config["qc"] = qc
     for key in (
-        *_QC_CUTOFFS,
         "thresholds_confirmed",
         "mito_gene_prefix",
         "mito_prefix",
         "max_ribo_frac",
+        "min_umi",
+        "max_umi",
+        "min_counts",
+        "max_counts",
     ):
         qc.pop(key, None)
-    provided = {key: customer.get(key) for key in _QC_CUTOFFS}
-    if any(value is not None for value in provided.values()):
-        qc.update(provided)
     for key in _GENE_CUTOFFS:
         if customer.get(key) is not None:
             qc[key] = customer[key]
@@ -221,13 +219,15 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "min_cells_per_target": None,
         "min_cells_per_guide": None,
         "min_guide_umi": None,
-        "min_umi": None,
-        "max_umi": None,
         "min_genes": None,
         "max_genes": None,
         "max_mito_frac": None,
-        # Rejected in validate_config (unsupported key).
+        # Rejected in validate_config (unsupported keys).
         "max_ribo_frac": None,
+        "min_umi": None,
+        "max_umi": None,
+        "min_counts": None,
+        "max_counts": None,
         "mito_gene_prefix": None,
         "mito_prefix": None,
     },
@@ -381,8 +381,16 @@ def validate_config(config: dict[str, Any]) -> None:
     qc = _section(config, "qc")
     if "max_ribo_frac" in qc:
         raise ConfigError(
-            "不支持 qc.max_ribo_frac：请删除该键（及命令行 --max-ribo-frac）。QC 指标为 nCount / nFeature / percent.mt。"
+            "不支持 qc.max_ribo_frac：请删除该键。QC 过滤用 nFeature / percent.mt；"
+            "nCount 只作指标与作图，不做文库 UMI 绝对阈值过滤。"
         )
+    for key in ("min_umi", "max_umi", "min_counts", "max_counts"):
+        if key in qc:
+            raise ConfigError(
+                f"不支持 qc.{key}：不做文库 UMI / nCount 绝对阈值过滤。"
+                "请删除该键。QC 过滤只用 qc.min_genes / qc.max_genes / qc.max_mito_frac；"
+                "nCount（total_counts）仍计算并画在 QC 图上。"
+            )
     for key in ("min_cells_per_target", "min_cells_per_guide"):
         value = qc.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -809,24 +817,9 @@ def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
 
 
 def _require_confirmed_qc(qc: dict[str, Any]) -> None:
+    """Validate gene-count and mito fraction cutoffs used for cell QC filtering."""
     _require_gene_cutoffs(qc)
     _require_mito_cutoff(qc)
-    present = [key for key in _QC_CUTOFFS if qc.get(key) is not None]
-    if not present:
-        return
-    if len(present) != len(_QC_CUTOFFS):
-        raise ConfigError(
-            "命令行上的 --min-umi、--max-umi 必须同时填写，"
-            "或者全部留空（留空则不做 UMI 绝对阈值过滤）。"
-            "线粒体比例上限由 qc.max_mito_frac 单独设置（默认 0.2）。"
-            "表达基因数上下限由 qc.min_genes / qc.max_genes 单独设置。"
-        )
-    for key in _QC_CUTOFFS:
-        value = qc.get(key)
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ConfigError(f"qc.{key} 必须是数值。")
-    if float(qc["min_umi"]) >= float(qc["max_umi"]):
-        raise ConfigError("qc.min_umi 必须小于 qc.max_umi。")
 
 
 def _require_gene_cutoffs(qc: dict[str, Any]) -> None:
