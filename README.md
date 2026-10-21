@@ -50,11 +50,11 @@ python -m perturbseq \
 | 目录 | 内容 |
 | --- | --- |
 | `checkpoints/` | 逐步 `*.h5ad`（含表 / 门槛 / 效应等 `uns`） |
-| `qc/figures/` | mRNA / gRNA / QC 统计图 |
-| `UMAP/figures/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
-| `Mixscape/figures/` | Mixscape class / 2x2 / fraction 等 |
-| `mixscale/figures/` | Mixscale ridge / scatter |
-| `DGE/descriptive/figures/` | 描述性 CPM log2FC 相关图 |
-| `E-distance/figures/` | 细胞级 E-test |
+| `qc/` | mRNA / gRNA / QC 统计图 |
+| `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
+| `Mixscape/` | Mixscape class / 2x2 / fraction 等 |
+| `mixscale/` | Mixscale ridge / scatter |
+| `DGE/` | 描述性 CPM log2FC 相关图 |
+| `E-distance/` | 细胞级 E-test |
 
 Wilcoxon（`dge`）无独立 PNG；结果在 `checkpoints/dge.h5ad`。图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。

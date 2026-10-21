@@ -25,23 +25,20 @@ from perturbseq.assign import STATUS_TARGET, control_cell_mask
 from perturbseq.config import ZERO_GUIDE_LABEL
 
 TEMPORARY_CONTROL_QC_NAME = "temporary_control_qc"
-ZERO_GUIDE_QC_GROUP = "zero-guide cells（临时对照）"
+ZERO_GUIDE_QC_GROUP = "zero-guide"
 TARGETING_QC_GROUP = "targeting"
 _TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
 
 # mRNA and gRNA statistics. Section "plot" is shared with UMAPs, so routing is by name.
 _QC_FIGURES = frozenset(
     {
-        "hist_ncount",
-        "hist_nfeature",
-        "hist_percent_mt_gex",
+        "qc_metrics_panel",
         "qc_scatter",
         "scatter_ncount_nfeature_gex",
         "marker_detection_heatmap",
         "dotplot_markers",
         TEMPORARY_CONTROL_QC_NAME,
         "guides_per_cell",
-        "assignment_status_bar",
         "cells_per_target_bar",
         "target_cell_counts",
         "variable_features",
@@ -54,6 +51,10 @@ _HIST_FILL = "#305080"
 _THRESHOLD_LINE = "#D62728"
 _GRID_MAJOR = "#E0E0E0"
 _GRID_MINOR = "#F0F0F0"
+# Seurat pbmc3k VlnPlot default (ggplot2 hue 1 / salmon).
+_SEURAT_VIOLIN_FILL = "#F8766D"
+_QC_PANEL_NAME = "qc_metrics_panel"
+_LEGACY_QC_HIST_NAMES = ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex")
 _MARKER_HEATMAP_CMAP = "Blues"
 _DOTPLOT_CMAP = "Purples"
 # Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
@@ -102,7 +103,7 @@ def _output_bucket(name: str, section: str) -> str:
 
 
 def _dge_bucket_root(output_dir: Path, bucket: str) -> Path:
-    # Three independent analysis roots (plus descriptive under DGE/).
+    # Mixscape / Mixscale / Wilcoxon roots; descriptive PNGs live directly under DGE/.
     if bucket == "mixscape":
         return output_dir / "Mixscape"
     if bucket == "mixscale":
@@ -110,7 +111,7 @@ def _dge_bucket_root(output_dir: Path, bucket: str) -> Path:
     if bucket == "wilcoxon":
         return output_dir / "wilcoxon"
     if bucket == "descriptive":
-        return output_dir / "DGE" / "descriptive"
+        return output_dir / "DGE"
     raise ValueError(f"不是分析输出桶: {bucket}")
 
 
@@ -152,15 +153,15 @@ class FigureStore:
     def figure_dir(self, name: str, section: str) -> Path:
         bucket = _output_bucket(name, section)
         if bucket == "umap":
-            return self.output_dir / "UMAP" / "figures"
+            return self.output_dir / "UMAP"
         if bucket == "qc":
-            return self.output_dir / "qc" / "figures"
+            return self.output_dir / "qc"
         if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
-            figures = _dge_bucket_root(self.output_dir, bucket) / "figures"
+            root = _dge_bucket_root(self.output_dir, bucket)
             if bucket == "mixscape" and section == "target_in_de":
-                return figures / "target_in_de"
-            return figures
-        return self.output_dir / "figures" / section
+                return root / "target_in_de"
+            return root
+        return self.output_dir / section
 
     def data_dir(self, name: str, section: str = "") -> Path:
         bucket = _output_bucket(name, section)
@@ -179,7 +180,7 @@ class FigureStore:
         folder.mkdir(parents=True, exist_ok=True)
         if getattr(figure, "perturbseq_manual_layout", False):
             figure.subplots_adjust(left=0.22, right=0.9, bottom=0.14, top=0.96)
-        else:
+        elif not getattr(figure, "perturbseq_skip_tight_layout", False):
             figure.tight_layout()
         path = folder / f"{name}.png"
         figure.savefig(path, dpi=int(self.plotting["dpi"]), bbox_inches="tight")
@@ -260,6 +261,7 @@ class FigureStore:
             Path("figures") / "mixscape" / f"{name}.pdf",
             Path("figures") / "mixscale" / f"{name}.png",
             Path("figures") / "de" / f"{name}.png",
+            Path("figures") / section / f"{name}.png" if section else Path("figures") / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.txt",
             Path("DGE") / "figures" / "mixscape" / f"{name}.pdf",
@@ -273,6 +275,16 @@ class FigureStore:
             Path("DGE") / "plot_data" / f"{name}.skipped.txt",
             Path("plot_data") / f"{name}.tsv",
             Path("plot_data") / f"{name}.skipped.txt",
+            # Prior layout nested PNGs under */figures/.
+            Path("UMAP") / "figures" / f"{name}.png",
+            Path("qc") / "figures" / f"{name}.png",
+            Path("Mixscape") / "figures" / f"{name}.png",
+            Path("Mixscape") / "figures" / "target_in_de" / f"{name}.png",
+            Path("mixscale") / "figures" / f"{name}.png",
+            Path("wilcoxon") / "figures" / f"{name}.png",
+            Path("DGE") / "descriptive" / "figures" / f"{name}.png",
+            Path("DGE") / "descriptive" / f"{name}.png",
+            Path("E-distance") / "figures" / f"{name}.png",
         ]
         if section and section not in {"", "plot"}:
             relatives.extend(
@@ -280,6 +292,15 @@ class FigureStore:
                     Path("DGE") / "figures" / section / f"{name}.png",
                     Path("DGE") / "figures" / section / f"{name}.txt",
                     Path("DGE") / "figures" / section / f"{name}.pdf",
+                ]
+            )
+        if bucket == "descriptive":
+            relatives.extend(
+                [
+                    Path("DGE") / "descriptive" / f"{name}.png",
+                    Path("DGE") / "descriptive" / "figures" / f"{name}.png",
+                    Path("DGE") / "descriptive" / "plot_data" / f"{name}.tsv",
+                    Path("DGE") / "descriptive" / "plot_data" / f"{name}.skipped.txt",
                 ]
             )
         if bucket == "mixscape":
@@ -377,13 +398,26 @@ def figure_context(
         "crispr_mode": str(config["experiment"]["crispr_mode"]),
         "n_cells": str(n_cells),
         "mito_prefix": mito_prefix(config),
-        "qc": json.dumps(thresholds, ensure_ascii=False),
+        "qc": json.dumps(thresholds, ensure_ascii=False, default=_json_default),
         "direction": sentence,
         "seed": str(config["runtime"]["seed"]),
         "control_source": spec["control_source"],
         "control_label": spec["control_label"],
         "control_phrase": spec["control_phrase"],
     }
+
+
+def _json_default(value: Any) -> Any:
+    """Serialize DataFrames / numpy scalars for figure_context qc metadata."""
+    if isinstance(value, pd.DataFrame):
+        return value.replace({np.nan: None}).to_dict(orient="records")
+    if isinstance(value, pd.Series):
+        return value.replace({np.nan: None}).tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def open_figure_store(
@@ -400,6 +434,7 @@ def retire_removed_umaps(output_dir: Path) -> None:
     for name in names:
         relatives.extend(
             (
+                Path("UMAP") / f"{name}.png",
                 Path("UMAP") / "figures" / f"{name}.png",
                 Path("UMAP") / "tables" / f"{name}.tsv",
                 Path("UMAP") / "tables" / f"{name}.skipped.txt",
@@ -521,20 +556,6 @@ def draw_descriptive_heatmap(store: FigureStore, effects: pd.DataFrame) -> None:
         id_vars="gene", var_name="target_gene", value_name="zscore"
     )
     store.save(figure, "de_gene_heatmap", "de", long, note)
-
-
-def draw_assignment_status(store: FigureStore, status: pd.Series) -> None:
-    counts = status.astype(str).value_counts()
-    table = pd.DataFrame({"status": counts.index.astype(str), "n_cells": counts.to_numpy()})
-    table["fraction"] = table["n_cells"] / table["n_cells"].sum()
-    figure, axis = store._figure()
-    colors = [store.palette(name, "#4C78A8") for name in table["status"]]
-    axis.bar(table["status"], table["n_cells"], color=colors)
-    _label_count_bars(axis, table["n_cells"])
-    axis.set_ylabel("cells")
-    axis.set_title("Guide assignment status")
-    axis.tick_params(axis="x", rotation=45)
-    store.save(figure, "assignment_status_bar", "qc", table, "cell counts by assignment status")
 
 
 def guides_per_cell_bars(n_guides: pd.Series) -> tuple[Figure, pd.DataFrame]:
@@ -688,19 +709,127 @@ def _draw_qc_histogram(
     store.save(figure, name, "qc", table, method)
 
 
-def draw_qc_histograms(
+def _style_seurat_violin_axis(axis: Axes) -> None:
+    """Seurat/ggplot2 classic: white face, black spines, no grid on violin panels."""
+    axis.set_facecolor("white")
+    axis.grid(False)
+    for spine in axis.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(0.8)
+    axis.tick_params(colors="black", labelsize=9)
+
+
+def _draw_seurat_violin(
+    axis: Axes,
+    values: np.ndarray,
+    *,
+    identity: str,
+    feature: str,
+    seed: int,
+    max_points: int = 8000,
+) -> None:
+    """Salmon violin + black jitter, matching Seurat pbmc3k VlnPlot."""
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        axis.set_title(feature)
+        axis.set_xlabel("Identity")
+        axis.set_ylabel(feature)
+        _style_seurat_violin_axis(axis)
+        return
+    frame = pd.DataFrame({"Identity": identity, feature: finite})
+    sns.violinplot(
+        data=frame,
+        x="Identity",
+        y=feature,
+        ax=axis,
+        color=_SEURAT_VIOLIN_FILL,
+        inner=None,
+        cut=0,
+        linewidth=0.8,
+        density_norm="width",
+        order=[identity],
+    )
+    for collection in axis.collections:
+        collection.set_edgecolor("black")
+        collection.set_linewidth(0.8)
+    shown = frame
+    if len(frame) > max_points:
+        shown = frame.sample(max_points, random_state=seed)
+    sns.stripplot(
+        data=shown,
+        x="Identity",
+        y=feature,
+        ax=axis,
+        color="black",
+        size=1.15,
+        alpha=0.35,
+        jitter=0.28,
+        order=[identity],
+        legend=False,
+    )
+    axis.set_title(feature, fontsize=11)
+    axis.set_xlabel("Identity")
+    axis.set_ylabel(feature)
+    plt.setp(axis.get_xticklabels(), rotation=45, ha="right")
+    _style_seurat_violin_axis(axis)
+
+
+def _draw_panel_histogram(
+    axis: Axes,
+    *,
+    values: np.ndarray,
+    xlabel: str,
+    title: str,
+    bins: int,
+    fill: str,
+    threshold: float | None = None,
+    threshold_label: str = "",
+) -> None:
+    finite = values[np.isfinite(values)]
+    if finite.size:
+        axis.hist(
+            finite,
+            bins=bins,
+            color=fill,
+            edgecolor="white",
+            linewidth=0.2,
+            zorder=2,
+        )
+    if threshold is not None and np.isfinite(threshold):
+        axis.axvline(
+            threshold,
+            color=_THRESHOLD_LINE,
+            linestyle="--",
+            linewidth=1.4,
+            zorder=3,
+            label=threshold_label or f"threshold={threshold:g}",
+        )
+        axis.legend(frameon=False, fontsize=8, loc="upper right")
+    axis.set_title(title, loc="left", fontsize=11)
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel("Cells")
+    _style_library_d(axis)
+
+
+def draw_qc_metrics_panel(
     store: FigureStore,
     metrics: pd.DataFrame,
     config: dict[str, Any],
     *,
     population: str = "qc metrics",
 ) -> None:
-    """Library-D style GEX QC histograms (nCount / nFeature / percent.mt)."""
+    """2×3 QC panel: Seurat-style violins (top) + Library-D histograms (bottom).
+
+    Violin order matches Seurat pbmc3k: nFeature_RNA, nCount_RNA, percent.mt.
+    Histogram row: nCount_RNA, nFeature_RNA, percent.mt.
+    """
+    name = _QC_PANEL_NAME
+    _remove_legacy_qc_hists(store.output_dir)
     mito = _mito_column(metrics)
     needed = {"total_counts", "n_genes_by_counts"}
     if metrics.empty or mito is None or not needed.issubset(metrics.columns):
-        for name in ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex"):
-            store.skip(name, "missing_fields")
+        store.skip(name, "missing_fields")
         return
     scaled, note = percent_mt_values(metrics)
     ncount = pd.to_numeric(metrics["total_counts"], errors="coerce").to_numpy(dtype=float)
@@ -708,37 +837,81 @@ def draw_qc_histograms(
         dtype=float
     )
     percent_mt = scaled.to_numpy(dtype=float)
+    if not (
+        np.isfinite(ncount).any() and np.isfinite(nfeature).any() and np.isfinite(percent_mt).any()
+    ):
+        store.skip(name, "missing_fields")
+        return
+    sample = str(config["experiment"]["sample_id"])
+    seed = int(config["runtime"]["seed"])
     max_mito = config.get("qc", {}).get("max_mito_frac")
     mito_line = float(max_mito) * 100.0 if max_mito is not None else None
-    _draw_qc_histogram(
-        store,
-        name="hist_ncount",
+    bins = _hist_bins(store)
+    fill = store.palette("hist_fill", _HIST_FILL)
+    figure, axes = plt.subplots(2, 3, figsize=(12.6, 8.8))
+    _draw_seurat_violin(
+        axes[0, 0], nfeature, identity=sample, feature="nFeature_RNA", seed=seed
+    )
+    _draw_seurat_violin(
+        axes[0, 1], ncount, identity=sample, feature="nCount_RNA", seed=seed
+    )
+    _draw_seurat_violin(
+        axes[0, 2], percent_mt, identity=sample, feature="percent.mt", seed=seed
+    )
+    _draw_panel_histogram(
+        axes[1, 0],
         values=ncount,
         xlabel="nCount_RNA",
-        title="nCount_RNA (gene expression)",
-        method=f"histogram nCount_RNA; bins={_hist_bins(store)}; {population}",
+        title="nCount_RNA",
+        bins=bins,
+        fill=fill,
     )
-    _draw_qc_histogram(
-        store,
-        name="hist_nfeature",
+    _draw_panel_histogram(
+        axes[1, 1],
         values=nfeature,
         xlabel="nFeature_RNA",
-        title="nFeature_RNA (gene expression)",
-        method=f"histogram nFeature_RNA; bins={_hist_bins(store)}; {population}",
+        title="nFeature_RNA",
+        bins=bins,
+        fill=fill,
     )
-    _draw_qc_histogram(
-        store,
-        name="hist_percent_mt_gex",
+    _draw_panel_histogram(
+        axes[1, 2],
         values=percent_mt,
         xlabel="percent.mt",
-        title="percent.mt (gene expression only)",
-        method=(
-            f"histogram percent.mt ({note}); bins={_hist_bins(store)}; "
-            f"threshold={mito_line}; {population}"
-        ),
+        title="percent.mt",
+        bins=bins,
+        fill=fill,
         threshold=mito_line,
         threshold_label=f"max_mito_frac={mito_line:g}%" if mito_line is not None else "",
     )
+    table = pd.DataFrame(
+        {
+            "nCount_RNA": ncount,
+            "nFeature_RNA": nfeature,
+            "percent.mt": percent_mt,
+        }
+    )
+    store.save(
+        figure,
+        name,
+        "qc",
+        table,
+        (
+            "2x3 QC panel; top=Seurat-style VlnPlot (nFeature, nCount, percent.mt); "
+            f"bottom=Library-D histograms; mito scale={note}; bins={bins}; {population}"
+        ),
+    )
+
+
+def draw_qc_histograms(
+    store: FigureStore,
+    metrics: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    population: str = "qc metrics",
+) -> None:
+    """Backward-compatible alias: write the combined ``qc_metrics_panel`` PNG."""
+    draw_qc_metrics_panel(store, metrics, config, population=population)
 
 
 def draw_scatter_ncount_nfeature_gex(
@@ -805,25 +978,45 @@ def draw_scatter_ncount_nfeature_gex(
     )
 
 
-def remove_qc_violin_products(output_dir: Path) -> None:
-    """Delete qc_violin PNG/TSV under the output root if present."""
+def _remove_legacy_qc_hists(output_dir: Path) -> None:
+    """Drop standalone hist_*.png replaced by qc_metrics_panel."""
     root = Path(output_dir)
-    for path in (
-        root / "qc" / "figures" / "qc_violin.png",
-        root / "qc" / "tables" / "qc_violin.tsv",
-        root / "qc" / "tables" / "qc_violin.skipped.txt",
-        root / "figures" / "plot" / "qc_violin.png",
-        root / "plot_data" / "qc_violin.tsv",
-        root / "plot_data" / "qc_violin.skipped.txt",
-    ):
-        if path.is_file():
-            path.unlink()
+    for name in _LEGACY_QC_HIST_NAMES:
+        for path in (
+            root / "qc" / f"{name}.png",
+            root / "qc" / "figures" / f"{name}.png",
+            root / "qc" / "tables" / f"{name}.tsv",
+            root / "qc" / "tables" / f"{name}.skipped.txt",
+            root / "figures" / "plot" / f"{name}.png",
+            root / "plot_data" / f"{name}.tsv",
+            root / "plot_data" / f"{name}.skipped.txt",
+        ):
+            if path.is_file():
+                path.unlink()
+
+
+def remove_qc_violin_products(output_dir: Path) -> None:
+    """Delete retired qc_violin / assignment_status_bar / standalone hist products."""
+    root = Path(output_dir)
+    for name in ("qc_violin", "assignment_status_bar", *_LEGACY_QC_HIST_NAMES):
+        for path in (
+            root / "qc" / f"{name}.png",
+            root / "qc" / "figures" / f"{name}.png",
+            root / "qc" / "tables" / f"{name}.tsv",
+            root / "qc" / "tables" / f"{name}.skipped.txt",
+            root / "figures" / "plot" / f"{name}.png",
+            root / "plot_data" / f"{name}.tsv",
+            root / "plot_data" / f"{name}.skipped.txt",
+        ):
+            if path.is_file():
+                path.unlink()
 
 
 def remove_temporary_control_qc(output_dir: Path) -> None:
     """Delete a temporary-control comparison left by an earlier zero-guide run."""
     name = TEMPORARY_CONTROL_QC_NAME
     for path in (
+        output_dir / "qc" / f"{name}.png",
         output_dir / "qc" / "figures" / f"{name}.png",
         output_dir / "qc" / "tables" / f"{name}.tsv",
         output_dir / "qc" / "tables" / f"{name}.skipped.txt",
@@ -1257,14 +1450,54 @@ def leiden_resolution(adata: AnnData) -> float | None:
     return float(params["resolution"])
 
 
+_ANNOTATION_CELL_CYCLE_PANEL = "umap_annotation_cell_cycle_panel"
+
+
+def _remove_legacy_annotation_umaps(output_dir: Path) -> None:
+    """Drop standalone Leiden/SingleR and cell-cycle UMAPs replaced by the panel."""
+    umap_roots = (Path(output_dir) / "UMAP", Path(output_dir) / "UMAP" / "figures")
+    for name in ("umap_cluster_annotation", "umap_nt_perturbed_cell_cycle"):
+        for root in umap_roots:
+            for path in (
+                root / f"{name}.png",
+                root / f"{name}.pdf",
+                root / f"{name}.txt",
+            ):
+                if path.is_file():
+                    path.unlink()
+        for path in (
+            Path(output_dir) / "UMAP" / "tables" / f"{name}.tsv",
+            Path(output_dir) / "UMAP" / "tables" / f"{name}.skipped.txt",
+            Path(output_dir) / "plot_data" / f"{name}.tsv",
+            Path(output_dir) / "plot_data" / f"{name}.skipped.txt",
+        ):
+            if path.is_file():
+                path.unlink()
+
+
 def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
-    """One figure: Leiden clusters and their SingleR labels on the same UMAP."""
-    name = "umap_cluster_annotation"
+    """Deprecated standalone name: write the combined annotation + cell-cycle panel."""
+    draw_annotation_cell_cycle_panel(store, adata)
+
+
+def draw_annotation_cell_cycle_panel(
+    store: FigureStore,
+    adata: AnnData,
+    *,
+    control_values: tuple[str, ...] | None = None,
+    control_title: str | None = None,
+) -> None:
+    """Two-row UMAP panel: Leiden+SingleR (top) and NT/perturbed/cell-cycle (bottom)."""
+    name = _ANNOTATION_CELL_CYCLE_PANEL
+    _remove_legacy_annotation_umaps(store.output_dir)
     if not store.singler_enabled:
         store.skip(name, "singler_disabled")
         return
     if "leiden" not in adata.obs or "X_umap" not in adata.obsm:
         store.skip(name, "missing_fields")
+        return
+    if "phase" not in adata.obs.columns:
+        store.skip(name, "missing_cell_cycle_phase")
         return
     organism = str(store.context.get("organism", ""))
     try:
@@ -1272,6 +1505,19 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
     except ValueError as exc:
         store.skip(name, str(exc))
         return
+    if control_values is None:
+        control_values = ("nt",)
+    if not control_values:
+        store.skip(name, "missing_control_values")
+        return
+    if control_title is None:
+        if set(control_values) == {ZERO_GUIDE_LABEL}:
+            control_title = "zero-guide"
+        elif set(control_values) <= {"nt", ZERO_GUIDE_LABEL}:
+            control_title = "NT / zero-guide"
+        else:
+            control_title = "NT" if set(control_values) == {"nt"} else " / ".join(control_values)
+
     resolution = leiden_resolution(adata)
     resolution_text = "not stored" if resolution is None else f"{resolution:g}"
     reference_name = str(summary["reference"].iloc[0])
@@ -1284,6 +1530,9 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
         f"{SINGLER_IMPLEMENTATION} {version} on cluster-mean log-normalized expression; "
         f"reference={reference_name} {label_field}"
     )
+    summary["control_title"] = control_title
+    summary["control_values"] = "|".join(control_values)
+
     coordinates = np.asarray(adata.obsm["X_umap"], dtype=float)
     table = pd.DataFrame(
         {
@@ -1291,11 +1540,42 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
             "UMAP2": coordinates[:, 1],
             "leiden": adata.obs["leiden"].astype(str).to_numpy(),
             "singler_label": labels.to_numpy(),
+            "perturbation_status": adata.obs["perturbation_status"].astype(str).to_numpy()
+            if "perturbation_status" in adata.obs
+            else np.array([""] * adata.n_obs),
+            "phase": adata.obs["phase"].astype(str).to_numpy(),
         }
     )
-    figure, axes = plt.subplots(1, 2, figsize=(12, 5.4), sharex=True, sharey=True)
+    x_span = float(np.max(coordinates[:, 0]) - np.min(coordinates[:, 0])) or 1.0
+    y_span = float(np.max(coordinates[:, 1]) - np.min(coordinates[:, 1])) or 1.0
+    xlim = (
+        float(np.min(coordinates[:, 0]) - 0.05 * x_span),
+        float(np.max(coordinates[:, 0]) + 0.05 * x_span),
+    )
+    ylim = (
+        float(np.min(coordinates[:, 1]) - 0.05 * y_span),
+        float(np.max(coordinates[:, 1]) + 0.05 * y_span),
+    )
+
+    figure = plt.figure(figsize=(16.8, 10.8))
+    grid = figure.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.28)
+    top = grid[0].subgridspec(1, 2, wspace=0.28)
+    bottom = grid[1].subgridspec(1, 3, wspace=0.35)
+    ax_leiden = figure.add_subplot(top[0, 0])
+    ax_singler = figure.add_subplot(top[0, 1], sharex=ax_leiden, sharey=ax_leiden)
+    ax_pert = figure.add_subplot(bottom[0, 0])
+    ax_control = figure.add_subplot(bottom[0, 1])
+    ax_cycle = figure.add_subplot(bottom[0, 2])
+
     sns.scatterplot(
-        data=table, x="UMAP1", y="UMAP2", hue="leiden", s=4, linewidth=0, ax=axes[0], legend=False
+        data=table,
+        x="UMAP1",
+        y="UMAP2",
+        hue="leiden",
+        s=4,
+        linewidth=0,
+        ax=ax_leiden,
+        legend=False,
     )
     sns.scatterplot(
         data=table,
@@ -1304,15 +1584,15 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
         hue="singler_label",
         s=4,
         linewidth=0,
-        ax=axes[1],
+        ax=ax_singler,
     )
-    axes[0].set_title(f"Leiden (igraph)\nresolution = {resolution_text}")
-    axes[1].set_title(f"SingleR ({reference_name})\n{label_field}")
-    for axis in axes:
+    ax_leiden.set_title(f"Leiden (igraph)\nresolution = {resolution_text}")
+    ax_singler.set_title(f"SingleR ({reference_name})\n{label_field}")
+    for axis in (ax_leiden, ax_singler):
         axis.set_xlabel("UMAP 1")
         axis.set_ylabel("UMAP 2")
     for cluster, group in table.groupby("leiden"):
-        axes[1].text(
+        ax_singler.text(
             group["UMAP1"].median(),
             group["UMAP2"].median(),
             str(cluster),
@@ -1320,11 +1600,57 @@ def draw_cluster_annotation(store: FigureStore, adata: AnnData) -> None:
             ha="center",
             va="center",
         )
-    axes[1].legend(title="singler_label", frameon=False, fontsize=7, loc="best")
+    ax_singler.legend(title="singler_label", frameon=False, fontsize=7, loc="best")
+
+    status = table["perturbation_status"]
+    phase = table["phase"]
+    control_mask = status.isin(control_values).to_numpy()
+    perturbed_mask = status.isin(("targeting",)).to_numpy()
+    phase_known = phase.isin(["G1", "G2M", "S"]).to_numpy()
+    for axis in (ax_pert, ax_control, ax_cycle):
+        _prepare_umap_axis(axis, xlim, ylim)
+    ax_control.scatter(
+        coordinates[control_mask, 0],
+        coordinates[control_mask, 1],
+        c=_NT_COLOR,
+        s=3.0,
+        linewidths=0,
+        rasterized=True,
+    )
+    ax_control.set_title(f"Perturbation Status\n{control_title}", fontsize=14, pad=8)
+    ax_pert.scatter(
+        coordinates[perturbed_mask, 0],
+        coordinates[perturbed_mask, 1],
+        c=_PERTURBED_COLOR,
+        s=3.0,
+        linewidths=0,
+        rasterized=True,
+    )
+    ax_pert.set_title("Perturbed", fontsize=14, pad=8)
+    for label in ("G1", "S", "G2M"):
+        mask = phase_known & phase.eq(label).to_numpy()
+        ax_cycle.scatter(
+            coordinates[mask, 0],
+            coordinates[mask, 1],
+            c=_PHASE_COLORS[label],
+            s=3.0,
+            linewidths=0,
+            rasterized=True,
+        )
+    ax_cycle.set_title("Cell Cycle Phase", fontsize=14, pad=8)
+    ax_cycle.legend(
+        handles=[_proxy(_PHASE_COLORS[label], label) for label in ("G1", "G2M", "S")],
+        frameon=False,
+        loc="lower left",
+        fontsize=8,
+    )
+    figure.subplots_adjust(left=0.05, right=0.98, bottom=0.05, top=0.93, hspace=0.30)
+    figure.perturbseq_skip_tight_layout = True
     method = (
-        f"clustering=Leiden igraph, resolution={resolution_text}; "
-        f"annotation={summary['annotation_method'].iloc[0]}; "
-        "one SingleR label per Leiden cluster; obs['cell_type'] unchanged"
+        f"2-row UMAP panel; top=Leiden+SingleR (resolution={resolution_text}; "
+        f"{summary['annotation_method'].iloc[0]}); "
+        f"bottom=perturbed / {control_title} / cell-cycle phase; "
+        "obs['cell_type'] unchanged"
     )
     store.save(figure, name, "plot", summary, method)
 
@@ -2460,7 +2786,7 @@ def target_in_de_table(adata: AnnData, *, control: str) -> pd.DataFrame:
 def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> pd.DataFrame:
     """Copy 2x2 figures whose target symbol is in that target's DE list.
 
-    Every passing target stays in ``Mixscape/figures``. This folder is the subset.
+    Every passing target stays in ``Mixscape/``. This folder is the subset.
     """
     table = target_in_de_table(adata, control=control)
     if store.plotting.get("save_plot_data", False):
@@ -2519,9 +2845,9 @@ def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5
         {
             "key": ["n_targets", "n_targets_with_de", "n_targets_in_own_de"],
             "label": [
-                "靶基因总数",
-                "通过 Mixscape DE 门槛",
-                "自身在 DE 名单中",
+                "all targets",
+                "passed Mixscape DE gate",
+                "target in own DE list",
             ],
             "n": [len(targets), len(with_de), len(in_own_list)],
         }
@@ -2544,8 +2870,10 @@ def target_de_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
             va="bottom",
             fontsize=10,
         )
-    axis.set_ylabel("靶基因数")
-    axis.set_title("Mixscape DE 门槛计数（细胞级 Wilcoxon，非生物学重复检验）")
+    axis.set_ylabel("n targets")
+    axis.set_title(
+        "Mixscape DE-gate counts (cell-level Wilcoxon; not a biological-replicate test)"
+    )
     return figure, frame
 
 
@@ -2615,13 +2943,15 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
             va="bottom",
             fontsize=10,
         )
-    axis.set_ylabel("DE 基因数（Mixscape 门槛名单）")
-    axis.set_title("自身基因在 Mixscape DE 名单中的靶基因（非组间推断）")
+    axis.set_ylabel("n DE genes (Mixscape gate list)")
+    axis.set_title(
+        "Targets with own gene in Mixscape DE list (not a between-group inference)"
+    )
     if len(frame) > 40:
         axis.set_xticks([])
-        axis.set_xlabel(f"{len(frame)} 个靶基因，名称在表里")
+        axis.set_xlabel(f"{len(frame)} targets; names are in the table")
     else:
-        axis.set_xlabel("靶基因")
+        axis.set_xlabel("target gene")
         plt.setp(axis.get_xticklabels(), rotation=40, ha="right", fontsize=10)
     legend = axis.get_legend()
     if legend is not None:
@@ -2664,12 +2994,12 @@ def draw_mixscape_target_panels(
     max_genes: int = 20,
     max_cells: int = 300,
     pval_cutoff: float = 0.05,
-    lfc_line: float = 0.25,
+    lfc_line: float = 0.1,
 ) -> None:
     """One 2x2 PNG per target: posterior, perturbation score, cell-level volcano, Top 20 heatmap.
 
-    ``lfc_line`` is MixscapeHeatmap / RunMixscape logfc.threshold (0.25). It is not
-    ``plotting.volcano_lfc``. The heatmap stays in the bottom-right panel.
+    ``lfc_line`` is MixscapeHeatmap / RunMixscape logfc.threshold (project 0.1).
+    It is not ``plotting.volcano_lfc``. The heatmap stays in the bottom-right panel.
     """
     if "mixscape_status" not in adata.obs or "mixscape_class_p" not in adata.obs:
         store.skip("mixscape_target_panels", "mixscape_not_run")
@@ -3253,7 +3583,7 @@ def draw_nt_perturbed_cell_cycle_umap(
     and temporary zero-guide controls both use this middle panel.
     """
     output_dir = Path(output_dir)
-    output_path = output_dir / "UMAP" / "figures" / "umap_nt_perturbed_cell_cycle.png"
+    output_path = output_dir / "UMAP" / "umap_nt_perturbed_cell_cycle.png"
     if output_path.suffix.lower() != ".png":
         raise ValueError(f"只写 PNG: {output_path}")
     if embedding not in adata.obsm:

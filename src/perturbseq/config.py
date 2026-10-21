@@ -273,6 +273,12 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "mixscape_pval": None,
         "cell_type_key": None,
     },
+    # E-test on X_pca (see distance_tests). Defaults match the pertpy tutorial.
+    "edistance": {
+        "n_perms": None,
+        "padj_threshold": None,
+        "max_contrast_cells": None,
+    },
     "target_expression": {
         "min_nt_detection_fraction": None,
         "min_nt_mean_cpm": None,
@@ -874,7 +880,7 @@ def _validate_embedding_ndims(config: dict[str, Any]) -> None:
 def _validate_mixscape_fallback(config: dict[str, Any]) -> None:
     """Keep mixscape.logfc_threshold and perturb.mixscape_logfc from drifting apart.
 
-    The primary key is ``mixscape.logfc_threshold`` (Seurat default 0.25).
+    The primary key is ``mixscape.logfc_threshold`` (project default 0.1).
     ``perturb.mixscape_logfc`` is only a fallback when the primary key is absent.
     """
     mix = config.get("mixscape")
@@ -894,7 +900,7 @@ def _validate_mixscape_fallback(config: dict[str, Any]) -> None:
             "mixscape.logfc_threshold 与 perturb.mixscape_logfc 不一致："
             f"{primary} vs {fallback}。"
             "请只改 mixscape.logfc_threshold，并把回退键改成相同数值"
-            "（Mixscape 默认 0.25，勿与 mixscale.logfc_threshold=0.2 混用）。"
+            "（项目 |logFC| 默认均为 0.1）。"
         )
 
 

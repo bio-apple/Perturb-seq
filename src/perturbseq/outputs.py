@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -21,20 +22,27 @@ def is_kept_output(path: Path, root: Path) -> bool:
     return False
 
 
-def cleanup_lean_outputs(folder: Path) -> int:
+def cleanup_lean_outputs(
+    folder: Path, *, protect: Iterable[Path] | None = None
+) -> int:
     """Delete pipeline products that are neither checkpoints nor PNGs.
 
-    Does not touch paths outside ``folder``. Returns the number of files removed.
-    Empty directories left behind (except ``checkpoints/``) are pruned.
+    ``protect`` paths (e.g. DRAGEN inputs when ``--output-dir`` equals
+    ``--input-dir``) are never removed. Does not touch paths outside
+    ``folder``. Returns the number of files removed. Empty directories left
+    behind (except ``checkpoints/``) are pruned.
     """
     root = Path(folder)
     if not root.is_dir():
         return 0
+    protected = {Path(path).resolve() for path in (protect or [])}
     removed = 0
     for path in sorted(root.rglob("*"), reverse=True):
         if not path.is_file():
             continue
         if is_kept_output(path, root):
+            continue
+        if path.resolve() in protected:
             continue
         path.unlink(missing_ok=True)
         removed += 1

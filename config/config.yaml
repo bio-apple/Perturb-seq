@@ -41,8 +41,8 @@ preprocess:
 mixscape:
   enabled: true
   min_de_genes: 5
-  # RunMixscape / MixscapeHeatmap 的 logfc.threshold。Seurat 函数默认 0.25（不是 Mixscale 的 0.2）。
-  logfc_threshold: 0.25
+  # |logFC| 门槛（项目统一 0.1）。Seurat RunMixscape / MixscapeHeatmap 函数默认曾为 0.25。
+  logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
   # CalcPerturbSig 维数；与 preprocess.n_pcs 一致（默认 30）。
@@ -52,11 +52,11 @@ mixscape:
   # RunMixscape iter.num。
   iter_num: 10
 # RunMixscale 教程实参：https://satijalab.github.io/Mixscale/
-# min.de.genes = 5，logfc.threshold = 0.2，max.de.genes = 100，fine.mode = F。
+# 教程原为 logfc.threshold = 0.2；本项目统一 |logFC|≥0.1。min.de.genes = 5，max.de.genes = 100，fine.mode = F。
 # pval.cutoff 教程调用没有写，函数默认是 0.05。不读取 mixscape.logfc_threshold。
 mixscale:
   min_de_genes: 5
-  logfc_threshold: 0.2
+  logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
 statistics:
@@ -75,9 +75,15 @@ statistics:
   allow_random_split_replicates: false
 perturb:
   mixscape_min_de_genes: 5
-  # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致。Mixscale 不读此键。
-  mixscape_logfc: 0.25
+  # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致（0.1）。Mixscale 不读此键。
+  mixscape_logfc: 0.1
   mixscape_pval: 0.05
+# E-test（表达 X_pca 上相对对照）。默认 n_perms=1000 与 pertpy 教程一致。
+# 大临时对照（zero_guide）会下采样到 max_contrast_cells，避免 N×N 距离矩阵 OOM。
+edistance:
+  n_perms: 1000
+  padj_threshold: 0.0015
+  max_contrast_cells: 4000
 target_expression:
   min_nt_detection_fraction: 0.05
   min_nt_mean_cpm: 1.0

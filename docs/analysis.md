@@ -74,12 +74,12 @@ flowchart TD
 | 步骤 | 作用 | 输出目录 | checkpoint |
 | --- | --- | --- | --- |
 | `io` | 读入矩阵 / 参考 / 分配 | — | `io.h5ad`（含 `uns['cell_calls']`） |
-| `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/figures/` | `assign.h5ad` |
+| `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/` | `assign.h5ad` |
 | `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` | `preprocess.h5ad` |
 | `dge` | pertpy `WilcoxonTest`（与另两者独立；无独立 PNG；表在 checkpoint） | — | `dge.h5ad` |
 | `mixscape` | Seurat Mixscape：分类 + `X_pert`；写出 Mixscape / 相关 UMAP | **`Mixscape/`**、`UMAP/` | `mixscape.h5ad` |
 | `mixscale` | Mixscale：自算签名 + 分数；写出 ridge / scatter | **`mixscale/`** | `mixscale.h5ad` |
-| `perturb` | 描述性效应、E-test；写出 descriptive 图与 E-test 图 | `DGE/descriptive/`、`E-distance/` | `perturb.h5ad` |
+| `perturb` | 描述性效应、E-test；写出描述性图与 E-test 图 | `DGE/`、`E-distance/` | `perturb.h5ad` |
 
 图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `checkpoints/*.h5ad` 与 `**/*.png`（细节见 [outputs.md](outputs.md)）。
 
@@ -190,7 +190,7 @@ flowchart TD
 
 > **警示**：临时 zero-guide 可能在 UMI、基因数、线粒体、环境 RNA、细胞状态上与靶向细胞不同；后续效应都相对这组对照，不宜直接当作设计 NT 的生物学结论。
 
-`assign` 步写出 `qc/figures/temporary_control_qc.png`（UMI / 基因数 / percent.mt）。对比只作描述，不因分布差异中止。设计 NT 不写警告，并去掉已有警告文件与对比图。对照掩码在 pandas CoW 下会拷贝为可写数组，避免 `output array is read-only` 导致对比图被跳过。
+`assign` 步写出 `qc/temporary_control_qc.png`（UMI / 基因数 / percent.mt）。对比只作描述，不因分布差异中止。设计 NT 不写警告，并去掉已有警告文件与对比图。对照掩码在 pandas CoW 下会拷贝为可写数组，避免 `output array is read-only` 导致对比图被跳过。
 
 `low_library_no_guide` 阶段在过滤账本中保留，新增排除数为 0；该状态不进入临时对照，也不进入设计 NT。真正检出 NT guide 的 `single_nt` 仍是设计对照。
 
@@ -217,7 +217,7 @@ UMI 阈值仅来自配置 / CLI，不做分布自适应。
 
 默认剔除 mito 比例 ≥ 20%：`qc.max_mito_frac=0.2`。`--max-mito-frac` 可覆盖。原因码 `high_mito`。
 
-> **警示**：20% 是软件固定默认，不是按本样本自适应。肿瘤、高代谢或线粒体相关扰动应先看 `hist_percent_mt_gex` / `qc_scatter` / `scatter_ncount_nfeature_gex`，再决定是否调低/调高；过度过滤会丢掉真实生物学变异。
+> **警示**：20% 是软件固定默认，不是按本样本自适应。肿瘤、高代谢或线粒体相关扰动应先看 `qc_metrics_panel`（含 percent.mt violin/直方图）/ `qc_scatter` / `scatter_ncount_nfeature_gex`，再决定是否调低/调高；过度过滤会丢掉真实生物学变异。
 
 ### GEX marker 图
 
@@ -252,7 +252,7 @@ UMI 阈值仅来自配置 / CLI，不做分布自适应。
 low_library_no_guide → no_guide → multi_guide → low_guide_umi → qc_failed → low_cells_target → retained
 ```
 
-`qc/figures/guides_per_cell.png` 按 **guide 条数** 分布（描述捕获），与资格用的 `n_targets` 不同。纵轴 `Cells`；分母含 `no_guide` 与 `multi_guide`；柱上标计数与一位小数百分比。
+`qc/guides_per_cell.png` 按 **guide 条数** 分布（描述捕获），与资格用的 `n_targets` 不同。纵轴 `Cells`；分母含 `no_guide` 与 `multi_guide`；柱上标计数与一位小数百分比。
 
 ---
 
@@ -339,7 +339,7 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 | 参考 | [Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette) | [Mixscale](https://satijalab.github.io/Mixscale/) | [pertpy WilcoxonTest](https://pertpy.scverse.org/en/stable/tutorials/notebooks/differential_gene_expression.html) |
 | 输出目录 | `Mixscape/` | `mixscale/` | `checkpoints/dge.h5ad` |
 | 签名层 | `X_pert` | `X_pert_mixscale` | — |
-| `logfc_threshold` | **0.25** | **0.2** | — |
+| `logfc_threshold` | **0.1** | **0.1** | — |
 | 主要产物 | KO/NP 分类、signature UMAP | `mixscale_score` | 靶 vs 对照 DE 表 |
 
 Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscale 假分数 `1` 置缺失。
@@ -395,7 +395,7 @@ PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**�
 
 ### 簇注释
 
-对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过整张 `umap_cluster_annotation`（原因 `singler_disabled`）。
+对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
 
 ---
 
@@ -405,7 +405,9 @@ PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**�
 | --- | --- | --- |
 | `E-distance/` E-test | 有对照与 `X_pca` | 表达 PCA 上相对对照；**细胞置换**，样本内距离检验，不是生物学重复 FDR |
 
-结果表在 `checkpoints/perturb.h5ad` 的 `uns['edistance_etest']`；图为 `E-distance/figures/edistance_etest.png`。
+实现用 pertpy 的 energy-distance 统计量，但**不**物化 N×N pairwise 矩阵（按组流式置换）。`edistance.n_perms` 默认 1000；超大对照（常见于临时 zero-guide）按 `edistance.max_contrast_cells`（默认 4000）随机下采样。
+
+结果表在 `checkpoints/perturb.h5ad` 的 `uns['edistance_etest']`；图为 `E-distance/edistance_etest.png`。
 
 ---
 

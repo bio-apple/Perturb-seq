@@ -829,10 +829,9 @@ def write_qc_figures(
     """Write QC / assignment PNGs at the end of the assign step."""
     from perturbseq.config import control_spec
     from perturbseq.plotting import (
-        draw_assignment_status,
         draw_cells_per_target,
         draw_guides_per_cell,
-        draw_qc_histograms,
+        draw_qc_metrics_panel,
         draw_qc_scatter,
         draw_scatter_ncount_nfeature_gex,
         draw_temporary_control_qc,
@@ -849,12 +848,10 @@ def write_qc_figures(
         cell_status = (
             pd.read_csv(ledger_path, sep="\t") if ledger_path.exists() else pd.DataFrame()
         )
-    if not cell_status.empty and "assignment_status" in cell_status.columns:
-        draw_assignment_status(store, cell_status["assignment_status"])
+    if not cell_status.empty and "n_guides" in cell_status.columns:
         draw_guides_per_cell(store, cell_status["n_guides"])
     else:
-        for name in ("assignment_status_bar", "guides_per_cell"):
-            store.skip(name, "missing_fields")
+        store.skip("guides_per_cell", "missing_fields")
     if targets is None:
         targets_path = output_dir / "qc" / "tables" / "cells_per_target.tsv"
         targets = (
@@ -864,15 +861,13 @@ def write_qc_figures(
     qc_table, qc_note = _qc_population(cell_status, adata)
     if qc_table.empty:
         for name in (
-            "hist_ncount",
-            "hist_nfeature",
-            "hist_percent_mt_gex",
+            "qc_metrics_panel",
             "qc_scatter",
             "scatter_ncount_nfeature_gex",
         ):
             store.skip(name, "missing_fields")
     else:
-        draw_qc_histograms(store, qc_table, config, population=qc_note)
+        draw_qc_metrics_panel(store, qc_table, config, population=qc_note)
         draw_qc_scatter(store, qc_table, int(config["runtime"]["seed"]), population=qc_note)
         draw_scatter_ncount_nfeature_gex(
             store, qc_table, int(config["runtime"]["seed"]), population=qc_note

@@ -7,7 +7,7 @@
 | 保留 | 说明 |
 | --- | --- |
 | `checkpoints/*.h5ad` | `--resume` 所需；表 / 门槛 / 效应等在对应 checkpoint 的 `uns` |
-| `**/*.png` | 各步 `**/figures/` |
+| `**/*.png` | 各步分析目录下的 PNG（无 `figures/` 二级目录） |
 
 跑程中可能短暂写出 TSV / JSON / YAML 等中间文件；结束时的 lean cleanup 只留下上述两类。`--validate-only` 不做 cleanup（校验文件留在输出目录）。
 
@@ -26,12 +26,12 @@
 | 目录 | 内容 |
 | --- | --- |
 | `checkpoints/` | 逐步 `*.h5ad`（resume + 表格数据） |
-| `qc/figures/` | assign / preprocess QC 图 |
-| `UMAP/figures/` | 表达 UMAP、簇注释、细胞周期；Mixscape signature UMAP |
-| `Mixscape/figures/` | Mixscape 图 |
-| `mixscale/figures/` | Mixscale ridge / scatter |
-| `DGE/descriptive/figures/` | 描述性效应图 |
-| `E-distance/figures/` | E-test 散点 |
+| `qc/` | assign / preprocess QC 图 |
+| `UMAP/` | 表达 UMAP、簇注释、细胞周期；Mixscape signature UMAP |
+| `Mixscape/` | Mixscape 图 |
+| `mixscale/` | Mixscale ridge / scatter |
+| `DGE/` | 描述性效应图 |
+| `E-distance/` | E-test 散点 |
 
 `dge` / `mixscape` / `mixscale` 互不依赖；Wilcoxon 结果只在 `checkpoints/dge.h5ad`（无独立 PNG 桶）。
 
@@ -63,42 +63,40 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `qc/figures/guides_per_cell.png` | 每细胞 guide 条数 |
-| `qc/figures/assignment_status_bar.png` | 四类分配 |
-| `qc/figures/cells_per_target_bar.png` | 靶基因细胞数 |
-| `qc/figures/hist_ncount.png` / `hist_nfeature.png` / `hist_percent_mt_gex.png` | QC 直方图 |
-| `qc/figures/qc_scatter.png` / `scatter_ncount_nfeature_gex.png` | QC 散点 |
-| `qc/figures/temporary_control_qc.png` | 仅临时 zero-guide 对照时 |
+| `qc/guides_per_cell.png` | 每细胞 guide 条数 |
+| `qc/cells_per_target_bar.png` | 靶基因细胞数 |
+| `qc/qc_metrics_panel.png` | 2×3 QC：上行 Seurat 风格 violin（nFeature / nCount / percent.mt）+ jitter；下行 Library-D 直方图（同三指标）。轴标签英文；Identity=`sample_id`。不再单独写 `hist_ncount` 等三张图 |
+| `qc/qc_scatter.png` / `scatter_ncount_nfeature_gex.png` | QC 散点 |
+| `qc/temporary_control_qc.png` | 仅临时 zero-guide 对照时；组标签 `zero-guide` / `targeting`（纯英文） |
 
 ### preprocess → `qc/` + `UMAP/`
 
 | 路径 | 内容 |
 | --- | --- |
-| `qc/figures/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA |
-| `qc/figures/marker_detection_heatmap.png`、`dotplot_markers.png` | marker |
-| `UMAP/figures/umap_cell_type.png` | 真实细胞类型（有注释时） |
-| `UMAP/figures/umap_cluster_annotation.png` | Leiden + SingleR |
-| `UMAP/figures/umap_nt_perturbed_cell_cycle.png` | 细胞周期 |
+| `qc/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA |
+| `qc/marker_detection_heatmap.png`、`dotplot_markers.png` | marker |
+| `UMAP/umap_cell_type.png` | 真实细胞类型（有注释时） |
+| `UMAP/umap_annotation_cell_cycle_panel.png` | 2 行组合：上行 Leiden + SingleR；下行 Perturbed / 对照 / Cell Cycle。不再单独写 `umap_cluster_annotation` 与 `umap_nt_perturbed_cell_cycle` |
 
 ### mixscape → `Mixscape/` + `UMAP/`
 
 | 路径 | 内容 |
 | --- | --- |
-| `UMAP/figures/umap_mixscape_class.png` / `umap_mixscape.png` / `umap_mixscape_class_global.png` | Mixscape UMAP |
-| `Mixscape/figures/mixscape_class_global_bar.png`、`mixscape_fraction_bar.png` | 分类计数 / 比例 |
-| `Mixscape/figures/{靶基因}_mixscape_2x2.png`、`target_in_de/...` | 火山 + 热图 |
-| `Mixscape/figures/target_de_counts.png`、`target_in_de_gene_counts.png` | DE 计数 |
+| `UMAP/umap_mixscape_class.png` / `umap_mixscape.png` / `umap_mixscape_class_global.png` | Mixscape UMAP |
+| `Mixscape/mixscape_class_global_bar.png`、`mixscape_fraction_bar.png` | 分类计数 / 比例 |
+| `Mixscape/{靶基因}_mixscape_2x2.png`、`target_in_de/...` | 火山 + 热图 |
+| `Mixscape/target_de_counts.png`、`target_in_de_gene_counts.png` | DE 计数 |
 
 ### mixscale → `mixscale/`
 
 | 路径 | 内容 |
 | --- | --- |
-| `mixscale/figures/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 箱线 |
+| `mixscale/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 箱线 |
 
-### perturb → `DGE/descriptive/` + `E-distance/`
+### perturb → `DGE/` + `E-distance/`
 
 | 路径 | 内容 |
 | --- | --- |
-| `DGE/descriptive/figures/de_gene_heatmap.png` | 描述性 log2FC |
-| `DGE/descriptive/figures/target_expression_effect.png`、`guide_consistency.png` | 靶基因 / guide |
-| `E-distance/figures/edistance_etest.png` | E-test 散点 |
+| `DGE/de_gene_heatmap.png` | 描述性 log2FC |
+| `DGE/target_expression_effect.png`、`guide_consistency.png` | 靶基因 / guide |
+| `E-distance/edistance_etest.png` | E-test 散点 |

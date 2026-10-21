@@ -314,8 +314,18 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             raise SystemExit(f"未知步骤: {step}")
         info.setdefault("steps", {})[step] = {"seconds": round(time.time() - step_started, 3)}
         _write_info(folder, info, started)
-    removed = cleanup_lean_outputs(folder)
+    removed = cleanup_lean_outputs(folder, protect=_lean_protect_paths(config, folder))
     print(f"Wrote {folder} (lean cleanup removed {removed} intermediate files)", flush=True)
+
+
+def _lean_protect_paths(config: dict[str, Any], folder: Path) -> list[Path]:
+    """Keep DRAGEN inputs when the output dir is the sample input dir."""
+    paths = list(resolve_input_paths(config).values())
+    sample_id = str(config["experiment"]["sample_id"])
+    input_dir = Path(config["input"].get("input_dir", "."))
+    if input_dir.resolve() == Path(folder).resolve():
+        paths.extend(input_dir.glob(f"{sample_id}.scRNA.*"))
+    return paths
 
 
 def _ensure_preprocess_adata(
@@ -400,6 +410,8 @@ def _merge_post_preprocess_products(folder: Path, preprocess_adata):
 
     Mixscale products stay in ``mixscale.h5ad``; descriptive / E-test do not require them.
     """
+    import gc
+
     adata = preprocess_adata.copy()
     mixscape_path = folder / "checkpoints" / "mixscape.h5ad"
     if mixscape_path.exists():
@@ -422,12 +434,34 @@ def _merge_post_preprocess_products(folder: Path, preprocess_adata):
         for key, value in mix.uns.items():
             if str(key).startswith("mixscape"):
                 adata.uns[key] = value
+        del mix
+        gc.collect()
     dge_path = folder / "checkpoints" / "dge.h5ad"
     if dge_path.exists():
-        dge = sc.read_h5ad(dge_path)
-        for key in ("wilcoxon_de_results", "wilcoxon_de_status", "wilcoxon_de"):
+        # Load status first; defer the bulky wilcoxon gene table until after E-test.
+        dge = sc.read_h5ad(dge_path, backed="r")
+        for key in ("wilcoxon_de_status", "wilcoxon_de"):
             if key in dge.uns:
                 adata.uns[key] = dge.uns[key]
+        dge.file.close()
+        del dge
+        gc.collect()
+    return adata
+
+
+def _attach_wilcoxon_de_results(folder: Path, adata):
+    """Copy the large Wilcoxon gene table into ``uns`` for the perturb checkpoint."""
+    import gc
+
+    dge_path = folder / "checkpoints" / "dge.h5ad"
+    if not dge_path.exists() or "wilcoxon_de_results" in adata.uns:
+        return adata
+    dge = sc.read_h5ad(dge_path, backed="r")
+    if "wilcoxon_de_results" in dge.uns:
+        adata.uns["wilcoxon_de_results"] = dge.uns["wilcoxon_de_results"]
+    dge.file.close()
+    del dge
+    gc.collect()
     return adata
 
 
@@ -527,7 +561,8 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     correlation = capture_library_correlation(calls)
     correlation["low_library_no_guide_applied"] = False
     correlation["low_library_no_guide_reason"] = library_rule["reason"]
-    correlation["low_library_min_total_counts"] = None
+    # Keep a float column (np.nan), not None — nested None/DataFrame break h5ad/JSON.
+    correlation["low_library_min_total_counts"] = np.nan
     recorded = {
         **thresholds,
         "source": "command_line" if umi_configured else "skipped",
@@ -536,8 +571,16 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         "gene_filter": "drop_n_genes_le_min_or_ge_max",
         "mito_frac_source": "configured",
         "mito_filter": "drop_mito_frac_ge_max",
-        "low_library_no_guide": library_rule,
-        "grna_capture_library_correlation": correlation.to_dict(orient="records"),
+        "low_library_no_guide": {
+            **library_rule,
+            "min_total_counts": (
+                np.nan
+                if library_rule.get("min_total_counts") is None
+                else library_rule["min_total_counts"]
+            ),
+        },
+        # Nested DataFrame is not JSON-serializable (figure_context) and is fragile in h5ad.
+        "grna_capture_library_correlation": _uns_scalar_row(correlation),
     }
     print(f"  low_library_no_guide skipped: {library_rule['reason']}", flush=True)
     updated = apply_eligibility(
@@ -752,6 +795,8 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     ``adata`` should already be preprocess merged with Mixscape labels / Wilcoxon
     ``uns`` when those checkpoints exist (see ``_merge_post_preprocess_products``).
     """
+    import gc
+
     comparisons = []
     spec = control_spec(config)
     if spec["temporary"]:
@@ -759,6 +804,13 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     if "mixscape_status" not in adata.obs:
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
+    # E-test first on a PCA-only view so pertpy does not compete with densified X.
+    slim = _edistance_pca_view(adata)
+    edistance = write_edistance_results(folder, slim, config)
+    del slim
+    gc.collect()
+    if isinstance(edistance, pd.DataFrame) and not edistance.empty:
+        adata.uns["edistance_etest"] = edistance
     main_effects, main_guides, main_status = descriptive_effects(adata, config, branch="main")
     sens_effects, sens_guides, sens_status = descriptive_effects(
         adata, config, branch="sensitivity"
@@ -783,9 +835,6 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     if isinstance(wilcoxon_status, pd.DataFrame) and not wilcoxon_status.empty:
         comparisons_table = pd.concat([comparisons_table, wilcoxon_status], ignore_index=True)
     adata.uns["comparison_status"] = comparisons_table
-    edistance = write_edistance_results(folder, adata, config)
-    if isinstance(edistance, pd.DataFrame) and not edistance.empty:
-        adata.uns["edistance_etest"] = edistance
     write_descriptive_figures(
         folder,
         config,
@@ -793,8 +842,44 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         direction=direction,
         guides=guides,
     )
+    adata = _attach_wilcoxon_de_results(folder, adata)
     _write_h5ad(adata, folder / "checkpoints" / "perturb.h5ad")
     return adata
+
+
+def _edistance_pca_view(adata):
+    """Minimal AnnData for pertpy E-test (obs labels + X_pca + Mixscape DE gate)."""
+    from anndata import AnnData
+
+    keep_obs = [
+        column
+        for column in (
+            "target_gene",
+            "n_targets",
+            "n_guides",
+            "perturbation_status",
+            "assignment_status",
+            "qc_pass",
+            "exclusion_reason_primary",
+        )
+        if column in adata.obs.columns
+    ]
+    view = AnnData(obs=adata.obs[keep_obs].copy())
+    view.obsm["X_pca"] = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
+    gate = adata.uns.get("mixscape_de_gate")
+    if isinstance(gate, pd.DataFrame):
+        view.uns["mixscape_de_gate"] = gate
+    for key in (
+        "control_label",
+        "control_source",
+        "control_temporary",
+        "control_phrase",
+        "control_note",
+        "control_fallback_from",
+    ):
+        if key in adata.uns:
+            view.uns[key] = adata.uns[key]
+    return view
 
 
 def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
@@ -1026,9 +1111,77 @@ def _calls(annotated: pd.DataFrame) -> pd.DataFrame:
     return annotated.drop(columns=drop)
 
 
+def _uns_scalar_row(frame: pd.DataFrame) -> dict[str, Any]:
+    """One-row QC table as a plain dict safe for nested uns / JSON / h5ad."""
+    if frame.empty:
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in frame.iloc[0].items():
+        name = str(key)
+        if isinstance(value, (bool, np.bool_)):
+            out[name] = bool(value)
+        elif isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+            out[name] = int(value)
+        elif isinstance(value, (float, np.floating)):
+            out[name] = float(value)
+        elif isinstance(value, np.generic):
+            out[name] = value.item()
+        else:
+            try:
+                missing = bool(pd.isna(value))
+            except (TypeError, ValueError):
+                missing = value is None
+            if missing:
+                out[name] = np.nan
+            elif isinstance(value, str):
+                out[name] = value
+            else:
+                out[name] = str(value)
+    return out
+
+
 def _write_h5ad(adata, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # h5py vlen strings reject pd.NA / None in object columns (e.g. target_gene).
+    adata.obs = _h5_safe_strings(adata.obs)
+    adata.var = _h5_safe_strings(adata.var)
+    adata.uns.update({key: _h5_safe_uns(value) for key, value in list(adata.uns.items())})
     adata.write_h5ad(path, compression="lzf")
+
+
+def _h5_safe_uns(value: Any) -> Any:
+    """Recursively make uns values writable (nested DataFrames / object NA)."""
+    if isinstance(value, pd.DataFrame):
+        return _h5_safe_strings(value)
+    if isinstance(value, dict):
+        return {str(key): _h5_safe_uns(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_h5_safe_uns(item) for item in value]
+    if isinstance(value, tuple):
+        return [_h5_safe_uns(item) for item in value]
+    return value
+
+
+def _h5_safe_strings(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing values in string/object columns so AnnData can write h5ad."""
+    out = frame.copy()
+    for column in out.columns:
+        series = out[column]
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            if series.isna().any():
+                if "" not in series.cat.categories:
+                    series = series.cat.add_categories([""])
+                out[column] = series.fillna("")
+            continue
+        if series.dtype != object and not pd.api.types.is_string_dtype(series):
+            continue
+        non_null = series[series.notna()]
+        if len(non_null) and isinstance(
+            non_null.iloc[0], (list, tuple, dict, set, np.ndarray)
+        ):
+            continue
+        out[column] = series.astype("string").fillna("").astype(str)
+    return out
 
 
 def _write_info(folder: Path, info: dict[str, Any], started: float) -> None:

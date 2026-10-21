@@ -1,14 +1,23 @@
-"""E-test from the pertpy Distance Tests tutorial.
+"""E-test on expression ``X_pca`` (pertpy tutorial metric, memory-safe runner).
 
-The notebook calls ``DistanceTest("edistance")`` on ``X_pca`` and plots each
-group's permutation p-value against its E-distance to the contrast. It does
-not draw a pairwise heatmap.
+The pertpy tutorial calls ``DistanceTest("edistance")`` on ``X_pca``. That path
+precomputes a dense pairwise distance matrix for every group∪contrast (~N²
+floats). With a large temporary zero-guide contrast this OOMs.
+
+This module keeps the same statistic (energy distance + cell-label Monte Carlo)
+but:
+
+* never materializes an N×N matrix (uses pertpy's euclidean kernel-sum edistance);
+* tests one group at a time;
+* optionally downsamples a huge contrast to ``max_contrast_cells`` (seeded);
+* reads ``n_perms`` / thresholds from config.
 
 https://pertpy.scverse.org/en/latest/tutorials/notebooks/distance_tests.html
 """
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +27,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from anndata import AnnData
-from pertpy.tools import DistanceTest
+from pertpy.tools import Distance
+from statsmodels.stats.multitest import multipletests
 
 from perturbseq.assign import control_cell_mask
 from perturbseq.config import ZERO_GUIDE_LABEL, control_spec
@@ -33,7 +43,9 @@ INFERENCE_NOTE = (
 )
 _TUTORIAL_N_PERMS = 1000
 _TUTORIAL_PADJ = 0.0015
+_DEFAULT_MAX_CONTRAST = 4000
 _OBSM_KEY = "X_pca"
+_CORRECTION = "holm-sidak"
 
 
 def run_edistance_test(
@@ -45,30 +57,44 @@ def run_edistance_test(
     n_perms: int = _TUTORIAL_N_PERMS,
     padj_threshold: float = _TUTORIAL_PADJ,
     obsm_key: str = _OBSM_KEY,
+    max_contrast_cells: int = _DEFAULT_MAX_CONTRAST,
+    seed: int = 0,
     selection_rule: str = "",
     show_progressbar: bool = False,
 ) -> pd.DataFrame:
-    """Test each perturbation group against ``contrast`` with pertpy's E-test.
+    """Test each perturbation group against ``contrast`` with energy distance.
 
     Cells are the permutation units, matching the tutorial. The result is a
     within-sample distance test for this one biological sample.
     """
+    del show_progressbar  # kept for call-site compatibility; streaming has no bar
     if obsm_key not in adata.obsm:
         raise ValueError(f"缺少 {obsm_key}。教程要求先在 log-normalized 表达上做 PCA。")
     view, counts = _pca_view(
         adata, groupby=groupby, contrast=contrast, groups=groups, obsm_key=obsm_key
     )
-    etest = DistanceTest(
-        "edistance",
-        n_perms=n_perms,
-        obsm_key=obsm_key,
-        padj_threshold=padj_threshold,
+    view, counts, subsample_note = _subsample_contrast(
+        view,
+        groupby=groupby,
+        contrast=contrast,
+        max_contrast_cells=max_contrast_cells,
+        seed=seed,
+        counts=counts,
     )
-    tab = etest(view, groupby=groupby, contrast=contrast, show_progressbar=show_progressbar)
-    tab = tab.copy()
-    tab.index = tab.index.astype(str)
+    tab = _estream_etest(
+        view,
+        groupby=groupby,
+        contrast=contrast,
+        n_perms=n_perms,
+        padj_threshold=padj_threshold,
+        obsm_key=obsm_key,
+        seed=seed,
+    )
     n_contrast = int(counts.get(contrast, 0))
     n_pcs = int(view.obsm[obsm_key].shape[1])
+    rule = selection_rule
+    if subsample_note:
+        rule = f"{rule} {subsample_note}".strip()
     rows = []
     for group in tab.index.astype(str):
         record = tab.loc[group]
@@ -89,10 +115,10 @@ def run_edistance_test(
                 "obsm_key": obsm_key,
                 "n_pcs": n_pcs,
                 "padj_threshold": float(padj_threshold),
-                "correction": str(etest.correction),
+                "correction": _CORRECTION,
                 "inference": INFERENCE,
                 "inference_note": INFERENCE_NOTE,
-                "selection_rule": selection_rule,
+                "selection_rule": rule,
             }
         )
     return pd.DataFrame(rows)
@@ -103,14 +129,15 @@ def write_edistance_results(
     adata: AnnData,
     config: dict[str, Any],
     *,
-    n_perms: int = _TUTORIAL_N_PERMS,
-    padj_threshold: float = _TUTORIAL_PADJ,
+    n_perms: int | None = None,
+    padj_threshold: float | None = None,
     show_progressbar: bool = False,
 ) -> pd.DataFrame:
     """Write the E-test table and scatter under ``E-distance/``."""
     figures, tables = _output_dirs(output_dir)
     spec = control_spec(config)
     contrast = spec["control_label"]
+    settings = _edistance_settings(config, n_perms=n_perms, padj_threshold=padj_threshold)
     n_control = int(control_cell_mask(adata.obs, spec).sum()) if adata.n_obs else 0
     if n_control == 0:
         reason = "no_zero_guide_cells" if spec["temporary"] else "no_designed_nt_cells"
@@ -129,32 +156,167 @@ def write_edistance_results(
     groups, rule = _select_groups(gate, contrast, source)
     print(
         f"  E-distance: {len(groups) if groups is not None else 'all'} groups vs {contrast}, "
-        f"n_perms={n_perms}",
+        f"n_perms={settings['n_perms']}, max_contrast_cells={settings['max_contrast_cells']}",
         flush=True,
     )
     table = run_edistance_test(
         adata,
         contrast=contrast,
         groups=groups,
-        n_perms=n_perms,
-        padj_threshold=padj_threshold,
+        n_perms=int(settings["n_perms"]),
+        padj_threshold=float(settings["padj_threshold"]),
+        max_contrast_cells=int(settings["max_contrast_cells"]),
+        seed=int(settings["seed"]),
         selection_rule=rule,
         show_progressbar=show_progressbar,
     )
-    # Lean outputs: PNG only; table stays in the perturb checkpoint via caller if needed.
     if not table.empty:
         plot_edistance_test(table, figures / "edistance_etest.png")
     _clear_edistance_skip_markers(figures)
+    legacy_png = figures / "figures" / "edistance_etest.png"
+    if legacy_png.is_file():
+        legacy_png.unlink()
     stale_table = tables / "edistance_etest.tsv"
     if stale_table.exists():
         stale_table.unlink()
     return table
 
 
+def _edistance_settings(
+    config: dict[str, Any],
+    *,
+    n_perms: int | None,
+    padj_threshold: float | None,
+) -> dict[str, Any]:
+    block = config.get("edistance") if isinstance(config.get("edistance"), dict) else {}
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    run = config.get("run") if isinstance(config.get("run"), dict) else {}
+    resolved_perms = int(block.get("n_perms", _TUTORIAL_N_PERMS)) if n_perms is None else int(n_perms)
+    resolved_padj = (
+        float(block.get("padj_threshold", _TUTORIAL_PADJ))
+        if padj_threshold is None
+        else float(padj_threshold)
+    )
+    return {
+        "n_perms": resolved_perms,
+        "padj_threshold": resolved_padj,
+        "max_contrast_cells": int(block.get("max_contrast_cells", _DEFAULT_MAX_CONTRAST)),
+        "seed": int(runtime.get("seed", run.get("random_seed", 0))),
+    }
+
+
+def _estream_etest(
+    adata: AnnData,
+    *,
+    groupby: str,
+    contrast: str,
+    n_perms: int,
+    padj_threshold: float,
+    obsm_key: str,
+    seed: int,
+) -> pd.DataFrame:
+    """One-group-at-a-time E-test without pairwise N×N matrices."""
+    metric = Distance("edistance", obsm_key=obsm_key).metric_fct
+    embedding = np.asarray(adata.obsm[obsm_key], dtype=np.float64, order="C")
+    labels = adata.obs[groupby].astype(str).to_numpy()
+    contrast_idx = np.flatnonzero(labels == contrast)
+    if contrast_idx.size == 0:
+        raise ValueError(f"对照 {contrast} 在分析细胞里没有细胞。")
+    contrast_xy = embedding[contrast_idx]
+    groups = [str(name) for name in pd.unique(labels) if str(name) != contrast]
+    if not groups:
+        raise ValueError("没有可与对照比较的扰动组。")
+
+    distances = np.full(len(groups), np.nan, dtype=float)
+    pvalues = np.ones(len(groups), dtype=float)
+    for index, group in enumerate(groups):
+        group_idx = np.flatnonzero(labels == group)
+        if group_idx.size == 0:
+            continue
+        group_xy = embedding[group_idx]
+        observed = float(metric(group_xy, contrast_xy))
+        distances[index] = observed
+        combined = np.vstack((group_xy, contrast_xy))
+        n_group = int(group_xy.shape[0])
+        n_total = int(combined.shape[0])
+        rng = np.random.default_rng(_group_seed(seed, group))
+        n_extreme = 0
+        for _ in range(int(n_perms)):
+            order = rng.permutation(n_total)
+            permuted = float(metric(combined[order[:n_group]], combined[order[n_group:]]))
+            if permuted >= observed:
+                n_extreme += 1
+        pvalues[index] = max(n_extreme, 1) / float(n_perms)
+        del combined, group_xy
+
+    significant_adj, pvalue_adj, _, _ = multipletests(
+        pvalues, alpha=padj_threshold, method=_CORRECTION
+    )
+    tab = pd.DataFrame(
+        {
+            "distance": distances,
+            "pvalue": pvalues,
+            "significant": pvalues < padj_threshold,
+            "pvalue_adj": pvalue_adj,
+            "significant_adj": significant_adj,
+        },
+        index=pd.Index(groups, name=groupby),
+    )
+    tab.loc[contrast, "distance"] = 0.0
+    tab.loc[contrast, "pvalue"] = 1.0
+    tab.loc[contrast, "significant"] = False
+    tab.loc[contrast, "pvalue_adj"] = 1.0
+    tab.loc[contrast, "significant_adj"] = False
+    return tab
+
+
+def _group_seed(seed: int, group: str) -> int:
+    payload = f"{int(seed)}\0{group}".encode()
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, "little") % (2**31 - 1)
+
+
+def _subsample_contrast(
+    adata: AnnData,
+    *,
+    groupby: str,
+    contrast: str,
+    max_contrast_cells: int,
+    seed: int,
+    counts: dict[str, int],
+) -> tuple[AnnData, dict[str, int], str]:
+    """Cap huge temporary-control sets so E-test stays in memory/time budget."""
+    if max_contrast_cells <= 0:
+        return adata, counts, ""
+    labels = adata.obs[groupby].astype(str)
+    contrast_mask = labels.eq(contrast).to_numpy()
+    n_contrast = int(contrast_mask.sum())
+    if n_contrast <= int(max_contrast_cells):
+        return adata, counts, ""
+    rng = np.random.default_rng(int(seed))
+    keep_contrast = rng.choice(
+        np.flatnonzero(contrast_mask), size=int(max_contrast_cells), replace=False
+    )
+    keep = np.flatnonzero(~contrast_mask)
+    indices = np.sort(np.concatenate([keep, keep_contrast]))
+    view = adata[indices].copy()
+    kept = view.obs[groupby].astype(str)
+    updated = {str(name): int(count) for name, count in kept.value_counts().items()}
+    note = (
+        f"对照 {contrast} 从 {n_contrast} 细胞随机下采样到 {max_contrast_cells} "
+        f"（edistance.max_contrast_cells；seed={seed}），以控制 pairwise 置换内存与时间。"
+    )
+    print(f"  E-distance: {note}", flush=True)
+    return view, updated, note
+
+
 def _clear_edistance_skip_markers(figures: Path) -> None:
-    skipped = figures / "edistance_etest.skipped.txt"
-    if skipped.exists():
-        skipped.unlink()
+    for skipped in (
+        figures / "edistance_etest.skipped.txt",
+        figures / "figures" / "edistance_etest.skipped.txt",
+    ):
+        if skipped.exists():
+            skipped.unlink()
 
 
 def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
@@ -163,11 +325,10 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
         raise ValueError("E-test 表是空的，不能作图。")
     contrast = str(table["contrast"].iloc[0])
     plotted = table[table["group"].astype(str) != contrast].copy()
-    # Color by adjusted significance when present: matches padj_threshold in the table.
     hue_col = "significant_adj" if "significant_adj" in plotted.columns else "significant"
     plotted[hue_col] = _as_bool(plotted[hue_col])
     path.parent.mkdir(parents=True, exist_ok=True)
-    matplotlib.rcParams["font.sans-serif"] = ["Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
+    matplotlib.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
     matplotlib.rcParams["axes.unicode_minus"] = False
     figure, axis = plt.subplots(figsize=(7.2, 5.6))
     with sns.axes_style("darkgrid"):
@@ -179,7 +340,7 @@ def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
             palette={True: "green", False: "red"},
             ax=axis,
         )
-    shown = "zero-guide cells" if contrast == ZERO_GUIDE_LABEL else contrast
+    shown = "zero-guide" if contrast == ZERO_GUIDE_LABEL else contrast
     axis.set_title(f"E-test on expression X_pca vs {shown} (within-sample; not replicates)")
     axis.set_xlabel("within-sample p-value (cell permutation; not biological replicates)")
     axis.set_ylabel(f"E-distance to {shown}")
@@ -235,8 +396,12 @@ def _pca_view(
     embedding = np.asarray(adata.obsm[obsm_key][indices], dtype=np.float64)
     if embedding.ndim != 2 or embedding.shape[1] < 1:
         raise ValueError(f"{obsm_key} 不是可用的嵌入。")
+    # Slim AnnData: tiny X + labels + PCA (avoid copying the expression matrix).
     obs = pd.DataFrame({groupby: kept.to_numpy()})
-    view = AnnData(X=np.zeros((obs.shape[0], 1), dtype=np.float32), obs=obs)
+    view = AnnData(
+        X=np.zeros((obs.shape[0], 1), dtype=np.float32),
+        obs=obs,
+    )
     view.obsm[obsm_key] = embedding
     counts = {str(name): int(count) for name, count in kept.value_counts().items()}
     return view, counts
@@ -279,7 +444,7 @@ def _select_groups(
 
 
 def _output_dirs(output_dir: Path) -> tuple[Path, Path]:
-    figures = output_dir / "E-distance" / "figures"
+    figures = output_dir / "E-distance"
     tables = output_dir / "E-distance" / "tables"
     figures.mkdir(parents=True, exist_ok=True)
     tables.mkdir(parents=True, exist_ok=True)

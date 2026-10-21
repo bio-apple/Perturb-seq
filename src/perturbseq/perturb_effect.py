@@ -805,12 +805,14 @@ def write_descriptive_figures(
     store.skip("target_effect_forest", "see_wilcoxon_checkpoint")
     if effects is None:
         effects = _read_first(
+            output_dir / "DGE" / "tables" / "effect_main.tsv",
             output_dir / "DGE" / "descriptive" / "tables" / "effect_main.tsv",
             output_dir / "effect_main.tsv",
         )
     draw_descriptive_heatmap(store, effects)
     if direction is None:
         direction = _read_first(
+            output_dir / "DGE" / "tables" / "target_expression_effect.tsv",
             output_dir / "DGE" / "descriptive" / "tables" / "target_expression_effect.tsv",
             output_dir / "target_expression_effect.tsv",
             output_dir / "tables" / "target_expression.tsv",
@@ -818,6 +820,7 @@ def write_descriptive_figures(
     draw_target_expression(store, direction)
     if guides is None:
         guides = _read_first(
+            output_dir / "DGE" / "tables" / "guide_effects.tsv",
             output_dir / "DGE" / "descriptive" / "tables" / "guide_effects.tsv",
             output_dir / "guide_effects.tsv",
         )

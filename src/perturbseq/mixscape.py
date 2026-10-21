@@ -20,7 +20,7 @@ NOT_EVALUATED = "not_evaluated"
 
 # Seurat Mixscape vignette used CalcPerturbSig ndims=40; this pipeline keeps
 # preprocess PCA and signature width aligned at DEFAULT_SIGNATURE_NDIMS (30).
-# num.neighbors=20. RunMixscape omits logfc.threshold; function default is 0.25.
+# num.neighbors=20. Project |logFC| gate is 0.1 (Seurat function default was 0.25).
 # https://satijalab.org/seurat/articles/mixscape_vignette
 # https://satijalab.org/seurat/reference/runmixscape
 # DEFAULT_SIGNATURE_NDIMS is imported from config (re-exported for default checks).
@@ -33,10 +33,10 @@ def perturbation_type(config: dict[str, Any]) -> str:
 
 
 def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
-    """Mixscape classification thresholds from the Seurat vignette.
+    """Mixscape classification thresholds.
 
-    ``logfc_threshold`` defaults to RunMixscape / MixscapeHeatmap's 0.25.
-    Mixscale's 0.2 cutoff is not read here. ``fine_mode`` stays off.
+    ``logfc_threshold`` project default is 0.1 (|logFC|≥0.1). Mixscale's
+    cutoff is not read here. ``fine_mode`` stays off.
     """
     mix = config.get("mixscape", {})
     perturb = config.get("perturb", {})
@@ -46,7 +46,7 @@ def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
         perturb = {}
     return {
         "min_de_genes": int(mix.get("min_de_genes", perturb.get("mixscape_min_de_genes", 5))),
-        "logfc_threshold": float(mix.get("logfc_threshold", perturb.get("mixscape_logfc", 0.25))),
+        "logfc_threshold": float(mix.get("logfc_threshold", perturb.get("mixscape_logfc", 0.1))),
         "pval_cutoff": float(mix.get("pval_cutoff", perturb.get("mixscape_pval", 0.05))),
         "max_de_genes": int(mix.get("max_de_genes", 100)),
         "fine_mode": False,
@@ -406,7 +406,7 @@ def write_mixscape_figures(
         max_genes=int(plotting.get("mixscape_heatmap_max_genes", 20)),
         max_cells=int(plotting.get("mixscape_heatmap_max_cells", 300)),
         pval_cutoff=float(config.get("mixscape", {}).get("pval_cutoff", 0.05)),
-        lfc_line=float(config.get("mixscape", {}).get("logfc_threshold", 0.25)),
+        lfc_line=float(config.get("mixscape", {}).get("logfc_threshold", 0.1)),
     )
     draw_target_de_counts(
         store,

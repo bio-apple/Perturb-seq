@@ -27,17 +27,17 @@ VIGNETTE_CONTROL_NEIGHBORS = 20
 
 
 def de_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
-    """Thresholds the Mixscale tutorial passes to ``RunMixscale``.
+    """Thresholds passed to Mixscale DE gate / ``RunMixscale``.
 
-    The tutorial calls ``min.de.genes = 5``, ``logfc.threshold = 0.2``,
-    ``max.de.genes = 100``, and ``fine.mode = F``, with ``split.by = NULL``.
-    ``pval.cutoff`` is omitted there; the function default is 0.05.
-    Mixscape's own log fold-change is not read here.
+    Project default ``logfc_threshold`` is 0.1 (|logFC|≥0.1); the Mixscale
+    tutorial originally used 0.2. Also ``min.de.genes = 5``,
+    ``max.de.genes = 100``, ``fine.mode = F``, ``split.by = NULL``.
+    ``pval.cutoff`` default is 0.05. Mixscape's log fold-change is not read.
     """
     mix = config.get("mixscale", {})
     return {
         "min_de_genes": int(mix.get("min_de_genes", 5)),
-        "logfc_threshold": float(mix.get("logfc_threshold", 0.2)),
+        "logfc_threshold": float(mix.get("logfc_threshold", 0.1)),
         "pval_cutoff": float(mix.get("pval_cutoff", 0.05)),
         "max_de_genes": int(mix.get("max_de_genes", 100)),
         "fine_mode": False,
