@@ -1,7 +1,7 @@
 # 分析软件默认参数。
 # 步骤：io → assign → preprocess → {dge ‖ mixscape ‖ mixscale} → perturb。
 # dge / mixscape / mixscale 互不依赖（均只依赖 preprocess）；≥2 步时进程池并发。
-# 图目录：Mixscape/、mixscale/、DGE/、E-distance/、qc/、UMAP/；Wilcoxon 表在 checkpoints/dge.h5ad。
+# 图目录：Mixscape/、mixscale/、DGE/、E-distance/、qc/、UMAP/。成功结束后磁盘只保留 PNG。
 # 参考：pertpy WilcoxonTest；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
 # 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
@@ -109,7 +109,7 @@ plotting:
   scatter_max_points: 50000
   volcano_lfc: 1.0
   heatmap_max_genes: 50
-  # false：不写图旁 plot_data/*.tsv；流水线结束还会清理非 checkpoint / 非 PNG 产物。
+  # false：不写图旁 plot_data/*.tsv；流水线结束还会清理非 PNG 产物。
   save_plot_data: false
   palette:
     nt: '#7F7F7F'
@@ -125,3 +125,5 @@ run:
   random_seed: 0
 runtime:
   seed: 0
+  # 默认 max(1, CPU数//3)；控制 OpenMP/BLAS/scanpy.n_jobs 与并行步 ProcessPool 上限。
+  # n_threads: 4

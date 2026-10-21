@@ -1,4 +1,4 @@
-"""Lean output policy: keep checkpoints and PNGs only."""
+"""Lean output policy: keep PNGs only."""
 
 from __future__ import annotations
 
@@ -7,30 +7,22 @@ from pathlib import Path
 
 
 def is_kept_output(path: Path, root: Path) -> bool:
-    """True for checkpoints/*.h5ad and any PNG under the output root."""
+    """True for any PNG under the output root."""
     try:
-        relative = path.resolve().relative_to(root.resolve())
+        path.resolve().relative_to(root.resolve())
     except ValueError:
         return False
-    if not path.is_file():
-        return False
-    suffix = path.suffix.lower()
-    if suffix == ".png":
-        return True
-    if suffix == ".h5ad" and relative.parts and relative.parts[0] == "checkpoints":
-        return True
-    return False
+    return path.is_file() and path.suffix.lower() == ".png"
 
 
 def cleanup_lean_outputs(
     folder: Path, *, protect: Iterable[Path] | None = None
 ) -> int:
-    """Delete pipeline products that are neither checkpoints nor PNGs.
+    """Delete pipeline products that are not PNGs.
 
     ``protect`` paths (e.g. DRAGEN inputs when ``--output-dir`` equals
     ``--input-dir``) are never removed. Does not touch paths outside
-    ``folder``. Returns the number of files removed. Empty directories left
-    behind (except ``checkpoints/``) are pruned.
+    ``folder``. Returns the number of files removed. Empty directories are pruned.
     """
     root = Path(folder)
     if not root.is_dir():
@@ -46,15 +38,13 @@ def cleanup_lean_outputs(
             continue
         path.unlink(missing_ok=True)
         removed += 1
-    _prune_empty_dirs(root, keep_named={"checkpoints"})
+    _prune_empty_dirs(root)
     return removed
 
 
-def _prune_empty_dirs(root: Path, *, keep_named: set[str]) -> None:
+def _prune_empty_dirs(root: Path) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         if not path.is_dir():
-            continue
-        if path.name in keep_named and path.parent.resolve() == root.resolve():
             continue
         try:
             next(path.iterdir())

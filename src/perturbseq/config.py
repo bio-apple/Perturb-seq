@@ -303,7 +303,7 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "palette": _ANY_KEYS,
     },
     "run": {"random_seed": None, "output_dir": None},
-    "runtime": {"seed": None},
+    "runtime": {"seed": None, "n_threads": None},
 }
 
 
@@ -920,6 +920,60 @@ def _validate_statistics(statistics: dict[str, Any]) -> None:
     statistics["bootstrap_ci"] = float(level)
 
 
+def default_n_threads() -> int:
+    """Host CPU budget: one third of logical CPUs, at least 1."""
+    import os
+
+    detected = os.cpu_count() or 1
+    return max(1, int(detected) // 3)
+
+
+def resolve_n_threads(config: dict[str, Any] | None = None) -> int:
+    """Return ``runtime.n_threads`` after normalization (falls back to one-third CPUs)."""
+    if not isinstance(config, dict):
+        return default_n_threads()
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    value = runtime.get("n_threads")
+    if value is None:
+        return default_n_threads()
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("runtime.n_threads 必须是正整数。") from exc
+    if n < 1:
+        raise ConfigError("runtime.n_threads 必须是正整数。")
+    return n
+
+
+def apply_thread_budget(config: dict[str, Any] | None = None) -> int:
+    """Cap BLAS / OpenMP / scanpy / R-inherited env threads to ``runtime.n_threads``.
+
+    Call once in the parent process and again at the start of each parallel worker.
+    Returns the resolved thread count.
+    """
+    import os
+
+    n = resolve_n_threads(config)
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[key] = str(n)
+    # R / Bioconductor SingleR subprocess inherits these env vars.
+    os.environ["R_THREADS"] = str(n)
+    try:
+        import scanpy as sc
+
+        sc.settings.n_jobs = n
+    except Exception:
+        pass
+    return n
+
+
 def _normalize_runtime(config: dict[str, Any]) -> None:
     run = config.get("run") if isinstance(config.get("run"), dict) else {}
     output = config.get("output") if isinstance(config.get("output"), dict) else {}
@@ -928,8 +982,18 @@ def _normalize_runtime(config: dict[str, Any]) -> None:
     if not isinstance(output_path, str) or not output_path.strip():
         raise ConfigError("必须填写 output.output_dir 或 run.output_dir。")
     seed = runtime.get("seed", run.get("random_seed", 0))
+    n_threads = runtime.get("n_threads")
+    if n_threads is None:
+        n_threads = default_n_threads()
+    else:
+        try:
+            n_threads = int(n_threads)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("runtime.n_threads 必须是正整数。") from exc
+        if n_threads < 1:
+            raise ConfigError("runtime.n_threads 必须是正整数。")
     config["output"] = {**output, "output_dir": output_path}
-    config["runtime"] = {**runtime, "seed": seed}
+    config["runtime"] = {**runtime, "seed": seed, "n_threads": n_threads}
 
 
 def _section(config: dict[str, Any], name: str) -> dict[str, Any]:

@@ -213,6 +213,7 @@ def run_wilcoxon_de(adata: AnnData, config: dict[str, Any]) -> tuple[pd.DataFram
     table = (
         pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=WILCOXON_COLUMNS)
     )
+    table = compact_wilcoxon_frame(table)
     status = pd.DataFrame(statuses)
     n_log_fc = int(len(table)) if not table.empty else 0
     n_log_fc_na = (
@@ -236,6 +237,20 @@ def run_wilcoxon_de(adata: AnnData, config: dict[str, Any]) -> tuple[pd.DataFram
         ),
     }
     return table, status
+
+
+def compact_wilcoxon_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Category-encode repeated string columns to shrink h5ad / memory for ~n_genes×n_targets tables."""
+    if frame is None or frame.empty:
+        return frame
+    out = frame.copy()
+    for column in out.columns:
+        series = out[column]
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            continue
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            out[column] = series.astype("category")
+    return out
 
 
 def _sanitize_wilcoxon_log_fc(frame: pd.DataFrame) -> pd.DataFrame:

@@ -800,9 +800,9 @@ def write_descriptive_figures(
 
     output_dir = Path(output_dir)
     store = open_figure_store(output_dir, config, None)
-    # Cell-level Wilcoxon lives in the dge checkpoint; not a biological-replicate volcano.
-    store.skip("volcano", "see_wilcoxon_checkpoint")
-    store.skip("target_effect_forest", "see_wilcoxon_checkpoint")
+    # Cell-level Wilcoxon is computed in the dge step (no separate volcano PNG).
+    store.skip("volcano", "wilcoxon_in_dge_step")
+    store.skip("target_effect_forest", "wilcoxon_in_dge_step")
     if effects is None:
         effects = _read_first(
             output_dir / "DGE" / "tables" / "effect_main.tsv",

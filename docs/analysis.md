@@ -30,7 +30,9 @@
 io → assign → preprocess → { dge ‖ mixscape ‖ mixscale } → perturb
 ```
 
-`dge` / `mixscape` / `mixscale` 只依赖 `preprocess`，彼此无边；同一次 `run` 里只要这三者中有 **≥2 个** 待跑，就会用进程池**并发**执行（各进程只读 `checkpoints/preprocess.h5ad`，写各自目录与 checkpoint）。仅指定其中一步时仍串行。`perturb` 在三者之后：以 preprocess 为底，按需合并已有的 `mixscape.h5ad` 标签 / `dge.h5ad` 的 Wilcoxon `uns`（sensitivity 分支需要 Mixscape；Mixscale 不并入 perturb）。
+`dge` / `mixscape` / `mixscale` 只依赖 `preprocess`，彼此无边；同一次 `run` 里只要这三者中有 **≥2 个** 待跑，就会用进程池**并发**执行（各进程读临时 preprocess 副本，写各自 PNG 目录；进程间用临时目录交换，**不**写出 `checkpoints/`）。仅指定其中一步时仍串行。`perturb` 在三者之后：以 preprocess 为底，合并本轮 Mixscape 标签与 Wilcoxon `uns`（sensitivity 需要 Mixscape；Mixscale 不并入 perturb）。
+
+不支持 `--resume` / 不落盘 h5ad：`--steps` 须从 `io` 起连续跑（通常 `--steps all`）。
 
 ### 数据分析流程图
 
@@ -38,66 +40,59 @@ io → assign → preprocess → { dge ‖ mixscape ‖ mixscale } → perturb
 flowchart TD
   IN["输入<br/>matrix / barcodes / features<br/>feature_barcode_reference<br/>positive_cell_guide_assignments"] --> IO
 
-  IO["io<br/>读入 + barcode 校验"] --> CP_IO["checkpoint<br/>io.h5ad"]
-  CP_IO --> ASG
+  IO["io<br/>读入 + barcode 校验"] --> ASG
 
   ASG["assign<br/>QC · 资格过滤 · 对照解析"] --> CTRL{"对照"}
   CTRL -->|"--nt-control 且数据中有可用 NT 细胞"| NT["设计 NT"]
   CTRL -->|"未指定，或指定了但无可用 NT 细胞"| ZG["临时 zero_guide"]
-  NT --> CP_ASG
-  ZG --> CP_ASG["checkpoint<br/>assign.h5ad"]
-  CP_ASG --> PRE
+  NT --> PRE
+  ZG --> PRE
 
-  PRE["preprocess<br/>归一化 · HVG · PCA/neighbors<br/>Leiden/UMAP · 可选 Harmony/细胞周期"] --> CP_PRE["checkpoint<br/>preprocess.h5ad"]
-  CP_PRE --> PAR
+  PRE["preprocess<br/>归一化 · HVG · PCA/neighbors<br/>Leiden/UMAP · 可选 Harmony/细胞周期"] --> PAR
 
-  subgraph PAR["并行（≥2 步时 ProcessPool）"]
+  subgraph PAR["并行（≥2 步时 ProcessPool；受 runtime.n_threads 上限）"]
     DGE["dge<br/>pertpy WilcoxonTest"]
     MX["mixscape<br/>Seurat Mixscape vignette"]
     MS["mixscale<br/>satijalab Mixscale<br/>自算 X_pert_mixscale"]
   end
 
-  DGE --> CP_DGE["checkpoint dge.h5ad"]
-  CP_DGE --> OUT_W["wilcoxon uns"]
-  MX --> CP_MX["checkpoint mixscape.h5ad"]
-  CP_MX --> OUT_MX["Mixscape/<br/>layer X_pert"]
-  MS --> CP_MS["checkpoint mixscale.h5ad"]
-  CP_MS --> OUT_MS["mixscale/"]
+  DGE --> OUT_W["内存 wilcoxon uns"]
+  MX --> OUT_MX["Mixscape/<br/>layer X_pert"]
+  MS --> OUT_MS["mixscale/"]
 
-  CP_PRE --> PT
-  CP_MX -.->|"合并 mixscape 标签"| PT
-  CP_DGE -.->|"合并 wilcoxon uns"| PT
-  PT["perturb<br/>描述性 CPM · E-test"] --> CP_PT["checkpoint perturb.h5ad"]
-  CP_PT --> OUT_DGE["DGE/"]
-  CP_PT --> OUT_ED["E-distance/"]
-  CP_PT --> OUT["checkpoints/*.h5ad + **/*.png"]
+  PRE --> PT
+  MX -.->|"合并 mixscape 标签"| PT
+  DGE -.->|"合并 wilcoxon uns"| PT
+  PT["perturb<br/>描述性 CPM · E-test"] --> OUT_DGE["DGE/"]
+  PT --> OUT_ED["E-distance/"]
+  PT --> OUT["**/*.png only"]
 ```
 
-| 步骤 | 作用 | 输出目录 | checkpoint |
-| --- | --- | --- | --- |
-| `io` | 读入矩阵 / 参考 / 分配 | — | `io.h5ad`（含 `uns['cell_calls']`） |
-| `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/` | `assign.h5ad` |
-| `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` | `preprocess.h5ad` |
-| `dge` | pertpy `WilcoxonTest`（与另两者独立；无独立 PNG；表在 checkpoint） | — | `dge.h5ad` |
-| `mixscape` | Seurat Mixscape：分类 + `X_pert`；写出 Mixscape / 相关 UMAP | **`Mixscape/`**、`UMAP/` | `mixscape.h5ad` |
-| `mixscale` | Mixscale：自算签名 + 分数；写出 ridge / scatter | **`mixscale/`** | `mixscale.h5ad` |
-| `perturb` | 描述性效应、E-test；写出描述性图与 E-test 图 | `DGE/`、`E-distance/` | `perturb.h5ad` |
+| 步骤 | 作用 | 输出目录 |
+| --- | --- | --- |
+| `io` | 读入矩阵 / 参考 / 分配（账本在内存） | — |
+| `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/` |
+| `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` |
+| `dge` | pertpy `WilcoxonTest`（与另两者独立；无独立 PNG） | — |
+| `mixscape` | Seurat Mixscape：分类 + `X_pert`；写出 Mixscape / 相关 UMAP | **`Mixscape/`**、`UMAP/` |
+| `mixscale` | Mixscale：自算签名 + 分数；写出 ridge / scatter | **`mixscale/`** |
+| `perturb` | 描述性效应、E-test；写出描述性图与 E-test 图 | `DGE/`、`E-distance/` |
 
-图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `checkpoints/*.h5ad` 与 `**/*.png`（细节见 [outputs.md](outputs.md)）。
+图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `**/*.png`（细节见 [outputs.md](outputs.md)）。
 
 ### 并行触发与限制
 
 | 情形 | 行为 |
 | --- | --- |
 | `--steps all`（默认） | preprocess 之后三步并发，再跑 perturb |
-| `--steps dge,mixscape,mixscale`（或其中任意 ≥2 个） | 遇到第一个并行步时，把列表里尚未跑的 `dge`/`mixscape`/`mixscale` 一并并发 |
-| 只指定三者之一 | 单进程串行（无进程池开销） |
-| `--steps perturb --resume` | 读 `preprocess.h5ad`，合并已有 dge/mixscape checkpoint 后跑 perturb |
-| 共享输入 | 各 worker **只读** `checkpoints/preprocess.h5ad` |
-| 输出隔离 | `dge`→`dge.h5ad`；`mixscape`→`Mixscape/` + `mixscape.h5ad`；`mixscale`→`mixscale/` + `mixscale.h5ad`；日志带 `[step]` 前缀，可能交错 |
-| 资源 | 三进程各载一份 preprocess，峰值内存约 ×3；matplotlib 用 `Agg` |
+| `--steps` 含 ≥2 个 `dge`/`mixscape`/`mixscale` 且从 `io` 连续跑到该处 | 一并并发 |
+| 只指定三者之一（仍须从 `io` 起） | 单进程串行 |
+| 共享输入 | 各 worker 读**临时** preprocess.h5ad（非输出目录） |
+| 输出隔离 | `mixscape`→`Mixscape/`；`mixscale`→`mixscale/`；日志带 `[step]` 前缀，可能交错 |
+| 线程 | 默认 `runtime.n_threads = max(1, CPU//3)`；限制 OpenMP/BLAS/`scanpy.n_jobs` 与 ProcessPool `max_workers` |
+| 资源 | 并发时峰值内存约 ×3；matplotlib 用 `Agg` |
 
-`dge` / `mixscape` / `mixscale` 均可单独 `--steps <名> --resume`（只依赖 `preprocess`）。`preprocess.n_pcs` 与 `mixscape.n_dims` 须同为 30。
+`preprocess.n_pcs` 与 `mixscape.n_dims` 须同为 30。
 
 ---
 
@@ -111,8 +106,7 @@ flowchart TD
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`，默认 `KO` |
-| `--steps` | 见上；逗号分隔子集；含 ≥2 个 `dge`/`mixscape`/`mixscale` 时并发 |
-| `--resume` | 从上一 checkpoint 继续 |
+| `--steps` | 见上；须从 `io` 起；含 ≥2 个 `dge`/`mixscape`/`mixscale` 时并发 |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
@@ -164,7 +158,7 @@ flowchart TD
 
 ## 对照
 
-单一来源：`control_spec(config)`。`assign` 用账本调用 `resolve_control_spec` 写入 `config['control']`、`adata.uns`；后续 dge / Mixscape / Mixscale / perturb 只读该解析结果（`--resume` 从 checkpoint 的 `uns` 恢复）。
+单一来源：`control_spec(config)`。`assign` 用账本调用 `resolve_control_spec` 写入 `config['control']`、`adata.uns`；后续 dge / Mixscape / Mixscale / perturb 只读该解析结果（同一次运行内存传递）。
 
 ### 设计 NT
 
@@ -223,7 +217,7 @@ QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount �
 
 ### gRNA 捕获
 
-效率 = CRISPR guide UMI 合计 / Gene Expression `total_counts`（guide UMI 为 0 则效率为 0）。Spearman（QC 前全部细胞）记入 `assign` checkpoint 的 `qc_thresholds.grna_capture_library_correlation`（此 p 不进效应表）。
+效率 = CRISPR guide UMI 合计 / Gene Expression `total_counts`（guide UMI 为 0 则效率为 0）。Spearman（QC 前全部细胞）记入 `adata.uns['qc_thresholds'].grna_capture_library_correlation`（此 p 不进效应表）。
 
 ### `low_library_no_guide`
 
@@ -285,7 +279,7 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 
 两侧计数都为 0 → `log2fc_descriptive` 缺失，`effect_status=not_detected_both`。
 
-| 表（在 `checkpoints/perturb.h5ad` 的 `uns`） | 分支 |
+| 表（`perturb` 步内存 `adata.uns`；图在 `DGE/`） | 分支 |
 | --- | --- |
 | `effect_main` | 全部可分析细胞 |
 | `effect_sensitivity` | Mixscape `perturbed` + 同一批对照 |
@@ -320,11 +314,11 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 | 对比 | 每个 `target_gene` vs 当前对照（`control_spec`：设计 NT 或临时 `zero_guide`） |
 | `log_fc` | pertpy：`log2(mean_log1p_g1) - log2(mean_log1p_g0)`，**无** pseudocount；零均值 → ±inf/NaN，写出前改为 NA（p 值不动）。**不是** counts 空间的 log2FC |
 | 与 Mixscape | **独立**：不读 `mixscape_status` / `X_pert`；Mixscape 自有 DE 门槛只服务分类 |
-| 输出 | `checkpoints/dge.h5ad`（`wilcoxon_de_results` / `wilcoxon_de_status`） |
+| 输出 | 内存 `wilcoxon_de_status` / meta（全基因表不落盘）；无独立 PNG |
 
 > **警示**：单生物学样本下细胞不是独立生物学重复；`p_value` / `adj_p_value` 是细胞级秩和检验，不能当作多样本组间 FDR。
 
-可单独重跑：`--steps dge --resume`。
+随 `--steps all`（从 `io` 起）一并运行。
 
 ---
 
@@ -335,7 +329,7 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 | | Mixscape | Mixscale | Wilcoxon (`dge`) |
 | --- | --- | --- | --- |
 | 参考 | [Mixscape vignette](https://satijalab.org/seurat/articles/mixscape_vignette) | [Mixscale](https://satijalab.github.io/Mixscale/) | [pertpy WilcoxonTest](https://pertpy.scverse.org/en/stable/tutorials/notebooks/differential_gene_expression.html) |
-| 输出目录 | `Mixscape/` | `mixscale/` | `checkpoints/dge.h5ad` |
+| 输出目录 | `Mixscape/` | `mixscale/` | （无独立 PNG） |
 | 签名层 | `X_pert` | `X_pert_mixscale` | — |
 | `logfc_threshold`（\|logFC\|） | **0.1** | **0.1** | — |
 | `min_de_genes` | 5 | 5 | — |
@@ -344,7 +338,7 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 
 Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscale 假分数 `1` 置缺失。
 
-**无 ridge / scatter**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` 记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。查 `mixscale.h5ad` 的 `uns['mixscale_de_gate']`，再决定是否调 `mixscale.logfc_threshold` / `min_de_genes`。
+**无 ridge / scatter**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` 记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。可调 `mixscale.logfc_threshold` / `min_de_genes`。
 
 > **口径**：三者独立；KO/NP 与 Mixscale 分数都不是生物学重复推断；Wilcoxon p 为细胞级。
 
@@ -407,13 +401,13 @@ PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**�
 
 实现用 pertpy 的 energy-distance 统计量，但**不**物化 N×N pairwise 矩阵（按组流式置换）。`edistance.n_perms` 默认 1000；超大对照（常见于临时 zero-guide）按 `edistance.max_contrast_cells`（默认 4000）随机下采样。
 
-结果表在 `checkpoints/perturb.h5ad` 的 `uns['edistance_etest']`；图为 `E-distance/edistance_etest.png`。
+图为 `E-distance/edistance_etest.png`。
 
 ---
 
 ## 靶基因表达
 
-`uns['target_expression_effect']`（`perturb.h5ad`）：靶基因自身 RNA 的描述性 CPM log2FC。
+`uns['target_expression_effect']`（`perturb` 步内存）：靶基因自身 RNA 的描述性 CPM log2FC；图在 `DGE/`。
 
 | `target_expression_status` | 原因 |
 | --- | --- |

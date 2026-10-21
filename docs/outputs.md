@@ -6,18 +6,16 @@
 
 | 保留 | 说明 |
 | --- | --- |
-| `checkpoints/*.h5ad` | `--resume` 所需；表 / 门槛 / 效应等在对应 checkpoint 的 `uns` |
 | `**/*.png` | 各步分析目录下的 PNG（直接写在目录根，如 `qc/*.png`、`DGE/*.png`） |
 
-跑程中可能短暂写出 TSV / JSON / YAML 等中间文件；结束时的 lean cleanup 只留下上述两类。`--validate-only` 不做 cleanup（校验文件留在输出目录）。
+跑程中可能短暂写出 TSV / JSON / YAML 等中间文件；结束时的 lean cleanup 只留下 PNG。`--validate-only` 不做 cleanup（校验文件留在输出目录）。不写出 `checkpoints/*.h5ad`，不支持 `--resume`；需从 `io` 起连续运行（通常 `--steps all`）。
 
 判定规则见 [analysis.md](analysis.md)。
 
 ## 目录
 
 1. [目录结构](#目录结构)
-2. [Checkpoint 里有什么](#checkpoint-里有什么)
-3. [各步写出的图](#各步写出的图)
+2. [各步写出的图](#各步写出的图)
 
 ---
 
@@ -25,7 +23,6 @@
 
 | 目录 | 内容 |
 | --- | --- |
-| `checkpoints/` | 逐步 `*.h5ad`（resume + 表格数据） |
 | `qc/` | assign / preprocess QC 图 |
 | `UMAP/` | 表达 UMAP、簇注释、细胞周期；Mixscape signature UMAP |
 | `Mixscape/` | Mixscape 图 |
@@ -33,31 +30,13 @@
 | `DGE/` | 描述性效应图 |
 | `E-distance/` | E-test 散点 |
 
-`dge` / `mixscape` / `mixscale` 互不依赖；Wilcoxon 结果只在 `checkpoints/dge.h5ad`（无独立 PNG 桶）。
-
----
-
-## Checkpoint 里有什么
-
-| 文件 | 关键 `uns` / 用途 |
-| --- | --- |
-| `checkpoints/io.h5ad` | `cell_calls`（完整注释账本，供 `--steps assign --resume`） |
-| `checkpoints/assign.h5ad` | `qc_thresholds`、`cells_per_target`、对照字段 |
-| `checkpoints/preprocess.h5ad` | 归一化 / PCA / UMAP / Leiden 等 |
-| `checkpoints/dge.h5ad` | `wilcoxon_de_results`、`wilcoxon_de_status` |
-| `checkpoints/mixscape.h5ad` | `mixscape_de_gate`、`mixscape_summary`、分类与 `X_pert` |
-| `checkpoints/mixscale.h5ad` | `mixscale_de_gate`、分数与 `X_pert_mixscale` |
-| `checkpoints/perturb.h5ad` | `effect_*`、`guide_effects`、`target_expression_effect`、`edistance_etest` 等 |
-
-需要完整对象时读最新相关 checkpoint（通常 `perturb.h5ad`）。`assign --resume` 依赖 `io.h5ad` 的 `uns['cell_calls']`；缺失时请重跑 `io`。
+`dge` / `mixscape` / `mixscale` 互不依赖；Wilcoxon（`dge`）无独立 PNG。并行步之间用**临时目录**交换 AnnData，跑完即删，不落盘到输出目录。
 
 ---
 
 ## 各步写出的图
 
 跳过原因只打日志 / 记在内存。`plotting.save_plot_data` 默认 `false`（不写图旁 TSV）。
-
-刷新某类图：对该步 `--steps <名> --resume`。
 
 ### assign → `qc/`
 
@@ -98,5 +77,5 @@
 | 路径 | 内容 |
 | --- | --- |
 | `DGE/de_gene_heatmap.png` | 描述性 log2FC |
-| `DGE/target_expression_effect.png`、`guide_consistency.png` | 靶基因 / guide |
-| `E-distance/edistance_etest.png` | E-test 散点 |
+| `DGE/guide_consistency.png`、`target_expression_effect.png` | guide / 靶基因自身表达 |
+| `E-distance/edistance_etest.png` | 细胞级 E-test |

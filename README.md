@@ -2,7 +2,9 @@
 
 从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 与扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
 
-步骤：`io` → `assign` → `preprocess` → `{dge ‖ mixscape ‖ mixscale}` → `perturb`。后三者只依赖 preprocess、互不依赖；默认全量跑时在 preprocess 之后**进程池并发**，再跑 perturb。图分目录 `Mixscape/`、`mixscale/` 等。各分析步结束时写出对应 PNG。成功跑完后磁盘只保留 `checkpoints/*.h5ad` 与 PNG。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
+步骤：`io` → `assign` → `preprocess` → `{dge ‖ mixscape ‖ mixscale}` → `perturb`。后三者只依赖 preprocess、互不依赖；默认全量跑时在 preprocess 之后**进程池并发**，再跑 perturb。图分目录 `Mixscape/`、`mixscale/` 等。各分析步结束时写出对应 PNG。成功跑完后磁盘**只保留 PNG**（不写 `checkpoints/`，不支持 `--resume`；须从 `io` 连续跑）。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
+
+线程默认：`runtime.n_threads = max(1, CPU数//3)`，用于 OpenMP / BLAS / `scanpy.n_jobs` 与并行步进程数上限。
 
 ## 环境搭建
 
@@ -38,17 +40,16 @@ python -m perturbseq \
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
-| `--steps` | 默认 `all`（preprocess 后三步并行）；可逗号子集，如 `mixscape --resume`；子集里含 ≥2 个 `dge`/`mixscape`/`mixscale` 时同样并行 |
+| `--steps` | 默认 `all`（须从 `io` 起；preprocess 后三步并行） |
 | 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
 | QC 指标 | `nCount` / `nFeature` / `percent.mt`（`nCount` 只作图，不按 UMI 绝对阈值过滤细胞） |
 
 ## 输出概览
 
-成功结束后保留 **`checkpoints/*.h5ad`** 与各步 PNG。表与门槛等在对应 checkpoint 的 `uns`；图按步骤落在下列目录：
+成功结束后只保留各步 PNG：
 
 | 目录 | 内容 |
 | --- | --- |
-| `checkpoints/` | 逐步 `*.h5ad`（含表 / 门槛 / 效应等 `uns`） |
 | `qc/` | mRNA / gRNA / QC 统计图 |
 | `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
 | `Mixscape/` | Mixscape class / 2x2 / fraction 等 |
@@ -56,4 +57,4 @@ python -m perturbseq \
 | `DGE/` | 描述性 CPM log2FC 相关图 |
 | `E-distance/` | 细胞级 E-test |
 
-Wilcoxon（`dge`）无独立 PNG；结果在 `checkpoints/dge.h5ad`。图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。
+Wilcoxon（`dge`）无独立 PNG。图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。

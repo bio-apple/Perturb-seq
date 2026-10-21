@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import platform
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.metadata import PackageNotFoundError, version
@@ -39,18 +40,20 @@ from perturbseq.config import (
     TEMPORARY_CONTROL_WARNING,
     ConfigError,
     apply_customer_arguments,
+    apply_thread_budget,
     control_spec,
     mito_prefix,
     output_dir,
     read_config,
     resolve_control_spec,
     resolve_input_paths,
+    resolve_n_threads,
     restore_control_spec,
     software_config_path,
     validate_config,
     verify_species_consistency,
 )
-from perturbseq.differential_expression import run_wilcoxon_de
+from perturbseq.differential_expression import compact_wilcoxon_frame, run_wilcoxon_de
 from perturbseq.distance_tests import write_edistance_results
 from perturbseq.io import (
     InputMismatch,
@@ -78,7 +81,7 @@ STEPS = [
     "mixscale",
     "perturb",
 ]
-# After preprocess these three only read preprocess.h5ad and write disjoint products.
+# After preprocess these three only read preprocess AnnData and write disjoint PNG dirs.
 PARALLEL_ANALYSIS_STEPS = ("dge", "mixscape", "mixscale")
 PACKAGES = [
     "perturbseq",
@@ -139,7 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-mito-frac",
         type=float,
         default=None,
-        help="线粒体 reads 比例上限，0 到 1。细胞 ≥ 该值时剔除。默认读配置（0.2 = 20%）。",
+        help="线粒体 reads 比例上限，0 到 1。细胞 ≥ 该值时剔除。默认读配置（0.2 = 20%%）。",
     )
     parser.add_argument(
         "--min-genes",
@@ -153,8 +156,11 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="表达基因数上限。细胞 n_genes ≥ 该值时剔除。默认读配置（6000）。",
     )
-    parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--steps",
+        default="all",
+        help="all, or a comma-separated subset starting from io (no checkpoints / --resume)",
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     config_path = args.config or software_config_path()
@@ -195,14 +201,19 @@ def main(argv: list[str] | None = None) -> None:
     unknown = [step for step in steps if step not in STEPS]
     if unknown:
         raise SystemExit(f"未知步骤: {', '.join(unknown)}")
-    run(config, steps, resume=args.resume)
+    run(config, steps)
 
 
-def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
+def run(config: dict[str, Any], steps: list[str]) -> None:
     folder = output_dir(config)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "tables").mkdir(exist_ok=True)
-    (folder / "checkpoints").mkdir(exist_ok=True)
+    if steps and steps[0] != "io":
+        raise SystemExit(
+            "已不再写出 checkpoints / 不支持 --resume："
+            f"请从 io 起连续运行（当前首步为 {steps[0]}；可用 --steps all）。"
+        )
+    n_threads = apply_thread_budget(config)
+    print(f"  runtime.n_threads={n_threads} (host/3 default; BLAS/OpenMP/scanpy)", flush=True)
     _record_species(folder, config)
     seed = int(config["runtime"]["seed"])
     np.random.seed(seed)
@@ -227,16 +238,6 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
         }
     )
     state: dict[str, Any] = {"adata": None, "preprocess_adata": None}
-    if resume:
-        state["adata"] = _load_resume(folder, steps[0])
-        if state["adata"] is not None:
-            restore_control_spec(config, state["adata"])
-            info.update(_control_summary(config, state["adata"]))
-        if steps[0] in PARALLEL_ANALYSIS_STEPS or steps[0] == "perturb":
-            pre_path = folder / "checkpoints" / "preprocess.h5ad"
-            if pre_path.exists():
-                state["preprocess_adata"] = sc.read_h5ad(pre_path)
-                restore_control_spec(config, state["preprocess_adata"])
     started = time.time()
     # Provisional until assign resolves from the ledger (may fall back to zero_guide).
     info["temporary_control_warning"] = _publish_temporary_control_warning(folder, config)
@@ -249,13 +250,14 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             for name in batch:
                 remaining.remove(name)
             print(
-                f"[parallel] {', '.join(batch)} (shared read-only preprocess checkpoint)",
+                f"[parallel] {', '.join(batch)} (in-memory preprocess; temp IPC only)",
                 flush=True,
             )
             step_started = time.time()
-            preprocess_adata = _ensure_preprocess_adata(state, folder, config)
-            timings = _run_parallel_analysis(folder, config, batch)
-            state["adata"] = _merge_post_preprocess_products(folder, preprocess_adata)
+            preprocess_adata = _ensure_preprocess_adata(state, config)
+            timings, state["adata"] = _run_parallel_analysis(
+                folder, config, batch, preprocess_adata
+            )
             wall = round(time.time() - step_started, 3)
             for name in batch:
                 info.setdefault("steps", {})[name] = {
@@ -278,23 +280,23 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             info["input_validation"] = validation
             info["n_matrix_only_as_no_guide"] = validation.get("n_matrix_only_as_no_guide", 0)
         elif step == "assign":
-            state["adata"] = _require(state, folder, "io")
+            state["adata"] = _require(state, "io")
             state["adata"] = _step_assign(folder, config, state["adata"])
             info.update(_control_summary(config, state["adata"]))
             info["temporary_control_warning"] = _publish_temporary_control_warning(folder, config)
         elif step == "preprocess":
-            state["adata"] = _require(state, folder, "assign")
+            state["adata"] = _require(state, "assign")
             state["adata"] = preprocess(state["adata"], config)
             _score_cell_cycle(state["adata"], config)
             info["cell_cycle_status"] = state["adata"].uns.get("cell_cycle_status", "")
             info["cell_cycle_note"] = state["adata"].uns.get("cell_cycle_note", "")
             write_preprocess_figures(folder, config, state["adata"])
-            _write_h5ad(state["adata"], folder / "checkpoints" / "preprocess.h5ad")
             state["preprocess_adata"] = state["adata"]
         elif step == "perturb":
-            # Needs preprocess; sensitivity uses Mixscape labels when mixscape.h5ad exists.
-            preprocess_adata = _ensure_preprocess_adata(state, folder, config)
-            state["adata"] = _merge_post_preprocess_products(folder, preprocess_adata)
+            if state["adata"] is None:
+                raise SystemExit(
+                    "缺少 preprocess / 并行分析结果：请从 io 起连续跑到 perturb（--steps all）。"
+                )
             state["adata"] = _step_perturb(folder, config, state["adata"])
         else:
             raise SystemExit(f"未知步骤: {step}")
@@ -314,76 +316,98 @@ def _lean_protect_paths(config: dict[str, Any], folder: Path) -> list[Path]:
     return paths
 
 
-def _ensure_preprocess_adata(
-    state: dict[str, Any], folder: Path, config: dict[str, Any]
-):
-    """Return the preprocess AnnData (cached), ensuring the checkpoint exists."""
+def _ensure_preprocess_adata(state: dict[str, Any], config: dict[str, Any]):
+    """Return preprocess AnnData from the in-memory run state."""
     cached = state.get("preprocess_adata")
     if cached is not None:
+        restore_control_spec(config, cached)
         return cached
-    path = folder / "checkpoints" / "preprocess.h5ad"
-    if path.exists():
-        adata = sc.read_h5ad(path)
-        restore_control_spec(config, adata)
-        state["preprocess_adata"] = adata
-        return adata
-    adata = _require(state, folder, "preprocess")
+    adata = _require(state, "preprocess")
     restore_control_spec(config, adata)
-    _write_h5ad(adata, path)
     state["preprocess_adata"] = adata
     return adata
 
 
 def _run_parallel_analysis(
-    folder: Path, config: dict[str, Any], batch: list[str]
-) -> dict[str, float]:
-    """Run dge / mixscape / mixscale concurrently; each process reloads preprocess.h5ad."""
-    preprocess_path = folder / "checkpoints" / "preprocess.h5ad"
-    if not preprocess_path.exists():
-        raise SystemExit(f"缺少 preprocess checkpoint: {preprocess_path}")
-    # Strip private / non-serializable bookkeeping before shipping to workers.
+    folder: Path,
+    config: dict[str, Any],
+    batch: list[str],
+    preprocess_adata,
+) -> tuple[dict[str, float], Any]:
+    """Run dge / mixscape / mixscale; IPC via a temporary directory (not output checkpoints)."""
     public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
-    if len(batch) == 1:
-        result = _parallel_step_worker((batch[0], str(folder), public_config))
-        return {result["step"]: float(result["seconds"])}
-    timings: dict[str, float] = {}
-    errors: list[str] = []
-    with ProcessPoolExecutor(max_workers=len(batch)) as pool:
-        futures = {
-            pool.submit(_parallel_step_worker, (step, str(folder), public_config)): step
-            for step in batch
-        }
-        for future in as_completed(futures):
-            step = futures[future]
-            try:
-                payload = future.result()
-            except Exception as exc:  # noqa: BLE001 - surface worker failure to the parent
-                errors.append(f"{step}: {exc}")
-                continue
-            timings[str(payload["step"])] = float(payload["seconds"])
-    if errors:
-        raise SystemExit("并行分析失败: " + "; ".join(errors))
-    return timings
+    with tempfile.TemporaryDirectory(prefix="perturbseq_parallel_") as tmp:
+        tmp_dir = Path(tmp)
+        preprocess_path = tmp_dir / "preprocess.h5ad"
+        print("  writing temporary preprocess for workers…", flush=True)
+        _write_h5ad(preprocess_adata, preprocess_path)
+        product_paths = {step: tmp_dir / f"{step}.h5ad" for step in batch}
+        if len(batch) == 1:
+            result = _parallel_step_worker(
+                (
+                    batch[0],
+                    str(folder),
+                    public_config,
+                    str(preprocess_path),
+                    str(product_paths[batch[0]]),
+                )
+            )
+            timings = {result["step"]: float(result["seconds"])}
+        else:
+            timings = {}
+            errors: list[str] = []
+            max_workers = min(len(batch), resolve_n_threads(config))
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _parallel_step_worker,
+                        (
+                            step,
+                            str(folder),
+                            public_config,
+                            str(preprocess_path),
+                            str(product_paths[step]),
+                        ),
+                    ): step
+                    for step in batch
+                }
+                for future in as_completed(futures):
+                    step = futures[future]
+                    try:
+                        payload = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{step}: {exc}")
+                        continue
+                    timings[str(payload["step"])] = float(payload["seconds"])
+            if errors:
+                raise SystemExit("并行分析失败: " + "; ".join(errors))
+        merged = _merge_post_preprocess_products(preprocess_adata, product_paths)
+    return timings, merged
 
 
-def _parallel_step_worker(payload: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
-    """Process entrypoint: one independent analysis step from preprocess.h5ad."""
-    step, folder_str, config = payload
+def _parallel_step_worker(
+    payload: tuple[str, str, dict[str, Any], str, str],
+) -> dict[str, Any]:
+    """Process entrypoint: one analysis step from a temporary preprocess.h5ad."""
+    step, folder_str, config, preprocess_path, product_path = payload
     os.environ.setdefault("MPLBACKEND", "Agg")
+    apply_thread_budget(config)
     folder = Path(folder_str)
     seed = int(config["runtime"]["seed"])
     np.random.seed(seed)
-    preprocess_path = folder / "checkpoints" / "preprocess.h5ad"
     print(f"[{step}] start (worker)", flush=True)
     started = time.time()
     adata = sc.read_h5ad(preprocess_path)
     restore_control_spec(config, adata)
     if step == "dge":
-        _step_dge(folder, config, adata)
+        adata = _step_dge(folder, config, adata)
+        _write_lean_dge_product(adata, Path(product_path))
     elif step == "mixscape":
-        _step_mixscape(folder, config, adata)
+        adata = _step_mixscape(folder, config, adata)
+        _write_h5ad(adata, Path(product_path))
     elif step == "mixscale":
-        _step_mixscale(folder, config, adata)
+        adata = _step_mixscale(folder, config, adata)
+        _write_h5ad(adata, Path(product_path))
     else:
         raise ValueError(f"unsupported parallel step: {step}")
     seconds = round(time.time() - started, 3)
@@ -391,17 +415,17 @@ def _parallel_step_worker(payload: tuple[str, str, dict[str, Any]]) -> dict[str,
     return {"step": step, "seconds": seconds}
 
 
-def _merge_post_preprocess_products(folder: Path, preprocess_adata):
-    """Build perturb input: preprocess + Mixscape labels/layers + Wilcoxon uns if present.
-
-    Mixscale products stay in ``mixscale.h5ad``; descriptive / E-test do not require them.
-    """
+def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, Path]):
+    """Build perturb input: preprocess + Mixscape labels + Wilcoxon status if present."""
     import gc
 
+    import h5py
+    from anndata.io import read_elem
+
     adata = preprocess_adata.copy()
-    mixscape_path = folder / "checkpoints" / "mixscape.h5ad"
-    if mixscape_path.exists():
-        mix = sc.read_h5ad(mixscape_path)
+    mixscape_path = Path(product_paths["mixscape"]) if "mixscape" in product_paths else None
+    if mixscape_path is not None and mixscape_path.exists():
+        mix = sc.read_h5ad(mixscape_path, backed="r")
         for column in (
             "mixscape_status",
             "mixscape_class",
@@ -412,42 +436,26 @@ def _merge_post_preprocess_products(folder: Path, preprocess_adata):
             "mixscape_reason",
         ):
             if column in mix.obs.columns:
-                adata.obs[column] = mix.obs[column]
+                adata.obs[column] = mix.obs[column].to_numpy()
         if "X_pert" in mix.layers:
-            adata.layers["X_pert"] = mix.layers["X_pert"]
+            adata.layers["X_pert"] = mix.layers["X_pert"][...]
         if "X_umap_mixscape" in mix.obsm:
-            adata.obsm["X_umap_mixscape"] = mix.obsm["X_umap_mixscape"]
-        for key, value in mix.uns.items():
+            adata.obsm["X_umap_mixscape"] = np.asarray(mix.obsm["X_umap_mixscape"])
+        for key in list(mix.uns.keys()):
             if str(key).startswith("mixscape"):
-                adata.uns[key] = value
+                adata.uns[key] = mix.uns[key]
+        mix.file.close()
         del mix
         gc.collect()
-    dge_path = folder / "checkpoints" / "dge.h5ad"
-    if dge_path.exists():
-        # Load status first; defer the bulky wilcoxon gene table until after E-test.
-        dge = sc.read_h5ad(dge_path, backed="r")
-        for key in ("wilcoxon_de_status", "wilcoxon_de"):
-            if key in dge.uns:
-                adata.uns[key] = dge.uns[key]
-        dge.file.close()
-        del dge
+    dge_path = Path(product_paths["dge"]) if "dge" in product_paths else None
+    if dge_path is not None and dge_path.exists():
+        with h5py.File(dge_path, "r") as handle:
+            uns = handle["uns"] if "uns" in handle else None
+            if uns is not None:
+                for key in ("wilcoxon_de_status", "wilcoxon_de"):
+                    if key in uns:
+                        adata.uns[key] = read_elem(uns[key])
         gc.collect()
-    return adata
-
-
-def _attach_wilcoxon_de_results(folder: Path, adata):
-    """Copy the large Wilcoxon gene table into ``uns`` for the perturb checkpoint."""
-    import gc
-
-    dge_path = folder / "checkpoints" / "dge.h5ad"
-    if not dge_path.exists() or "wilcoxon_de_results" in adata.uns:
-        return adata
-    dge = sc.read_h5ad(dge_path, backed="r")
-    if "wilcoxon_de_results" in dge.uns:
-        adata.uns["wilcoxon_de_results"] = dge.uns["wilcoxon_de_results"]
-    dge.file.close()
-    del dge
-    gc.collect()
     return adata
 
 
@@ -493,7 +501,7 @@ def _step_io(folder: Path, config: dict[str, Any]):
             flush=True,
         )
     calls = _calls(annotated)
-    # Resume needs the full annotated ledger; keep it inside the io checkpoint.
+    # Keep the annotated ledger on the in-memory AnnData for assign in the same run.
     adata.uns["cell_calls"] = calls
     adata.uns["io_checks"] = checks
     reference = read_reference(paths["feature_reference"])
@@ -502,22 +510,14 @@ def _step_io(folder: Path, config: dict[str, Any]):
         nt_control=config["labels"]["nt_control"],
         reference=reference,
     )
-    _write_h5ad(adata, folder / "checkpoints" / "io.h5ad")
     return adata
 
 
-def _load_cell_calls(folder: Path, adata) -> pd.DataFrame:
+def _load_cell_calls(adata) -> pd.DataFrame:
     stored = adata.uns.get("cell_calls") if adata is not None else None
-    if isinstance(stored, pd.DataFrame) and not stored.empty:
-        calls = stored.copy()
-    else:
-        path = folder / "tables" / "cell_calls.tsv"
-        if not path.exists():
-            raise SystemExit(
-                "缺少 cell_calls：请重跑 io（写入 checkpoints/io.h5ad 的 uns['cell_calls']），"
-                "或提供 tables/cell_calls.tsv。"
-            )
-        calls = pd.read_csv(path, sep="\t", keep_default_na=False)
+    if not isinstance(stored, pd.DataFrame) or stored.empty:
+        raise SystemExit("缺少 cell_calls：请从 io 起连续运行（账本在内存 AnnData.uns 中传递）。")
+    calls = stored.copy()
     calls["guide_umi_pass"] = _as_bool(calls["guide_umi_pass"])
     for column in (
         "total_counts",
@@ -532,7 +532,7 @@ def _load_cell_calls(folder: Path, adata) -> pd.DataFrame:
 
 
 def _step_assign(folder: Path, config: dict[str, Any], adata):
-    calls = _load_cell_calls(folder, adata)
+    calls = _load_cell_calls(adata)
     thresholds = derive_qc_thresholds(config["qc"])
     # low_library_no_guide stage retained in ledger; exclusion count stays 0.
     library_rule = {
@@ -618,7 +618,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     control_ids = set(
         updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str)
     )
-    # Drop the full annotated ledger before writing assign.h5ad (io checkpoint keeps it).
+    # Drop the full annotated ledger after eligibility is applied (no longer needed).
     adata = adata[adata.obs_names.astype(str).isin(eligible | control_ids)].copy()
     if "cell_calls" in adata.uns:
         del adata.uns["cell_calls"]
@@ -654,7 +654,6 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         )
     _write_resolved(folder, config)
     write_qc_figures(folder, config, adata, cell_status=ledger, targets=targets)
-    _write_h5ad(adata, folder / "checkpoints" / "assign.h5ad")
     print(f"  analysis cells: {adata.n_obs:,}", flush=True)
     return adata
 
@@ -691,7 +690,8 @@ def _step_dge(folder: Path, config: dict[str, Any], adata):
     if spec["temporary"]:
         print(f"  temporary control warning: {spec['note']}", flush=True)
     results, status = run_wilcoxon_de(adata, config)
-    adata.uns["wilcoxon_de_results"] = results
+    # Never park the gene×target table on adata — it is tens of millions of rows.
+    adata.uns.pop("wilcoxon_de_results", None)
     adata.uns["wilcoxon_de_status"] = status
     for stale in (
         folder / "wilcoxon" / "tables" / "de_wilcoxon.tsv",
@@ -708,7 +708,20 @@ def _step_dge(folder: Path, config: dict[str, Any], adata):
             stale.unlink()
     n_ok = int(status["status"].eq("estimated").sum()) if not status.empty else 0
     meta = adata.uns.get("wilcoxon_de", {})
-    n_na = int(meta.get("n_log_fc_nonfinite_set_na", 0)) if isinstance(meta, dict) else 0
+    if not isinstance(meta, dict):
+        meta = {}
+    n_na = int(meta.get("n_log_fc_nonfinite_set_na", 0))
+    n_rows = int(len(results)) if results is not None and not results.empty else 0
+    meta = {
+        **meta,
+        "results_table_persisted": False,
+        "results_table_note": (
+            "Full wilcoxon_de_results kept out of memory merge products; "
+            "status + meta only for perturb."
+        ),
+        "n_log_fc_rows": n_rows,
+    }
+    adata.uns["wilcoxon_de"] = meta
     print(f"  WilcoxonTest contrasts estimated: {n_ok}", flush=True)
     if n_na:
         print(
@@ -716,8 +729,46 @@ def _step_dge(folder: Path, config: dict[str, Any], adata):
             "(pertpy log2(mean) on log1p without pseudocount)",
             flush=True,
         )
-    _write_h5ad(adata, folder / "checkpoints" / "dge.h5ad")
+    if n_rows and isinstance(results, pd.DataFrame):
+        preview_cols = [
+            c
+            for c in (
+                "target_gene",
+                "variable",
+                "log_fc",
+                "p_value",
+                "adj_p_value",
+                "cell_type",
+            )
+            if c in results.columns
+        ]
+        adata.uns["wilcoxon_de_preview"] = compact_wilcoxon_frame(
+            results.loc[:, preview_cols].head(50).copy()
+        )
+    del results
     return adata
+
+
+def _write_lean_dge_product(adata, path: Path) -> None:
+    """Temporary IPC product for parallel merge: status + meta only."""
+    from anndata import AnnData
+    from scipy import sparse
+
+    lean = AnnData(X=sparse.csr_matrix((0, 0), dtype=np.float32))
+    for key in ("wilcoxon_de_status", "wilcoxon_de", "wilcoxon_de_preview"):
+        if key in adata.uns:
+            lean.uns[key] = adata.uns[key]
+    for key in (
+        "control_label",
+        "control_source",
+        "control_temporary",
+        "control_phrase",
+        "control_note",
+        "control_fallback_from",
+    ):
+        if key in adata.uns:
+            lean.uns[key] = adata.uns[key]
+    _write_h5ad(lean, path)
 
 
 def _step_mixscape(folder: Path, config: dict[str, Any], adata):
@@ -733,7 +784,6 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
         fractions = mixscape_fraction(adata)
         adata.uns["mixscape_summary"] = fractions
         write_mixscape_figures(folder, config, adata, fractions=fractions)
-        _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
         return adata
     if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
         "cell_type_key"
@@ -753,7 +803,6 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
     fractions = mixscape_fraction(adata)
     adata.uns["mixscape_summary"] = fractions
     write_mixscape_figures(folder, config, adata, fractions=fractions)
-    _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
     return adata
 
 
@@ -768,16 +817,11 @@ def _step_mixscale(folder: Path, config: dict[str, Any], adata):
         print(f"  Mixscale failed: {mixscale_exc}", flush=True)
         adata.uns["mixscale_status"] = f"failed:{mixscale_exc}"
     write_mixscale_figures(folder, config, adata)
-    _write_h5ad(adata, folder / "checkpoints" / "mixscale.h5ad")
     return adata
 
 
 def _step_perturb(folder: Path, config: dict[str, Any], adata):
-    """Descriptive effects and cell-level E-test.
-
-    ``adata`` should already be preprocess merged with Mixscape labels / Wilcoxon
-    ``uns`` when those checkpoints exist (see ``_merge_post_preprocess_products``).
-    """
+    """Descriptive effects and cell-level E-test (figures only; no checkpoint)."""
     import gc
 
     comparisons = []
@@ -787,7 +831,6 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     if "mixscape_status" not in adata.obs:
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
-    # E-test first on a PCA-only view so pertpy does not compete with densified X.
     slim = _edistance_pca_view(adata)
     edistance = write_edistance_results(folder, slim, config)
     del slim
@@ -825,8 +868,7 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         direction=direction,
         guides=guides,
     )
-    adata = _attach_wilcoxon_de_results(folder, adata)
-    _write_h5ad(adata, folder / "checkpoints" / "perturb.h5ad")
+    adata.uns.pop("wilcoxon_de_results", None)
     return adata
 
 
@@ -1042,49 +1084,12 @@ def _cell_status(table: pd.DataFrame) -> pd.DataFrame:
     return ledger
 
 
-def _require(state: dict[str, Any], folder: Path, previous: str):
+def _require(state: dict[str, Any], previous: str):
     if state["adata"] is not None:
         return state["adata"]
-    path = folder / "checkpoints" / f"{previous}.h5ad"
-    if not path.exists():
-        raise SystemExit(f"缺少上一步结果 {path}。加上 --resume 前需要先跑完 {previous}。")
-    print(f"  resume {path}", flush=True)
-    return sc.read_h5ad(path)
-
-
-def _load_resume(folder: Path, step: str):
-    previous = {
-        "assign": "io",
-        "preprocess": "assign",
-        "dge": "preprocess",
-        "mixscape": "preprocess",
-        "mixscale": "preprocess",
-        "perturb": "preprocess",
-    }
-    if step not in previous:
-        return None
-    if step == "perturb":
-        pre_path = folder / "checkpoints" / "preprocess.h5ad"
-        if pre_path.exists():
-            print(f"  resume {pre_path} (+ merge dge/mixscape if present)", flush=True)
-            return _merge_post_preprocess_products(folder, sc.read_h5ad(pre_path))
-        return None
-    path = folder / "checkpoints" / f"{previous[step]}.h5ad"
-    fallback = {
-        "dge": ["preprocess.h5ad"],
-        "mixscape": ["preprocess.h5ad"],
-        "mixscale": ["preprocess.h5ad"],
-    }
-    candidates = (
-        [path]
-        if step not in fallback
-        else [folder / "checkpoints" / name for name in fallback[step]]
+    raise SystemExit(
+        f"缺少上一步「{previous}」的内存结果：请从 io 起连续运行（已不再支持 checkpoints / --resume）。"
     )
-    for candidate in candidates:
-        if candidate.exists():
-            print(f"  resume {candidate}", flush=True)
-            return sc.read_h5ad(candidate)
-    return None
 
 
 def _calls(annotated: pd.DataFrame) -> pd.DataFrame:

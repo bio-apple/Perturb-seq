@@ -1149,6 +1149,17 @@ SINGLER_IMPLEMENTATION = "R SingleR"
 
 _SINGLER_RSCRIPT = r"""
 options(timeout = 600)
+# Inherit OMP/OpenBLAS limits from the Python parent (runtime.n_threads).
+n_threads <- suppressWarnings(as.integer(Sys.getenv("OMP_NUM_THREADS", unset = "1")))
+if (is.na(n_threads) || n_threads < 1) n_threads <- 1L
+Sys.setenv(
+  OMP_NUM_THREADS = as.character(n_threads),
+  OPENBLAS_NUM_THREADS = as.character(n_threads),
+  MKL_NUM_THREADS = as.character(n_threads)
+)
+if (requireNamespace("data.table", quietly = TRUE)) {
+  data.table::setDTthreads(n_threads)
+}
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) %% 2 != 0) stop("参数不成对")
 opt <- list()
