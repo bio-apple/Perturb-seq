@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ from perturbseq.assign import (
     filter_stage_counts,
     multi_guide_composition,
     validate_guide_targets,
+    write_qc_figures,
 )
 from perturbseq.config import (
     TEMPORARY_CONTROL_WARNING,
@@ -40,12 +43,14 @@ from perturbseq.config import (
     mito_prefix,
     output_dir,
     read_config,
+    resolve_control_spec,
     resolve_input_paths,
-    ribo_prefixes,
+    restore_control_spec,
     software_config_path,
     validate_config,
     verify_species_consistency,
 )
+from perturbseq.differential_expression import run_wilcoxon_de
 from perturbseq.distance_tests import write_edistance_results
 from perturbseq.io import (
     InputMismatch,
@@ -54,19 +59,27 @@ from perturbseq.io import (
     read_features,
     read_reference,
 )
-from perturbseq.mixscale import run_mixscale
-from perturbseq.mixscape import mixscape_fraction, run_mixscape
+from perturbseq.mixscale import run_mixscale, write_mixscale_figures
+from perturbseq.mixscape import mixscape_fraction, run_mixscape, write_mixscape_figures
+from perturbseq.outputs import cleanup_lean_outputs
 from perturbseq.perturb_effect import (
     descriptive_effects,
-    guide_pseudobulk,
-    perturbation_distance,
     target_direction_table,
-    tutorial_differential_expression,
+    write_descriptive_figures,
 )
-from perturbseq.preprocess import preprocess
-from perturbseq.report import write_report
+from perturbseq.preprocess import preprocess, write_preprocess_figures
 
-STEPS = ["io", "assign", "preprocess", "mixscape", "mixscale", "perturb", "report"]
+STEPS = [
+    "io",
+    "assign",
+    "preprocess",
+    "dge",
+    "mixscape",
+    "mixscale",
+    "perturb",
+]
+# After preprocess these three only read preprocess.h5ad and write disjoint products.
+PARALLEL_ANALYSIS_STEPS = ("dge", "mixscape", "mixscale")
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -99,7 +112,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-dir", required=True, help="结果输出目录")
     parser.add_argument("--guide-separator", required=True, help="多条 guide 之间的分隔符，例如 |")
     parser.add_argument(
-        "--nt-control", default="", help="设计好的非靶向对照名。不填则用 zero-guide 细胞"
+        "--nt-control",
+        default="",
+        help="设计好的非靶向对照名。不填，或填了但数据中无可用 NT 细胞时，用 zero-guide 临时对照",
     )
     parser.add_argument(
         "--crispr-mode",
@@ -150,12 +165,6 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="表达基因数上限。细胞 n_genes ≥ 该值时剔除。默认读配置（6000）。",
     )
-    parser.add_argument(
-        "--max-ribo-frac",
-        type=float,
-        default=None,
-        help="核糖体蛋白基因比例上限，0 到 1。不填则不做 ribo 过滤，不并入 UMI 绝对阈值。",
-    )
     parser.add_argument("--steps", default="all", help="all, or a comma-separated subset")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
@@ -181,7 +190,6 @@ def main(argv: list[str] | None = None) -> None:
             "max_mito_frac": args.max_mito_frac,
             "min_genes": args.min_genes,
             "max_genes": args.max_genes,
-            "max_ribo_frac": args.max_ribo_frac,
         },
     )
     validate_config(config)
@@ -209,7 +217,6 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "tables").mkdir(exist_ok=True)
     (folder / "checkpoints").mkdir(exist_ok=True)
-    (folder / "pseudobulk").mkdir(exist_ok=True)
     _record_species(folder, config)
     seed = int(config["runtime"]["seed"])
     np.random.seed(seed)
@@ -233,13 +240,50 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             **_control_summary(config),
         }
     )
-    state: dict[str, Any] = {"adata": None}
+    state: dict[str, Any] = {"adata": None, "preprocess_adata": None}
     if resume:
         state["adata"] = _load_resume(folder, steps[0])
+        if state["adata"] is not None:
+            restore_control_spec(config, state["adata"])
+            info.update(_control_summary(config, state["adata"]))
+        if steps[0] in PARALLEL_ANALYSIS_STEPS or steps[0] == "perturb":
+            pre_path = folder / "checkpoints" / "preprocess.h5ad"
+            if pre_path.exists():
+                state["preprocess_adata"] = sc.read_h5ad(pre_path)
+                restore_control_spec(config, state["preprocess_adata"])
     started = time.time()
+    # Provisional until assign resolves from the ledger (may fall back to zero_guide).
     info["temporary_control_warning"] = _publish_temporary_control_warning(folder, config)
     _write_info(folder, info, started)
-    for step in steps:
+    remaining = list(steps)
+    while remaining:
+        step = remaining[0]
+        if step in PARALLEL_ANALYSIS_STEPS:
+            batch = [name for name in PARALLEL_ANALYSIS_STEPS if name in remaining]
+            for name in batch:
+                remaining.remove(name)
+            print(
+                f"[parallel] {', '.join(batch)} (shared read-only preprocess checkpoint)",
+                flush=True,
+            )
+            step_started = time.time()
+            preprocess_adata = _ensure_preprocess_adata(state, folder, config)
+            timings = _run_parallel_analysis(folder, config, batch)
+            state["adata"] = _merge_post_preprocess_products(folder, preprocess_adata)
+            wall = round(time.time() - step_started, 3)
+            for name in batch:
+                info.setdefault("steps", {})[name] = {
+                    "seconds": timings.get(name, wall),
+                    "parallel_wall_seconds": wall,
+                    "parallel_batch": list(batch),
+                }
+            info.setdefault("steps", {})["_parallel_analysis"] = {
+                "steps": list(batch),
+                "wall_seconds": wall,
+            }
+            _write_info(folder, info, started)
+            continue
+        remaining.pop(0)
         print(f"[{step}]", flush=True)
         step_started = time.time()
         if step == "io":
@@ -251,30 +295,140 @@ def run(config: dict[str, Any], steps: list[str], *, resume: bool) -> None:
             state["adata"] = _require(state, folder, "io")
             state["adata"] = _step_assign(folder, config, state["adata"])
             info.update(_control_summary(config, state["adata"]))
+            info["temporary_control_warning"] = _publish_temporary_control_warning(folder, config)
         elif step == "preprocess":
             state["adata"] = _require(state, folder, "assign")
             state["adata"] = preprocess(state["adata"], config)
             _score_cell_cycle(state["adata"], config)
             info["cell_cycle_status"] = state["adata"].uns.get("cell_cycle_status", "")
             info["cell_cycle_note"] = state["adata"].uns.get("cell_cycle_note", "")
+            write_preprocess_figures(folder, config, state["adata"])
             _write_h5ad(state["adata"], folder / "checkpoints" / "preprocess.h5ad")
-        elif step == "mixscape":
-            state["adata"] = _require(state, folder, "preprocess")
-            state["adata"] = _step_mixscape(folder, config, state["adata"])
-        elif step == "mixscale":
-            state["adata"] = _require(state, folder, "mixscape")
-            state["adata"] = _step_mixscale(folder, config, state["adata"])
+            state["preprocess_adata"] = state["adata"]
         elif step == "perturb":
-            state["adata"] = _require(state, folder, "mixscale")
+            # Needs preprocess; sensitivity uses Mixscape labels when mixscape.h5ad exists.
+            preprocess_adata = _ensure_preprocess_adata(state, folder, config)
+            state["adata"] = _merge_post_preprocess_products(folder, preprocess_adata)
             state["adata"] = _step_perturb(folder, config, state["adata"])
-        elif step == "report":
-            state["adata"] = (
-                state["adata"] if state["adata"] is not None else _load_resume(folder, "report")
-            )
-            write_report(folder, config, state["adata"])
+        else:
+            raise SystemExit(f"未知步骤: {step}")
         info.setdefault("steps", {})[step] = {"seconds": round(time.time() - step_started, 3)}
         _write_info(folder, info, started)
-    print(f"Wrote {folder}", flush=True)
+    removed = cleanup_lean_outputs(folder)
+    print(f"Wrote {folder} (lean cleanup removed {removed} intermediate files)", flush=True)
+
+
+def _ensure_preprocess_adata(
+    state: dict[str, Any], folder: Path, config: dict[str, Any]
+):
+    """Return the preprocess AnnData (cached), ensuring the checkpoint exists."""
+    cached = state.get("preprocess_adata")
+    if cached is not None:
+        return cached
+    path = folder / "checkpoints" / "preprocess.h5ad"
+    if path.exists():
+        adata = sc.read_h5ad(path)
+        restore_control_spec(config, adata)
+        state["preprocess_adata"] = adata
+        return adata
+    adata = _require(state, folder, "preprocess")
+    restore_control_spec(config, adata)
+    _write_h5ad(adata, path)
+    state["preprocess_adata"] = adata
+    return adata
+
+
+def _run_parallel_analysis(
+    folder: Path, config: dict[str, Any], batch: list[str]
+) -> dict[str, float]:
+    """Run dge / mixscape / mixscale concurrently; each process reloads preprocess.h5ad."""
+    preprocess_path = folder / "checkpoints" / "preprocess.h5ad"
+    if not preprocess_path.exists():
+        raise SystemExit(f"缺少 preprocess checkpoint: {preprocess_path}")
+    # Strip private / non-serializable bookkeeping before shipping to workers.
+    public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
+    if len(batch) == 1:
+        result = _parallel_step_worker((batch[0], str(folder), public_config))
+        return {result["step"]: float(result["seconds"])}
+    timings: dict[str, float] = {}
+    errors: list[str] = []
+    with ProcessPoolExecutor(max_workers=len(batch)) as pool:
+        futures = {
+            pool.submit(_parallel_step_worker, (step, str(folder), public_config)): step
+            for step in batch
+        }
+        for future in as_completed(futures):
+            step = futures[future]
+            try:
+                payload = future.result()
+            except Exception as exc:  # noqa: BLE001 - surface worker failure to the parent
+                errors.append(f"{step}: {exc}")
+                continue
+            timings[str(payload["step"])] = float(payload["seconds"])
+    if errors:
+        raise SystemExit("并行分析失败: " + "; ".join(errors))
+    return timings
+
+
+def _parallel_step_worker(payload: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
+    """Process entrypoint: one independent analysis step from preprocess.h5ad."""
+    step, folder_str, config = payload
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    folder = Path(folder_str)
+    seed = int(config["runtime"]["seed"])
+    np.random.seed(seed)
+    preprocess_path = folder / "checkpoints" / "preprocess.h5ad"
+    print(f"[{step}] start (worker)", flush=True)
+    started = time.time()
+    adata = sc.read_h5ad(preprocess_path)
+    restore_control_spec(config, adata)
+    if step == "dge":
+        _step_dge(folder, config, adata)
+    elif step == "mixscape":
+        _step_mixscape(folder, config, adata)
+    elif step == "mixscale":
+        _step_mixscale(folder, config, adata)
+    else:
+        raise ValueError(f"unsupported parallel step: {step}")
+    seconds = round(time.time() - started, 3)
+    print(f"[{step}] done ({seconds}s)", flush=True)
+    return {"step": step, "seconds": seconds}
+
+
+def _merge_post_preprocess_products(folder: Path, preprocess_adata):
+    """Build perturb input: preprocess + Mixscape labels/layers + Wilcoxon uns if present.
+
+    Mixscale products stay in ``mixscale.h5ad``; descriptive / E-test do not require them.
+    """
+    adata = preprocess_adata.copy()
+    mixscape_path = folder / "checkpoints" / "mixscape.h5ad"
+    if mixscape_path.exists():
+        mix = sc.read_h5ad(mixscape_path)
+        for column in (
+            "mixscape_status",
+            "mixscape_class",
+            "mixscape_class_raw",
+            "mixscape_class_global",
+            "mixscape_class_p",
+            "mixscape_probability",
+            "mixscape_reason",
+        ):
+            if column in mix.obs.columns:
+                adata.obs[column] = mix.obs[column]
+        if "X_pert" in mix.layers:
+            adata.layers["X_pert"] = mix.layers["X_pert"]
+        if "X_umap_mixscape" in mix.obsm:
+            adata.obsm["X_umap_mixscape"] = mix.obsm["X_umap_mixscape"]
+        for key, value in mix.uns.items():
+            if str(key).startswith("mixscape"):
+                adata.uns[key] = value
+    dge_path = folder / "checkpoints" / "dge.h5ad"
+    if dge_path.exists():
+        dge = sc.read_h5ad(dge_path)
+        for key in ("wilcoxon_de_results", "wilcoxon_de_status", "wilcoxon_de"):
+            if key in dge.uns:
+                adata.uns[key] = dge.uns[key]
+    return adata
 
 
 def _step_io(folder: Path, config: dict[str, Any]):
@@ -291,7 +445,6 @@ def _step_io(folder: Path, config: dict[str, Any]):
             targets_per_cell=int(config["labels"].get("targets_per_cell", 1)),
             min_guide_umi=None if min_guide_umi is None else float(min_guide_umi),
             mito_prefix=mito_prefix(config),
-            ribo_prefixes=ribo_prefixes(config),
         )
     except InputMismatch as exc:
         _write_barcode_differences(folder, exc.only_matrix, exc.only_assignment)
@@ -319,43 +472,57 @@ def _step_io(folder: Path, config: dict[str, Any]):
             f"  matrix-only barcodes recorded as no_guide: {len(only_matrix)}",
             flush=True,
         )
-    _calls(annotated).to_csv(folder / "tables" / "cell_calls.tsv", sep="\t", index=False)
-    (folder / "tables" / "io_checks.json").write_text(json.dumps(checks, indent=2) + "\n")
+    calls = _calls(annotated)
+    # Resume needs the full annotated ledger; keep it inside the io checkpoint.
+    adata.uns["cell_calls"] = calls
+    adata.uns["io_checks"] = checks
     reference = read_reference(paths["feature_reference"])
-    composition = multi_guide_composition(
+    adata.uns["multi_guide_composition"] = multi_guide_composition(
         annotated,
         nt_control=config["labels"]["nt_control"],
         reference=reference,
     )
-    composition.to_csv(folder / "tables" / "multi_guide_composition.tsv", sep="\t", index=False)
     _write_h5ad(adata, folder / "checkpoints" / "io.h5ad")
     return adata
 
 
-def _step_assign(folder: Path, config: dict[str, Any], adata):
-    calls = pd.read_csv(folder / "tables" / "cell_calls.tsv", sep="\t", keep_default_na=False)
+def _load_cell_calls(folder: Path, adata) -> pd.DataFrame:
+    stored = adata.uns.get("cell_calls") if adata is not None else None
+    if isinstance(stored, pd.DataFrame) and not stored.empty:
+        calls = stored.copy()
+    else:
+        path = folder / "tables" / "cell_calls.tsv"
+        if not path.exists():
+            raise SystemExit(
+                "缺少 cell_calls：请重跑 io（写入 checkpoints/io.h5ad 的 uns['cell_calls']），"
+                "或提供 tables/cell_calls.tsv。"
+            )
+        calls = pd.read_csv(path, sep="\t", keep_default_na=False)
     calls["guide_umi_pass"] = _as_bool(calls["guide_umi_pass"])
     for column in (
         "total_counts",
         "n_genes_by_counts",
         "mito_frac",
-        "ribo_frac",
         "guide_umi_total",
         "grna_capture_efficiency",
     ):
         if column in calls.columns:
             calls[column] = pd.to_numeric(calls[column], errors="coerce")
+    return calls
+
+
+def _step_assign(folder: Path, config: dict[str, Any], adata):
+    calls = _load_cell_calls(folder, adata)
     thresholds = derive_qc_thresholds(config["qc"])
     umi_pair = ("min_umi", "max_umi")
     umi_configured = all(config["qc"].get(key) is not None for key in umi_pair)
-    ribo_configured = config["qc"].get("max_ribo_frac") is not None
-    # MAD-based shallow no-guide exclusion removed; stage kept in ledger at 0.
+    # low_library_no_guide stage retained in ledger; exclusion count stays 0.
     library_rule = {
         "applied": False,
         "reason": "disabled_mad_qc_removed",
         "min_total_counts": None,
         "source": "disabled",
-        "note": "原 MAD 文库下限规则已移除，不再排除 low_library_no_guide。",
+        "note": "low_library_no_guide 不应用排除；账本阶段保留，新增排除数为 0。",
     }
     correlation = capture_library_correlation(calls)
     correlation["low_library_no_guide_applied"] = False
@@ -369,17 +536,9 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         "gene_filter": "drop_n_genes_le_min_or_ge_max",
         "mito_frac_source": "configured",
         "mito_filter": "drop_mito_frac_ge_max",
-        "ribo_frac_source": "command_line" if ribo_configured else "disabled",
-        "ribo_prefixes": list(ribo_prefixes(config)),
-        "ribo_match": "gene_symbol_prefix_case_insensitive",
         "low_library_no_guide": library_rule,
+        "grna_capture_library_correlation": correlation.to_dict(orient="records"),
     }
-    (folder / "tables" / "qc_thresholds.json").write_text(
-        json.dumps(recorded, indent=2, ensure_ascii=False) + "\n"
-    )
-    correlation.to_csv(
-        _qc_tables(folder) / "grna_capture_library_correlation.tsv", sep="\t", index=False
-    )
     print(f"  low_library_no_guide skipped: {library_rule['reason']}", flush=True)
     updated = apply_eligibility(
         calls,
@@ -389,7 +548,13 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         low_library_rule=library_rule,
     )
     updated.insert(0, "sample_id", config["experiment"]["sample_id"])
-    spec = control_spec(config)
+    spec = resolve_control_spec(config, updated)
+    if spec["temporary"] and spec.get("fallback_from"):
+        print(
+            f"  control fallback: labels.nt_control={spec['fallback_from']!r} "
+            "has no usable NT cells → temporary zero_guide",
+            flush=True,
+        )
     temporary = pd.Series(False, index=updated.index)
     if spec["temporary"]:
         temporary = (
@@ -401,7 +566,6 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     updated["temporary_control"] = temporary.to_numpy()
     updated["control_source"] = spec["control_source"]
     updated["control_label"] = spec["control_label"]
-    stages = filter_stage_counts(updated)
     retained = int((updated["exclusion_reason_primary"] == STATUS_RETAINED).sum())
     analysis_n = int(updated["analysis_eligible"].astype(bool).sum())
     targeting_n = int(
@@ -421,42 +585,17 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     if len(updated) != int(adata.uns.get("n_input_barcodes", len(updated))):
         pass
     ledger = _cell_status(updated)
-    ledger.to_csv(folder / "cell_status.tsv", sep="\t", index=False)
-    metric_columns = [
-        "cell_barcode",
-        "total_counts",
-        "n_genes_by_counts",
-        "pct_counts_mito",
-        "pct_counts_ribo",
-        "guide_umi_total",
-        "grna_capture_efficiency",
-        "n_guides",
-        "n_targets",
-        "exclusion_reason_primary",
-        "perturbation_status",
-    ]
-    ledger[metric_columns].to_csv(_qc_tables(folder) / "qc_metrics.tsv", sep="\t", index=False)
-    stages.to_csv(folder / "filter_stage_counts.tsv", sep="\t", index=False)
-    assignment = (
-        updated["assignment_status"]
-        .value_counts()
-        .rename_axis("assignment_status")
-        .reset_index(name="n_cells")
-    )
-    assignment.to_csv(_qc_tables(folder) / "assignment_summary.tsv", sep="\t", index=False)
-    cells_per_guide(updated).to_csv(
-        _qc_tables(folder) / "cells_per_guide.tsv", sep="\t", index=False
-    )
-    cells_per_target(updated, int(config["qc"]["min_cells_per_guide"])).to_csv(
-        _qc_tables(folder) / "cells_per_target.tsv", sep="\t", index=False
-    )
+    targets = cells_per_target(updated, int(config["qc"]["min_cells_per_guide"]))
     eligible = set(
         updated.loc[updated["analysis_eligible"].astype(bool), "cell_barcode"].astype(str)
     )
     control_ids = set(
         updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str)
     )
+    # Drop the full annotated ledger before writing assign.h5ad (io checkpoint keeps it).
     adata = adata[adata.obs_names.astype(str).isin(eligible | control_ids)].copy()
+    if "cell_calls" in adata.uns:
+        del adata.uns["cell_calls"]
     if control_ids:
         hit = np.isin(adata.obs_names.astype(str), list(control_ids))
         for column in ("target_gene", "perturbation_status"):
@@ -467,13 +606,28 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     adata.uns["config"] = config
     adata.uns["control_source"] = spec["control_source"]
     adata.uns["control_label"] = spec["control_label"]
+    adata.uns["control_temporary"] = bool(spec["temporary"])
+    adata.uns["control_phrase"] = spec["control_phrase"]
     adata.uns["control_note"] = spec["note"]
-    adata.uns["n_temporary_control_cells"] = int(len(control_ids))
+    adata.uns["control_fallback_from"] = str(spec.get("fallback_from", ""))
+    adata.uns["n_temporary_control_cells"] = int(len(control_ids)) if spec["temporary"] else 0
+    adata.uns["qc_thresholds"] = recorded
+    adata.uns["cells_per_target"] = targets
+    adata.uns["filter_stage_counts"] = filter_stage_counts(updated)
+    adata.uns["cells_per_guide"] = cells_per_guide(updated)
     if spec["temporary"]:
         print(
             f"  temporary control {spec['control_label']}: {len(control_ids):,} zero-guide cells",
             flush=True,
         )
+    else:
+        print(
+            f"  designed NT control {spec['control_label']}: "
+            f"{int((updated['analysis_eligible'].astype(bool) & (updated['perturbation_status'] == STATUS_NT)).sum()):,} cells",
+            flush=True,
+        )
+    _write_resolved(folder, config)
+    write_qc_figures(folder, config, adata, cell_status=ledger, targets=targets)
     _write_h5ad(adata, folder / "checkpoints" / "assign.h5ad")
     print(f"  analysis cells: {adata.n_obs:,}", flush=True)
     return adata
@@ -505,6 +659,41 @@ def _resolve_species(config: dict[str, Any]) -> None:
     )
 
 
+def _step_dge(folder: Path, config: dict[str, Any], adata):
+    """Independent WilcoxonTest DE (pertpy Simple statistical tests); not Mixscape/Mixscale."""
+    spec = control_spec(config)
+    if spec["temporary"]:
+        print(f"  temporary control warning: {spec['note']}", flush=True)
+    results, status = run_wilcoxon_de(adata, config)
+    adata.uns["wilcoxon_de_results"] = results
+    adata.uns["wilcoxon_de_status"] = status
+    for stale in (
+        folder / "wilcoxon" / "tables" / "de_wilcoxon.tsv",
+        folder / "wilcoxon" / "tables" / "de_wilcoxon_status.tsv",
+        folder / "DGE" / "descriptive" / "tables" / "de_edger_main.tsv",
+        folder / "DGE" / "descriptive" / "tables" / "de_edger_sensitivity.tsv",
+        folder / "DGE" / "descriptive" / "tables" / "de_pydeseq2_main.tsv",
+        folder / "DGE" / "descriptive" / "tables" / "de_pydeseq2_sensitivity.tsv",
+        folder / "DGE" / "tables" / "de_edger_main.tsv",
+        folder / "DGE" / "tables" / "de_pydeseq2_main.tsv",
+        folder / "DGE" / "wilcoxon" / "tables" / "de_wilcoxon.tsv",
+    ):
+        if stale.is_file():
+            stale.unlink()
+    n_ok = int(status["status"].eq("estimated").sum()) if not status.empty else 0
+    meta = adata.uns.get("wilcoxon_de", {})
+    n_na = int(meta.get("n_log_fc_nonfinite_set_na", 0)) if isinstance(meta, dict) else 0
+    print(f"  WilcoxonTest contrasts estimated: {n_ok}", flush=True)
+    if n_na:
+        print(
+            f"  WilcoxonTest log_fc non-finite→NA: {n_na} "
+            "(pertpy log2(mean) on log1p without pseudocount)",
+            flush=True,
+        )
+    _write_h5ad(adata, folder / "checkpoints" / "dge.h5ad")
+    return adata
+
+
 def _step_mixscape(folder: Path, config: dict[str, Any], adata):
     """Independent Mixscape step: DE gate, X_pert signature, classification."""
     mixscape_on = config.get("mixscape", {}).get("enabled", True)
@@ -515,9 +704,9 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
         adata.obs["mixscape_class_raw"] = "not_evaluated"
-        _write_de_gate(folder, adata)
         fractions = mixscape_fraction(adata)
-        fractions.to_csv(_mixscape_tables(folder) / "mixscape_summary.tsv", sep="\t", index=False)
+        adata.uns["mixscape_summary"] = fractions
+        write_mixscape_figures(folder, config, adata, fractions=fractions)
         _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
         return adata
     if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
@@ -529,49 +718,40 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
         adata.obs["mixscape_class_raw"] = adata.obs["mixscape_class"].astype(str)
         if "mixscape_class_p" in adata.obs:
             adata.obs["mixscape_probability"] = adata.obs["mixscape_class_p"]
-        _write_de_gate(folder, adata)
     except Exception as exc:
         print(f"  Mixscape failed: {exc}", flush=True)
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
         adata.obs["mixscape_class_raw"] = "not_evaluated"
         adata.uns["mixscape_skip_reason"] = f"mixscape_failed:{exc}"
-        _write_de_gate(folder, adata)
     fractions = mixscape_fraction(adata)
-    summary_path = _mixscape_tables(folder) / "mixscape_summary.tsv"
-    fractions.to_csv(summary_path, sep="\t", index=False)
-    for stale in (
-        folder / "DGE" / "tables" / "mixscape_summary.tsv",
-        folder / "DGE" / "mixscape" / "tables" / "mixscape_summary.tsv",
-        folder / "tables" / "mixscape_fraction.tsv",
-    ):
-        if stale.is_file() and stale != summary_path:
-            stale.unlink()
-    _refresh_mixscape_ledger(folder, adata)
+    adata.uns["mixscape_summary"] = fractions
+    write_mixscape_figures(folder, config, adata, fractions=fractions)
     _write_h5ad(adata, folder / "checkpoints" / "mixscape.h5ad")
     return adata
 
 
 def _step_mixscale(folder: Path, config: dict[str, Any], adata):
-    """Independent Mixscale step: own DE gate and mixscale_score on X_pert."""
-    if "X_pert" not in adata.layers:
-        print("  Mixscale skipped: missing X_pert (run mixscape first)", flush=True)
-        adata.uns["mixscale_status"] = "skipped:missing_X_pert"
-        _write_mixscale_gate(folder, adata)
-        _write_h5ad(adata, folder / "checkpoints" / "mixscale.h5ad")
-        return adata
+    """Independent Mixscale step: own CalcPerturbSig + mixscale_score (no Mixscape step)."""
+    spec = control_spec(config)
+    if spec["temporary"]:
+        print(f"  temporary control warning: {spec['note']}", flush=True)
     try:
         adata = run_mixscale(adata, config)
     except Exception as mixscale_exc:
         print(f"  Mixscale failed: {mixscale_exc}", flush=True)
         adata.uns["mixscale_status"] = f"failed:{mixscale_exc}"
-    _write_mixscale_gate(folder, adata)
+    write_mixscale_figures(folder, config, adata)
     _write_h5ad(adata, folder / "checkpoints" / "mixscale.h5ad")
     return adata
 
 
 def _step_perturb(folder: Path, config: dict[str, Any], adata):
-    """Descriptive effects, pseudobulk distances, and E-test (after Mixscape/Mixscale)."""
+    """Descriptive effects and cell-level E-test.
+
+    ``adata`` should already be preprocess merged with Mixscape labels / Wilcoxon
+    ``uns`` when those checkpoints exist (see ``_merge_post_preprocess_products``).
+    """
     comparisons = []
     spec = control_spec(config)
     if spec["temporary"]:
@@ -583,11 +763,7 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
     sens_effects, sens_guides, sens_status = descriptive_effects(
         adata, config, branch="sensitivity"
     )
-    descriptive = _descriptive_tables(folder)
-    main_effects.to_csv(descriptive / "effect_main.tsv", sep="\t", index=False)
-    sens_effects.to_csv(descriptive / "effect_sensitivity.tsv", sep="\t", index=False)
     guides = pd.concat([main_guides, sens_guides], ignore_index=True)
-    guides.to_csv(descriptive / "guide_effects.tsv", sep="\t", index=False)
     direction = pd.concat(
         [
             target_direction_table(adata, config, branch="main"),
@@ -595,68 +771,30 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         ],
         ignore_index=True,
     )
-    direction.to_csv(descriptive / "target_expression_effect.tsv", sep="\t", index=False)
-    de_main, de_main_status = tutorial_differential_expression(adata, config, branch="main")
-    de_sens, de_sens_status = tutorial_differential_expression(adata, config, branch="sensitivity")
-    for branch_name, tables in (("main", de_main), ("sensitivity", de_sens)):
-        for method, frame in tables.items():
-            name = f"de_{method}_{branch_name}.tsv"
-            frame.to_csv(descriptive / name, sep="\t", index=False)
-            legacy = folder / "DGE" / "tables" / name
-            if legacy.is_file():
-                legacy.unlink()
-    for name in (
-        "effect_main.tsv",
-        "effect_sensitivity.tsv",
-        "guide_effects.tsv",
-        "target_expression_effect.tsv",
-    ):
-        legacy = folder / name
-        if legacy.is_file():
-            legacy.unlink()
+    adata.uns["effect_main"] = main_effects
+    adata.uns["effect_sensitivity"] = sens_effects
+    adata.uns["guide_effects"] = guides
+    adata.uns["target_expression_effect"] = direction
     comparisons_table = pd.concat(
-        [main_status, sens_status, de_main_status, de_sens_status, pd.DataFrame(comparisons)],
+        [main_status, sens_status, pd.DataFrame(comparisons)],
         ignore_index=True,
     )
-    comparisons_table.to_csv(folder / "comparison_status.tsv", sep="\t", index=False)
-    pseudobulk, guide_table = guide_pseudobulk(adata, config, branch="main")
-    guide_table.to_csv(folder / "pseudobulk" / "guide_metadata.tsv", sep="\t", index=False)
-    _write_h5ad(pseudobulk, folder / "pseudobulk" / "guide_counts.h5ad")
-    _write_guide_distance(folder, pseudobulk, config)
-    write_edistance_results(folder, adata, config)
-    _refresh_mixscape_ledger(folder, adata)
+    wilcoxon_status = adata.uns.get("wilcoxon_de_status")
+    if isinstance(wilcoxon_status, pd.DataFrame) and not wilcoxon_status.empty:
+        comparisons_table = pd.concat([comparisons_table, wilcoxon_status], ignore_index=True)
+    adata.uns["comparison_status"] = comparisons_table
+    edistance = write_edistance_results(folder, adata, config)
+    if isinstance(edistance, pd.DataFrame) and not edistance.empty:
+        adata.uns["edistance_etest"] = edistance
+    write_descriptive_figures(
+        folder,
+        config,
+        effects=main_effects,
+        direction=direction,
+        guides=guides,
+    )
     _write_h5ad(adata, folder / "checkpoints" / "perturb.h5ad")
     return adata
-
-
-def _write_guide_distance(folder: Path, pseudobulk, config: dict[str, Any]) -> None:
-    """Skip the guide-pseudobulk distance when no replicate minimum was configured.
-
-    Guides are not biological replicates, so a missing minimum is not filled in.
-    The cell-level E-test is written later and is not this table.
-    """
-    tables = _edistance_tables(folder)
-    skip_path = tables / "perturbation_distance_heatmap.skipped.txt"
-    if "min_guide_replicates" not in config.get("perturb", {}):
-        skip_path.write_text("min_guide_replicates_not_set\n")
-        _retire_legacy_distance_skip(folder)
-        return
-    distance, embedding = perturbation_distance(pseudobulk, config)
-    if distance.empty:
-        skip_path.write_text("insufficient_cells\n")
-        _retire_legacy_distance_skip(folder)
-        return
-    if skip_path.exists():
-        skip_path.unlink()
-    distance.to_csv(tables / "perturbation_distance.tsv", sep="\t")
-    embedding.to_csv(tables / "perturbation_embedding.tsv", sep="\t", index=False)
-    for stale in (
-        folder / "perturbation_distance.tsv",
-        folder / "perturbation_embedding.tsv",
-        folder / "plot_data" / "perturbation_distance_heatmap.skipped.txt",
-    ):
-        if stale.is_file():
-            stale.unlink()
 
 
 def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
@@ -689,64 +827,6 @@ def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
     }
     adata.uns["cell_cycle_note"] = notes.get(status, "")
     print(f"  cell cycle: {status}", flush=True)
-
-
-def _qc_tables(folder: Path) -> Path:
-    path = folder / "qc" / "tables"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _mixscape_tables(folder: Path) -> Path:
-    path = folder / "DGE" / "Mixscape" / "tables"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _mixscale_tables(folder: Path) -> Path:
-    path = folder / "DGE" / "mixscale" / "tables"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _descriptive_tables(folder: Path) -> Path:
-    path = folder / "DGE" / "descriptive" / "tables"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _edistance_tables(folder: Path) -> Path:
-    path = folder / "E-distance" / "tables"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _retire_legacy_distance_skip(folder: Path) -> None:
-    legacy = folder / "plot_data" / "perturbation_distance_heatmap.skipped.txt"
-    if legacy.is_file():
-        legacy.unlink()
-
-
-def _write_de_gate(folder: Path, adata) -> None:
-    gate = adata.uns.get("mixscape_de_gate")
-    if not isinstance(gate, pd.DataFrame):
-        return
-    path = _mixscape_tables(folder) / "mixscape_de_gate.tsv"
-    gate.to_csv(path, sep="\t", index=False)
-    for stale in (
-        folder / "DGE" / "tables" / "mixscape_de_gate.tsv",
-        folder / "tables" / "mixscape_de_gate.tsv",
-        folder / "DGE" / "mixscape" / "tables" / "mixscape_de_gate.tsv",
-    ):
-        if stale.is_file() and stale != path:
-            stale.unlink()
-
-
-def _write_mixscale_gate(folder: Path, adata) -> None:
-    gate = adata.uns.get("mixscale_de_gate")
-    if not isinstance(gate, pd.DataFrame):
-        return
-    gate.to_csv(_mixscale_tables(folder) / "mixscale_de_gate.tsv", sep="\t", index=False)
 
 
 def _write_resolved(folder: Path, config: dict[str, Any]) -> None:
@@ -828,7 +908,10 @@ def _control_summary(config: dict[str, Any], adata=None) -> dict[str, Any]:
     summary = {
         "control_source": spec["control_source"],
         "control_label": spec["control_label"],
+        "control_temporary": bool(spec["temporary"]),
+        "control_phrase": spec["control_phrase"],
         "control_note": spec["note"],
+        "control_fallback_from": str(spec.get("fallback_from", "")),
     }
     if adata is not None:
         summary["n_temporary_control_cells"] = int(adata.uns.get("n_temporary_control_cells", 0))
@@ -839,19 +922,22 @@ def _publish_temporary_control_warning(folder: Path, config: dict[str, Any]) -> 
     """Record the zero-guide warning in the log and on disk.
 
     A designed NT control removes that warning and the temporary-control QC figure.
+    After assign, the note may include a data-level fallback from a missing NT label.
     """
     path = folder / "tables" / "temporary_control_warning.txt"
-    if not control_spec(config)["temporary"]:
+    spec = control_spec(config)
+    if not spec["temporary"]:
         if path.is_file():
             path.unlink()
         from perturbseq.plotting import remove_temporary_control_qc
 
         remove_temporary_control_qc(folder)
         return ""
+    text = str(spec.get("note") or TEMPORARY_CONTROL_WARNING).strip()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(TEMPORARY_CONTROL_WARNING.strip() + "\n")
-    print(f"  temporary control warning: {TEMPORARY_CONTROL_WARNING}", flush=True)
-    return TEMPORARY_CONTROL_WARNING
+    path.write_text(text + "\n")
+    print(f"  temporary control warning: {text}", flush=True)
+    return text
 
 
 def _write_barcode_differences(
@@ -875,8 +961,6 @@ def _as_bool(values: pd.Series) -> pd.Series:
 def _cell_status(table: pd.DataFrame) -> pd.DataFrame:
     ledger = table.copy()
     ledger["pct_counts_mito"] = ledger["mito_frac"]
-    if "ribo_frac" in ledger.columns:
-        ledger["pct_counts_ribo"] = ledger["ribo_frac"]
     for column in (
         "mixscape_class_raw",
         "mixscape_class",
@@ -888,64 +972,6 @@ def _cell_status(table: pd.DataFrame) -> pd.DataFrame:
         if column not in ledger.columns:
             ledger[column] = pd.NA
     return ledger
-
-
-def _refresh_mixscape_ledger(folder: Path, adata) -> None:
-    path = folder / "cell_status.tsv"
-    if not path.exists():
-        return
-    ledger = pd.read_csv(path, sep="\t", keep_default_na=False)
-    labels = adata.obs.copy()
-    labels["cell_barcode"] = adata.obs_names.astype(str)
-    mapped = labels.set_index("cell_barcode")
-    barcodes = ledger["cell_barcode"].astype(str)
-    for column in ("mixscape_class", "mixscape_status", "mixscape_probability"):
-        if column in mapped.columns:
-            ledger[column] = barcodes.map(mapped[column])
-    if "mixscape_class_raw" in mapped.columns:
-        ledger["mixscape_class_raw"] = barcodes.map(mapped["mixscape_class_raw"])
-    in_analysis = barcodes.isin(set(mapped.index.astype(str)))
-    perturbed = ledger["mixscape_class"].astype(str).eq("perturbed") & in_analysis
-    temporary = (
-        ledger["temporary_control"].astype(str).str.lower().isin(["true", "1"])
-        if "temporary_control" in ledger.columns
-        else pd.Series(False, index=ledger.index)
-    )
-    nt = (
-        ledger["perturbation_status"].astype(str).eq(STATUS_NT) | temporary.to_numpy()
-    ) & in_analysis
-    ledger["sensitivity_eligible"] = perturbed | nt
-    ledger.loc[~in_analysis, "mixscape_status"] = ledger.loc[
-        ~in_analysis, "mixscape_status"
-    ].replace("", "not_evaluated")
-    ledger.to_csv(path, sep="\t", index=False)
-
-
-def _note_untested_targets(notes: pd.DataFrame, adata, control: str) -> pd.DataFrame:
-    """Targets with too few perturbed guide replicates never enter the model."""
-    present = (
-        set(notes["target_gene"].astype(str))
-        if not notes.empty and "target_gene" in notes
-        else set()
-    )
-    targeting = adata.obs.loc[
-        adata.obs["perturbation_status"].astype(str) == STATUS_TARGET, "target_gene"
-    ]
-    rows = []
-    for target, count in targeting.astype(str).value_counts().items():
-        if target in present or target == control:
-            continue
-        rows.append(
-            {
-                "target_gene": target,
-                "reason": "insufficient_replicates",
-                "n_guides": 0,
-                "n_cells": int(count),
-            }
-        )
-    if not rows:
-        return notes
-    return pd.concat([notes, pd.DataFrame(rows)], ignore_index=True)
 
 
 def _require(state: dict[str, Any], folder: Path, previous: str):
@@ -962,24 +988,24 @@ def _load_resume(folder: Path, step: str):
     previous = {
         "assign": "io",
         "preprocess": "assign",
+        "dge": "preprocess",
         "mixscape": "preprocess",
-        "mixscale": "mixscape",
-        "perturb": "mixscale",
-        "report": "perturb",
+        "mixscale": "preprocess",
+        "perturb": "preprocess",
     }
     if step not in previous:
         return None
+    if step == "perturb":
+        pre_path = folder / "checkpoints" / "preprocess.h5ad"
+        if pre_path.exists():
+            print(f"  resume {pre_path} (+ merge dge/mixscape if present)", flush=True)
+            return _merge_post_preprocess_products(folder, sc.read_h5ad(pre_path))
+        return None
     path = folder / "checkpoints" / f"{previous[step]}.h5ad"
     fallback = {
-        "mixscale": ["mixscape.h5ad", "preprocess.h5ad"],
-        "perturb": ["mixscale.h5ad", "mixscape.h5ad", "preprocess.h5ad"],
-        "report": [
-            "perturb.h5ad",
-            "mixscale.h5ad",
-            "mixscape.h5ad",
-            "preprocess.h5ad",
-            "assign.h5ad",
-        ],
+        "dge": ["preprocess.h5ad"],
+        "mixscape": ["preprocess.h5ad"],
+        "mixscale": ["preprocess.h5ad"],
     }
     candidates = (
         [path]
@@ -1028,9 +1054,3 @@ def _package_versions() -> dict[str, str]:
         except PackageNotFoundError:
             found[name] = "not_installed"
     return found
-
-
-def _safe(value: str) -> str:
-    return "".join(
-        character if character.isalnum() or character in "._+-" else "_" for character in value
-    )

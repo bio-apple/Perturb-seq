@@ -19,6 +19,7 @@ from anndata import AnnData
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from scipy import sparse
 
 from perturbseq.assign import STATUS_TARGET, control_cell_mask
 from perturbseq.config import ZERO_GUIDE_LABEL
@@ -31,8 +32,13 @@ _TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
 # mRNA and gRNA statistics. Section "plot" is shared with UMAPs, so routing is by name.
 _QC_FIGURES = frozenset(
     {
-        "qc_violin",
+        "hist_ncount",
+        "hist_nfeature",
+        "hist_percent_mt_gex",
         "qc_scatter",
+        "scatter_ncount_nfeature_gex",
+        "marker_detection_heatmap",
+        "dotplot_markers",
         TEMPORARY_CONTROL_QC_NAME,
         "guides_per_cell",
         "assignment_status_bar",
@@ -43,6 +49,13 @@ _QC_FIGURES = frozenset(
         "pca_scatter",
     }
 )
+# Library-D / ggplot2-like defaults (figures under xihu/Library-D/figures).
+_HIST_FILL = "#305080"
+_THRESHOLD_LINE = "#D62728"
+_GRID_MAJOR = "#E0E0E0"
+_GRID_MINOR = "#F0F0F0"
+_MARKER_HEATMAP_CMAP = "Blues"
+_DOTPLOT_CMAP = "Purples"
 # Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
 _MIXSCAPE_FIGURES = frozenset(
     {
@@ -63,20 +76,14 @@ _DESCRIPTIVE_FIGURES = frozenset(
         "de_gene_heatmap",
         "target_expression_effect",
         "guide_consistency",
-        "pseudobulk_library_size",
-        "pseudobulk_pca",
     }
 )
-# Pairwise guide-pseudobulk distances. The E-test scatter is written separately.
-_DISTANCE_FIGURES = frozenset({"perturbation_distance_heatmap", "perturbation_embedding"})
 
 
 def _output_bucket(name: str, section: str) -> str:
     # Signature UMAPs may pass section "mixscape"; the image still goes to UMAP/.
     if name.startswith("umap_"):
         return "umap"
-    if name in _DISTANCE_FIGURES:
-        return "edistance"
     if (
         section in {"mixscape", "target_in_de"}
         or name in _MIXSCAPE_FIGURES
@@ -85,6 +92,8 @@ def _output_bucket(name: str, section: str) -> str:
         return "mixscape"
     if section == "mixscale" or name in _MIXSCALE_FIGURES:
         return "mixscale"
+    if section == "wilcoxon" or name.startswith("wilcoxon_"):
+        return "wilcoxon"
     if section in {"de", "dge"} or name in _DESCRIPTIVE_FIGURES:
         return "descriptive"
     if name in _QC_FIGURES:
@@ -93,13 +102,16 @@ def _output_bucket(name: str, section: str) -> str:
 
 
 def _dge_bucket_root(output_dir: Path, bucket: str) -> Path:
+    # Three independent analysis roots (plus descriptive under DGE/).
     if bucket == "mixscape":
-        return output_dir / "DGE" / "Mixscape"
+        return output_dir / "Mixscape"
     if bucket == "mixscale":
-        return output_dir / "DGE" / "mixscale"
+        return output_dir / "mixscale"
+    if bucket == "wilcoxon":
+        return output_dir / "wilcoxon"
     if bucket == "descriptive":
         return output_dir / "DGE" / "descriptive"
-    raise ValueError(f"不是 DGE 子桶: {bucket}")
+    raise ValueError(f"不是分析输出桶: {bucket}")
 
 
 class FigureStore:
@@ -111,13 +123,31 @@ class FigureStore:
         self.plot_data = output_dir / "plot_data"
         self.plot_data.mkdir(parents=True, exist_ok=True)
         self.manifest: list[dict[str, str]] = []
-        sns.set_theme(style=str(self.plotting.get("theme", "whitegrid")))
-        matplotlib.rcParams["font.sans-serif"] = [
-            "Heiti SC",
-            "Arial Unicode MS",
-            "DejaVu Sans",
-        ]
-        matplotlib.rcParams["axes.unicode_minus"] = False
+        theme = str(self.plotting.get("theme", "white"))
+        sns.set_theme(style=theme if theme in {"white", "whitegrid", "ticks"} else "white")
+        matplotlib.rcParams.update(
+            {
+                "font.family": "sans-serif",
+                "font.sans-serif": [
+                    "Arial",
+                    "Helvetica",
+                    "DejaVu Sans",
+                    "Heiti SC",
+                    "Arial Unicode MS",
+                ],
+                "axes.unicode_minus": False,
+                "axes.facecolor": "white",
+                "figure.facecolor": "white",
+                "axes.edgecolor": "black",
+                "axes.linewidth": 0.8,
+                "axes.grid": True,
+                "grid.color": _GRID_MAJOR,
+                "grid.linewidth": 0.7,
+                "xtick.direction": "out",
+                "ytick.direction": "out",
+                "legend.frameon": False,
+            }
+        )
 
     def figure_dir(self, name: str, section: str) -> Path:
         bucket = _output_bucket(name, section)
@@ -125,13 +155,11 @@ class FigureStore:
             return self.output_dir / "UMAP" / "figures"
         if bucket == "qc":
             return self.output_dir / "qc" / "figures"
-        if bucket in {"mixscape", "mixscale", "descriptive"}:
+        if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
             figures = _dge_bucket_root(self.output_dir, bucket) / "figures"
             if bucket == "mixscape" and section == "target_in_de":
                 return figures / "target_in_de"
             return figures
-        if bucket == "edistance":
-            return self.output_dir / "E-distance" / "figures"
         return self.output_dir / "figures" / section
 
     def data_dir(self, name: str, section: str = "") -> Path:
@@ -140,10 +168,8 @@ class FigureStore:
             return self.output_dir / "UMAP" / "tables"
         if bucket == "qc":
             return self.output_dir / "qc" / "tables"
-        if bucket in {"mixscape", "mixscale", "descriptive"}:
+        if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
             return _dge_bucket_root(self.output_dir, bucket) / "plot_data"
-        if bucket == "edistance":
-            return self.output_dir / "E-distance" / "tables"
         return self.plot_data
 
     def save(
@@ -172,9 +198,14 @@ class FigureStore:
         if legacy != stale and legacy.exists():
             legacy.unlink()
         data_path = ""
-        if self.plotting.get("save_plot_data", True):
+        if self.plotting.get("save_plot_data", False):
+            data_folder.mkdir(parents=True, exist_ok=True)
             data_path = str(data_folder / f"{name}.tsv")
             data.to_csv(data_path, sep="\t", index=False)
+        else:
+            stale_tsv = data_folder / f"{name}.tsv"
+            if stale_tsv.exists():
+                stale_tsv.unlink()
         bucket = _output_bucket(name, section)
         self._retire_legacy_plot(name, section, bucket)
         self.manifest.append(
@@ -191,10 +222,16 @@ class FigureStore:
         )
 
     def skip(self, name: str, reason: str, section: str = "") -> None:
+        # Lean outputs: record skip in the in-memory manifest only; do not leave
+        # *.skipped.txt on disk (cleanup would remove them anyway).
         data_folder = self.data_dir(name, section)
-        data_folder.mkdir(parents=True, exist_ok=True)
-        skipped = data_folder / f"{name}.skipped.txt"
-        skipped.write_text(reason.strip() + "\n")
+        for stale in (
+            data_folder / f"{name}.skipped.txt",
+            data_folder / f"{name}.tsv",
+            self.plot_data / f"{name}.skipped.txt",
+        ):
+            if stale.exists():
+                stale.unlink()
         bucket = _output_bucket(name, section)
         self._retire_legacy_plot(name, section, bucket)
         self.manifest.append(
@@ -203,7 +240,7 @@ class FigureStore:
                 "branch": "UMAP" if bucket == "umap" else section,
                 "status": "skipped",
                 "reason": reason.strip(),
-                "data_path": str(skipped),
+                "data_path": "",
                 "png_path": "",
                 "pdf_path": "",
             }
@@ -223,7 +260,6 @@ class FigureStore:
             Path("figures") / "mixscape" / f"{name}.pdf",
             Path("figures") / "mixscale" / f"{name}.png",
             Path("figures") / "de" / f"{name}.png",
-            Path("figures") / "summary" / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.png",
             Path("DGE") / "figures" / "mixscape" / f"{name}.txt",
             Path("DGE") / "figures" / "mixscape" / f"{name}.pdf",
@@ -233,7 +269,6 @@ class FigureStore:
             Path("DGE") / "figures" / "de" / f"{name}.png",
             Path("DGE") / "figures" / "plot" / f"{name}.png",
             Path("DGE") / "figures" / "target_in_de" / f"{name}.png",
-            Path("DGE") / "figures" / "summary" / f"{name}.png",
             Path("DGE") / "plot_data" / f"{name}.tsv",
             Path("DGE") / "plot_data" / f"{name}.skipped.txt",
             Path("plot_data") / f"{name}.tsv",
@@ -250,9 +285,26 @@ class FigureStore:
         if bucket == "mixscape":
             relatives.extend(
                 [
+                    Path("DGE") / "Mixscape" / "figures" / f"{name}.png",
+                    Path("DGE") / "Mixscape" / "plot_data" / f"{name}.tsv",
                     Path("DGE") / "mixscape" / "figures" / f"{name}.png",
                     Path("DGE") / "mixscape" / "plot_data" / f"{name}.tsv",
                     Path("DGE") / "mixscape" / "plot_data" / f"{name}.skipped.txt",
+                ]
+            )
+        if bucket == "mixscale":
+            relatives.extend(
+                [
+                    Path("DGE") / "mixscale" / "figures" / f"{name}.png",
+                    Path("DGE") / "mixscale" / "plot_data" / f"{name}.tsv",
+                    Path("DGE") / "mixscale" / "plot_data" / f"{name}.skipped.txt",
+                ]
+            )
+        if bucket == "wilcoxon":
+            relatives.extend(
+                [
+                    Path("DGE") / "wilcoxon" / "tables" / f"{name}.tsv",
+                    Path("DGE") / "wilcoxon" / "figures" / f"{name}.png",
                 ]
             )
         keep = {
@@ -264,9 +316,6 @@ class FigureStore:
             stale = self.output_dir / relative
             if stale.is_file() and stale not in keep:
                 stale.unlink()
-
-    def write_manifest(self, path: Path) -> None:
-        pd.DataFrame(self.manifest).to_csv(path, sep="\t", index=False)
 
     def _figure(
         self, width: float | None = None, height: float | None = None
@@ -281,6 +330,89 @@ class FigureStore:
 
     def palette(self, key: str, fallback: str = "#4C78A8") -> str:
         return str(self.plotting.get("palette", {}).get(key, fallback))
+
+    def write_manifest(self, path: Path) -> None:
+        """Write or merge this store's rows into ``plot_manifest.tsv``.
+
+        Re-running one analysis step replaces that step's plot_name rows and
+        keeps rows written by other steps.
+        """
+        frame = pd.DataFrame(self.manifest)
+        path = Path(path)
+        if path.exists():
+            previous = pd.read_csv(path, sep="\t")
+            if frame.empty:
+                frame = previous
+            elif not previous.empty and "plot_name" in previous.columns:
+                owned = set(frame["plot_name"].astype(str))
+                previous = previous[~previous["plot_name"].astype(str).isin(owned)]
+                frame = pd.concat([previous, frame], ignore_index=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(path, sep="\t", index=False)
+
+
+def figure_context(
+    output_dir: Path, config: dict[str, Any], adata: AnnData | None
+) -> dict[str, str]:
+    """Shared figure caption context for ``FigureStore``."""
+    import json
+
+    from perturbseq.config import control_spec, expected_expression, mito_prefix
+
+    _direction, sentence = expected_expression(config)
+    spec = control_spec(config)
+    thresholds: dict[str, Any] = {}
+    if adata is not None:
+        stored = adata.uns.get("qc_thresholds")
+        if isinstance(stored, dict):
+            thresholds = dict(stored)
+    if not thresholds:
+        threshold_path = Path(output_dir) / "tables" / "qc_thresholds.json"
+        if threshold_path.exists():
+            thresholds = json.loads(threshold_path.read_text())
+    n_cells = int(adata.n_obs) if adata is not None else 0
+    return {
+        "sample": str(config["experiment"]["sample_id"]),
+        "organism": str(config["experiment"]["organism"]),
+        "crispr_mode": str(config["experiment"]["crispr_mode"]),
+        "n_cells": str(n_cells),
+        "mito_prefix": mito_prefix(config),
+        "qc": json.dumps(thresholds, ensure_ascii=False),
+        "direction": sentence,
+        "seed": str(config["runtime"]["seed"]),
+        "control_source": spec["control_source"],
+        "control_label": spec["control_label"],
+        "control_phrase": spec["control_phrase"],
+    }
+
+
+def open_figure_store(
+    output_dir: Path, config: dict[str, Any], adata: AnnData | None = None
+) -> FigureStore:
+    return FigureStore(Path(output_dir), config, figure_context(output_dir, config, adata))
+
+
+def retire_removed_umaps(output_dir: Path) -> None:
+    """Remove non-current UMAP PNG/TSV names if present under the output root."""
+    names = ("umap_leiden", "umap_assignment", "umap_target", "umap_status")
+    root = Path(output_dir)
+    relatives: list[Path] = []
+    for name in names:
+        relatives.extend(
+            (
+                Path("UMAP") / "figures" / f"{name}.png",
+                Path("UMAP") / "tables" / f"{name}.tsv",
+                Path("UMAP") / "tables" / f"{name}.skipped.txt",
+                Path("figures") / "plot" / f"{name}.png",
+                Path("figures") / "embedding" / f"{name}.png",
+                Path("plot_data") / f"{name}.tsv",
+                Path("plot_data") / f"{name}.skipped.txt",
+            )
+        )
+    for relative in relatives:
+        stale = root / relative
+        if stale.is_file():
+            stale.unlink()
 
 
 def _label_count_bars(axis: Axes, counts, *, horizontal: bool = False) -> None:
@@ -473,14 +605,6 @@ def _mito_column(metrics: pd.DataFrame) -> str | None:
     return None
 
 
-def _ribo_column(metrics: pd.DataFrame) -> str | None:
-    if "ribo_frac" in metrics.columns:
-        return "ribo_frac"
-    if "pct_counts_ribo" in metrics.columns:
-        return "pct_counts_ribo"
-    return None
-
-
 def _as_percent(values: pd.Series) -> tuple[pd.Series, str]:
     """Map a 0–1 fraction onto 0–100. Values already above 1 stay as they are."""
     numeric = values.astype(float)
@@ -498,66 +622,202 @@ def percent_mt_values(metrics: pd.DataFrame) -> tuple[pd.Series, str]:
     return _as_percent(metrics[column])
 
 
-def qc_identity_violin(metrics: pd.DataFrame, identity: str) -> Figure:
-    """Seurat-style violins: nFeature_RNA, nCount_RNA, percent.mt, and percent.ribo when present."""
-    scaled, _note = percent_mt_values(metrics)
-    shown = metrics.copy()
-    shown["percent.mt"] = scaled
-    panels = [
-        ("n_genes_by_counts", "nFeature_RNA"),
-        ("total_counts", "nCount_RNA"),
-        ("percent.mt", "percent.mt"),
-    ]
-    ribo = _ribo_column(metrics)
-    if ribo is not None:
-        shown["percent.ribo"] = _as_percent(metrics[ribo])[0]
-        panels.append(("percent.ribo", "percent.ribo"))
-    figure, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4))
-    if len(panels) == 1:
-        axes = [axes]
-    identity_labels = [identity] * len(shown)
-    for axis, (column, title) in zip(axes, panels, strict=True):
-        sns.violinplot(
-            x=identity_labels, y=shown[column], ax=axis, inner=None, color="#F4A6A6", cut=0
-        )
-        sns.stripplot(
-            x=identity_labels, y=shown[column], ax=axis, color="black", size=2, jitter=0.25
-        )
-        axis.set_title(title)
-        axis.set_xlabel("Identity")
-        axis.set_ylabel("")
-    return figure
+def _style_library_d(axis: Axes) -> None:
+    """Match Library-D histograms: white face, light grid, full black spines."""
+    axis.set_facecolor("white")
+    axis.grid(True, which="major", color=_GRID_MAJOR, linewidth=0.7, zorder=0)
+    axis.grid(True, which="minor", color=_GRID_MINOR, linewidth=0.45, zorder=0)
+    axis.minorticks_on()
+    axis.set_axisbelow(True)
+    for spine in axis.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(0.8)
+    axis.tick_params(colors="black", labelsize=9)
 
 
-def draw_qc_violin(
-    store: FigureStore, metrics: pd.DataFrame, *, population: str = "qc metrics"
+def _hist_bins(store: FigureStore) -> int:
+    raw = store.plotting.get("hist_bins", 50)
+    try:
+        bins = int(raw)
+    except (TypeError, ValueError):
+        bins = 50
+    return max(bins, 10)
+
+
+def _draw_qc_histogram(
+    store: FigureStore,
+    *,
+    name: str,
+    values: np.ndarray,
+    xlabel: str,
+    title: str,
+    method: str,
+    threshold: float | None = None,
+    threshold_label: str = "",
 ) -> None:
-    """Seurat VlnPlot: nFeature_RNA, nCount_RNA, percent.mt on a 0–100 scale."""
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        store.skip(name, "missing_fields")
+        return
+    figure, axis = store._figure(width=8.4, height=5.6)
+    bins = _hist_bins(store)
+    axis.hist(
+        finite,
+        bins=bins,
+        color=store.palette("hist_fill", _HIST_FILL),
+        edgecolor="white",
+        linewidth=0.2,
+        zorder=2,
+    )
+    if threshold is not None and np.isfinite(threshold):
+        axis.axvline(
+            threshold,
+            color=_THRESHOLD_LINE,
+            linestyle="--",
+            linewidth=1.4,
+            zorder=3,
+            label=threshold_label or f"threshold={threshold:g}",
+        )
+        axis.legend(frameon=False, fontsize=8, loc="upper right")
+    axis.set_title(title, loc="left", fontsize=12)
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel("Cells")
+    _style_library_d(axis)
+    table = pd.DataFrame({xlabel: finite})
+    store.save(figure, name, "qc", table, method)
+
+
+def draw_qc_histograms(
+    store: FigureStore,
+    metrics: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    population: str = "qc metrics",
+) -> None:
+    """Library-D style GEX QC histograms (nCount / nFeature / percent.mt)."""
     mito = _mito_column(metrics)
     needed = {"total_counts", "n_genes_by_counts"}
     if metrics.empty or mito is None or not needed.issubset(metrics.columns):
-        store.skip("qc_violin", "missing_fields")
+        for name in ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex"):
+            store.skip(name, "missing_fields")
         return
-    identity = str(store.context.get("sample", "sample"))
     scaled, note = percent_mt_values(metrics)
-    shown = metrics.copy()
-    shown["percent.mt"] = scaled
-    value_vars = ["total_counts", "n_genes_by_counts", "percent.mt"]
-    method = f"VlnPlot nFeature, nCount, percent.mt ({note})"
-    ribo = _ribo_column(metrics)
-    if ribo is not None:
-        ribo_scaled, ribo_note = _as_percent(metrics[ribo])
-        shown["percent.ribo"] = ribo_scaled
-        value_vars.append("percent.ribo")
-        method += f", percent.ribo ({ribo_note})"
-    long = shown.melt(
-        id_vars=[column for column in ("cell_barcode",) if column in shown.columns],
-        value_vars=value_vars,
-        var_name="metric",
-        value_name="value",
+    ncount = pd.to_numeric(metrics["total_counts"], errors="coerce").to_numpy(dtype=float)
+    nfeature = pd.to_numeric(metrics["n_genes_by_counts"], errors="coerce").to_numpy(
+        dtype=float
     )
-    figure = qc_identity_violin(metrics, identity)
-    store.save(figure, "qc_violin", "qc", long, f"{method}; {population}")
+    percent_mt = scaled.to_numpy(dtype=float)
+    max_mito = config.get("qc", {}).get("max_mito_frac")
+    mito_line = float(max_mito) * 100.0 if max_mito is not None else None
+    _draw_qc_histogram(
+        store,
+        name="hist_ncount",
+        values=ncount,
+        xlabel="nCount_RNA",
+        title="nCount_RNA (gene expression)",
+        method=f"histogram nCount_RNA; bins={_hist_bins(store)}; {population}",
+    )
+    _draw_qc_histogram(
+        store,
+        name="hist_nfeature",
+        values=nfeature,
+        xlabel="nFeature_RNA",
+        title="nFeature_RNA (gene expression)",
+        method=f"histogram nFeature_RNA; bins={_hist_bins(store)}; {population}",
+    )
+    _draw_qc_histogram(
+        store,
+        name="hist_percent_mt_gex",
+        values=percent_mt,
+        xlabel="percent.mt",
+        title="percent.mt (gene expression only)",
+        method=(
+            f"histogram percent.mt ({note}); bins={_hist_bins(store)}; "
+            f"threshold={mito_line}; {population}"
+        ),
+        threshold=mito_line,
+        threshold_label=f"max_mito_frac={mito_line:g}%" if mito_line is not None else "",
+    )
+
+
+def draw_scatter_ncount_nfeature_gex(
+    store: FigureStore,
+    metrics: pd.DataFrame,
+    seed: int,
+    *,
+    population: str = "qc metrics",
+) -> None:
+    """Library-D GEX nFeature vs nCount, colored by percent.mt (log10 axes)."""
+    mito = _mito_column(metrics)
+    needed = {"total_counts", "n_genes_by_counts"}
+    name = "scatter_ncount_nfeature_gex"
+    if metrics.empty or mito is None or not needed.issubset(metrics.columns):
+        store.skip(name, "missing_fields")
+        return
+    limit = int(store.plotting.get("scatter_max_points", 50000))
+    shown = metrics
+    if len(metrics) > limit:
+        shown = metrics.sample(limit, random_state=seed)
+    scaled_all, note = percent_mt_values(metrics)
+    scaled = scaled_all.loc[shown.index]
+    x = pd.to_numeric(shown["total_counts"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(shown["n_genes_by_counts"], errors="coerce").to_numpy(dtype=float)
+    color = scaled.to_numpy(dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(color) & (x > 0) & (y > 0)
+    if not bool(np.any(ok)):
+        store.skip(name, "missing_fields")
+        return
+    figure, axis = store._figure(width=9.8, height=7.0)
+    points = axis.scatter(
+        x[ok],
+        y[ok],
+        c=color[ok],
+        cmap="YlOrRd",
+        s=8,
+        alpha=0.55,
+        linewidths=0,
+        rasterized=True,
+        zorder=2,
+    )
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel("nCount_RNA")
+    axis.set_ylabel("nFeature_RNA")
+    axis.set_title("GEX nFeature vs nCount", loc="left", fontsize=12)
+    colorbar = figure.colorbar(points, ax=axis, fraction=0.046, pad=0.04)
+    colorbar.set_label("% MT")
+    _style_library_d(axis)
+    table = pd.DataFrame(
+        {
+            "nCount_RNA": x[ok],
+            "nFeature_RNA": y[ok],
+            "percent.mt": color[ok],
+        }
+    )
+    store.save(
+        figure,
+        name,
+        "qc",
+        table,
+        f"FeatureScatter nFeature vs nCount colored by percent.mt ({note}); "
+        f"log10 axes; {population}; seed={seed}",
+    )
+
+
+def remove_qc_violin_products(output_dir: Path) -> None:
+    """Delete qc_violin PNG/TSV under the output root if present."""
+    root = Path(output_dir)
+    for path in (
+        root / "qc" / "figures" / "qc_violin.png",
+        root / "qc" / "tables" / "qc_violin.tsv",
+        root / "qc" / "tables" / "qc_violin.skipped.txt",
+        root / "figures" / "plot" / "qc_violin.png",
+        root / "plot_data" / "qc_violin.tsv",
+        root / "plot_data" / "qc_violin.skipped.txt",
+    ):
+        if path.is_file():
+            path.unlink()
 
 
 def remove_temporary_control_qc(output_dir: Path) -> None:
@@ -654,21 +914,13 @@ def _draw_grouped_metric(
         "ax": axis,
     }
     try:
-        try:
-            sns.violinplot(**kwargs, inner="quartile", cut=0, legend=False)
-        except TypeError:
-            sns.violinplot(**kwargs, inner="quartile", cut=0)
-            legend = axis.get_legend()
-            if legend is not None:
-                legend.remove()
-    except Exception:
-        try:
-            sns.boxplot(**kwargs, legend=False)
-        except TypeError:
-            sns.boxplot(**kwargs)
-            legend = axis.get_legend()
-            if legend is not None:
-                legend.remove()
+        sns.boxplot(**kwargs, legend=False, fliersize=2, linewidth=0.8)
+    except TypeError:
+        sns.boxplot(**kwargs, fliersize=2, linewidth=0.8)
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.remove()
+    _style_library_d(axis)
 
 
 def _temporary_control_qc_figure(store: FigureStore, shown: pd.DataFrame) -> Figure:
@@ -1097,19 +1349,27 @@ def draw_qc_scatter(
     scaled_all, note = percent_mt_values(metrics)
     scaled = scaled_all.loc[shown.index]
     figure, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].scatter(shown["total_counts"], scaled, s=8, linewidths=0, c="#4C78A8", rasterized=True)
+    fill = store.palette("hist_fill", _HIST_FILL)
+    axes[0].scatter(
+        shown["total_counts"], scaled, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True
+    )
     axes[0].set_xlabel("nCount_RNA")
     axes[0].set_ylabel("percent.mt")
+    axes[0].set_title("nCount vs percent.mt", loc="left", fontsize=11)
     axes[1].scatter(
         shown["total_counts"],
         shown["n_genes_by_counts"],
         s=8,
         linewidths=0,
-        c="#4C78A8",
+        c=fill,
+        alpha=0.55,
         rasterized=True,
     )
     axes[1].set_xlabel("nCount_RNA")
     axes[1].set_ylabel("nFeature_RNA")
+    axes[1].set_title("nCount vs nFeature", loc="left", fontsize=11)
+    for axis in axes:
+        _style_library_d(axis)
     store.save(
         figure,
         "qc_scatter",
@@ -1117,6 +1377,240 @@ def draw_qc_scatter(
         shown,
         f"FeatureScatter nCount vs percent.mt ({note}) and nFeature; {population}; seed={seed}",
     )
+
+
+def _gene_symbol_series(adata: AnnData) -> pd.Series:
+    if "gene_symbol" in adata.var.columns:
+        return adata.var["gene_symbol"].astype(str)
+    return pd.Series(adata.var_names.astype(str), index=adata.var_names)
+
+
+def _resolve_marker_indices(
+    adata: AnnData, markers: list[str]
+) -> tuple[list[str], list[int], list[str]]:
+    """Map requested markers to var indices (case-insensitive symbol match)."""
+    symbols = _gene_symbol_series(adata)
+    folded = {str(symbol).casefold(): index for index, symbol in enumerate(symbols)}
+    found: list[str] = []
+    indices: list[int] = []
+    missing: list[str] = []
+    for marker in markers:
+        key = str(marker).casefold()
+        if key in folded:
+            found.append(str(symbols.iloc[folded[key]]))
+            indices.append(int(folded[key]))
+        else:
+            missing.append(str(marker))
+    return found, indices, missing
+
+
+def _cluster_display_labels(adata: AnnData) -> pd.Series:
+    """Leiden id, optionally annotated with majority cell_type (Library-D style)."""
+    clusters = adata.obs["leiden"].astype(str)
+    if "cell_type" not in adata.obs.columns:
+        return clusters
+    types = adata.obs["cell_type"].astype(str)
+    skip = {"ALL", "nan", "None", "<NA>", ""}
+    if not (set(types.unique()) - skip):
+        return clusters
+    mapping: dict[str, str] = {}
+    frame = adata.obs.assign(_cluster=clusters, _cell_type=types)
+    for cluster, block in frame.groupby("_cluster", sort=False):
+        majority = block["_cell_type"].value_counts()
+        majority = majority[~majority.index.isin(skip)]
+        if majority.empty:
+            mapping[str(cluster)] = str(cluster)
+        else:
+            mapping[str(cluster)] = f"{cluster}: {majority.index[0]}"
+    return clusters.map(mapping).astype(str)
+
+
+def _marker_expression_block(
+    adata: AnnData, indices: list[int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (detection 0/1, expression) matrices shaped (n_cells, n_genes)."""
+    counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
+    block = counts[:, indices]
+    if sparse.issparse(block):
+        detected = (block > 0).astype(np.float64).toarray()
+    else:
+        detected = (np.asarray(block) > 0).astype(np.float64)
+    expr = adata.X[:, indices]
+    if sparse.issparse(expr):
+        expression = expr.toarray().astype(np.float64)
+    else:
+        expression = np.asarray(expr, dtype=np.float64)
+    return detected, expression
+
+
+def _marker_by_cluster_table(
+    adata: AnnData, markers: list[str], indices: list[int]
+) -> pd.DataFrame:
+    labels = _cluster_display_labels(adata).to_numpy()
+    detected, expression = _marker_expression_block(adata, indices)
+    rows: list[dict[str, Any]] = []
+    try:
+        order = sorted(
+            set(labels),
+            key=lambda value: (int(str(value).split(":", 1)[0]), str(value)),
+        )
+    except ValueError:
+        order = sorted(set(labels))
+    for cluster in order:
+        mask = labels == cluster
+        n_cells = int(mask.sum())
+        if n_cells == 0:
+            continue
+        for gene_i, gene in enumerate(markers):
+            frac = float(detected[mask, gene_i].mean())
+            mean_expr = float(expression[mask, gene_i].mean())
+            rows.append(
+                {
+                    "cluster": cluster,
+                    "gene": gene,
+                    "n_cells": n_cells,
+                    "fraction_detected": frac,
+                    "mean_expression": mean_expr,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
+    """Fraction of cells detecting each marker gene, by Leiden cluster."""
+    name = "marker_detection_heatmap"
+    if "leiden" not in adata.obs:
+        store.skip(name, "missing_leiden")
+        return
+    found, indices, missing = _resolve_marker_indices(adata, markers)
+    if not found:
+        store.skip(name, "markers_not_in_adata")
+        return
+    table = _marker_by_cluster_table(adata, found, indices)
+    if table.empty:
+        store.skip(name, "missing_fields")
+        return
+    matrix = table.pivot(index="cluster", columns="gene", values="fraction_detected")
+    matrix = matrix.reindex(columns=found)
+    sample = str(store.context.get("sample", "sample"))
+    height = max(4.5, 0.45 * len(matrix) + 2.0)
+    width = max(8.0, 0.55 * len(found) + 3.5)
+    figure, axis = store._figure(width=width, height=height)
+    image = axis.imshow(
+        matrix.to_numpy(dtype=float),
+        aspect="auto",
+        cmap=_MARKER_HEATMAP_CMAP,
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    axis.set_xticks(np.arange(len(found)))
+    axis.set_xticklabels(found, rotation=45, ha="right")
+    axis.set_yticks(np.arange(len(matrix.index)))
+    axis.set_yticklabels(matrix.index.astype(str))
+    axis.set_xlabel("")
+    axis.set_ylabel("")
+    axis.set_title(f"{sample} marker detection by cluster", loc="left", fontsize=12)
+    axis.set_xticks(np.arange(-0.5, len(found), 1), minor=True)
+    axis.set_yticks(np.arange(-0.5, len(matrix.index), 1), minor=True)
+    axis.grid(which="minor", color="white", linestyle="-", linewidth=1.2)
+    axis.tick_params(which="minor", bottom=False, left=False)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    colorbar.set_label("Fraction detected")
+    method = (
+        f"fraction detected per Leiden cluster; cmap={_MARKER_HEATMAP_CMAP}; "
+        f"markers={','.join(found)}"
+    )
+    if missing:
+        method += f"; missing={','.join(missing)}"
+    store.save(figure, name, "qc", table, method)
+
+
+def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
+    """Dot plot: size = detection fraction, color = mean expression (Library-D dark panel)."""
+    name = "dotplot_markers"
+    if "leiden" not in adata.obs:
+        store.skip(name, "missing_leiden")
+        return
+    found, indices, missing = _resolve_marker_indices(adata, markers)
+    if not found:
+        store.skip(name, "markers_not_in_adata")
+        return
+    table = _marker_by_cluster_table(adata, found, indices)
+    if table.empty:
+        store.skip(name, "missing_fields")
+        return
+    clusters = list(dict.fromkeys(table["cluster"].astype(str)))
+    try:
+        clusters = sorted(clusters, key=lambda value: (int(str(value).split(":", 1)[0]), str(value)))
+    except ValueError:
+        clusters = sorted(clusters)
+    cluster_pos = {cluster: index for index, cluster in enumerate(clusters)}
+    gene_pos = {gene: index for index, gene in enumerate(found)}
+    height = max(4.2, 0.38 * len(clusters) + 1.8)
+    width = max(8.4, 0.55 * len(found) + 3.2)
+    figure, axis = plt.subplots(figsize=(width, height), facecolor="black")
+    axis.set_facecolor("black")
+    x = table["gene"].map(gene_pos).to_numpy(dtype=float)
+    y = table["cluster"].map(cluster_pos).to_numpy(dtype=float)
+    sizes = 20.0 + 180.0 * table["fraction_detected"].to_numpy(dtype=float)
+    points = axis.scatter(
+        x,
+        y,
+        s=sizes,
+        c=table["mean_expression"].to_numpy(dtype=float),
+        cmap=_DOTPLOT_CMAP,
+        edgecolors="none",
+        zorder=2,
+    )
+    axis.set_xticks(np.arange(len(found)))
+    axis.set_xticklabels(found, rotation=45, ha="right", color="white")
+    axis.set_yticks(np.arange(len(clusters)))
+    axis.set_yticklabels(clusters, color="white")
+    axis.set_xlim(-0.6, len(found) - 0.4)
+    axis.set_ylim(-0.6, len(clusters) - 0.4)
+    axis.invert_yaxis()
+    axis.tick_params(colors="white", labelsize=8)
+    for spine in axis.spines.values():
+        spine.set_color("white")
+        spine.set_linewidth(0.6)
+    axis.grid(False)
+    colorbar = figure.colorbar(points, ax=axis, fraction=0.046, pad=0.08)
+    colorbar.set_label("Mean expression", color="white")
+    colorbar.ax.yaxis.set_tick_params(color="white")
+    plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="white")
+    size_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor="white",
+            markersize=np.sqrt(20 + 180 * frac) / 2,
+            label=f"{int(frac * 100)}%",
+        )
+        for frac in (0.25, 0.5, 0.75, 1.0)
+    ]
+    legend = axis.legend(
+        handles=size_handles,
+        title="Fraction of cells",
+        loc="upper left",
+        bbox_to_anchor=(1.22, 1.0),
+        labelcolor="white",
+        fontsize=7,
+        title_fontsize=8,
+        frameon=False,
+    )
+    plt.setp(legend.get_title(), color="white")
+    method = (
+        f"dotplot size=fraction_detected color=mean_expression; cmap={_DOTPLOT_CMAP}; "
+        f"markers={','.join(found)}"
+    )
+    if missing:
+        method += f"; missing={','.join(missing)}"
+    store.save(figure, name, "qc", table, method)
 
 
 def draw_umap(
@@ -1237,86 +1731,6 @@ def draw_target_expression(store: FigureStore, effects: pd.DataFrame) -> None:
     )
 
 
-def draw_pseudobulk_pca(store: FigureStore, pseudobulk: pd.DataFrame, seed: int) -> None:
-    if pseudobulk.empty or len(pseudobulk) < 3:
-        store.skip("pseudobulk_pca", "fewer_than_3_guides")
-        return
-    from sklearn.decomposition import PCA
-
-    matrix = pseudobulk.drop(
-        columns=[column for column in ("guide_id", "target_gene") if column in pseudobulk.columns]
-    )
-    values = matrix.to_numpy(dtype=float)
-    library = values.sum(axis=1)
-    keep = np.isfinite(library) & (library > 0)
-    if int(keep.sum()) < 3 or values.shape[1] < 2:
-        store.skip("pseudobulk_pca", "fewer_than_3_guides")
-        return
-    pseudobulk = pseudobulk.iloc[np.flatnonzero(keep)].reset_index(drop=True)
-    values = values[keep]
-    library = library[keep]
-    components = PCA(n_components=2, random_state=seed).fit_transform(
-        np.log1p(1e4 * values / library[:, None])
-    )
-    table = pd.DataFrame(
-        {
-            "guide_id": pseudobulk["guide_id"].astype(str).to_numpy()
-            if "guide_id" in pseudobulk
-            else np.arange(len(pseudobulk)),
-            "target_gene": pseudobulk["target_gene"].astype(str).to_numpy(),
-            "pc1": components[:, 0],
-            "pc2": components[:, 1],
-        }
-    )
-    labels = table["target_gene"]
-    limit = int(store.plotting["max_legend_categories"])
-    if labels.nunique() > limit:
-        keep = set(labels.value_counts().head(limit - 1).index)
-        table["label"] = labels.where(labels.isin(keep), "Other")
-    else:
-        table["label"] = labels
-    figure, axis = store._figure()
-    sns.scatterplot(data=table, x="pc1", y="pc2", hue="label", s=18, linewidth=0, ax=axis)
-    axis.set_xlabel("PC1")
-    axis.set_ylabel("PC2")
-    axis.set_title("guide pseudobulk, not replicates")
-    store.save(
-        figure,
-        "pseudobulk_pca",
-        "de",
-        table,
-        "PCA of log1p guide-level CPM; library size is normalized out; "
-        "guides are not biological replicates",
-    )
-
-
-def draw_library_size(store: FigureStore, guides: pd.DataFrame) -> None:
-    needed = {"guide_id", "n_cells", "total_counts"}
-    if guides.empty or not needed.issubset(guides.columns):
-        store.skip("pseudobulk_library_size", "missing_fields")
-        return
-    figure, axis = store._figure()
-    sns.scatterplot(
-        data=guides,
-        x="n_cells",
-        y="total_counts",
-        hue="target_gene" if guides["target_gene"].nunique() <= 20 else None,
-        s=18,
-        linewidth=0,
-        ax=axis,
-    )
-    axis.set_xlabel("cells per guide")
-    axis.set_ylabel("pseudobulk total counts")
-    axis.set_title("guide totals, not replicates")
-    store.save(
-        figure,
-        "pseudobulk_library_size",
-        "de",
-        guides,
-        "guide-level total counts; a guide is not a biological replicate",
-    )
-
-
 def draw_guide_consistency(store: FigureStore, consistency: pd.DataFrame) -> None:
     """Per-guide CPM log2FC of the target gene on the main contrast.
 
@@ -1366,106 +1780,6 @@ def draw_guide_consistency(store: FigureStore, consistency: pd.DataFrame) -> Non
         shown,
         f"per-guide target-gene CPM log2FC versus the same {phrase} pool; "
         "guides are not biological replicates; this spread is not a reproducibility estimate",
-    )
-
-
-def draw_distance_heatmap(store: FigureStore, distance: pd.DataFrame) -> None:
-    if distance.empty or list(distance.index) != list(distance.columns):
-        store.skip("perturbation_distance_heatmap", "missing_fields")
-        return
-    values = distance.to_numpy(dtype=float)
-    if (
-        not np.isfinite(values).all()
-        or not np.allclose(values, values.T)
-        or not np.allclose(np.diag(values), 0)
-    ):
-        store.skip("perturbation_distance_heatmap", "invalid_distance_matrix")
-        return
-    figure, axis = plt.subplots(
-        figsize=(max(8, min(20, 0.25 * len(distance))), max(6, min(20, 0.25 * len(distance))))
-    )
-    sns.heatmap(
-        distance,
-        cmap="mako",
-        xticklabels=len(distance) <= 40,
-        yticklabels=len(distance) <= 40,
-        ax=axis,
-    )
-    axis.set_title("pairwise energy distance, not the E-test")
-    axis.set_xlabel("target")
-    axis.set_ylabel("target")
-    long = distance.reset_index(names="target_a").melt(
-        id_vars="target_a", var_name="target_b", value_name="distance"
-    )
-    store.save(
-        figure,
-        "perturbation_distance_heatmap",
-        "summary",
-        long,
-        "pairwise energy distance among guide pseudobulks; "
-        "not the contrast against the configured control",
-    )
-
-
-def draw_distance_embedding(store: FigureStore, embedding: pd.DataFrame) -> None:
-    needed = {"target_gene", "dimension_1", "dimension_2"}
-    if embedding.empty or not needed.issubset(embedding.columns):
-        store.skip("perturbation_embedding", "guide_distance_not_estimated")
-        return
-    if not np.isfinite(embedding[["dimension_1", "dimension_2"]].to_numpy(dtype=float)).all():
-        store.skip("perturbation_embedding", "non_finite_coordinates")
-        return
-    figure, axis = store._figure()
-    axis.scatter(
-        embedding["dimension_1"], embedding["dimension_2"], s=18, color=store.palette("targeting")
-    )
-    if len(embedding) <= 40:
-        for record in embedding.itertuples(index=False):
-            axis.text(record.dimension_1, record.dimension_2, str(record.target_gene), fontsize=7)
-    axis.set_xlabel("dimension 1")
-    axis.set_ylabel("dimension 2")
-    axis.set_title("MDS of pairwise distances, not the E-test")
-    store.save(
-        figure,
-        "perturbation_embedding",
-        "summary",
-        embedding,
-        "MDS of pairwise perturbation distances; not the E-test against the configured control; "
-        "axes are not biological variables",
-    )
-
-
-def draw_summary(store: FigureStore, summary: pd.DataFrame) -> None:
-    metrics = [
-        column
-        for column in (
-            "n_cells",
-            "n_guides_passing",
-            "fraction_perturbed",
-            "effect_log1p",
-            "n_significant",
-        )
-        if column in summary.columns
-        and pd.to_numeric(summary[column], errors="coerce").notna().any()
-    ]
-    if summary.empty or not metrics:
-        store.skip("perturbation_summary", "missing_fields")
-        return
-    figure, axes = plt.subplots(len(metrics), 1, figsize=(8, 2.2 * len(metrics)), sharex=False)
-    if len(metrics) == 1:
-        axes = [axes]
-    order = summary.sort_values(metrics[-1], na_position="last")
-    x = np.arange(len(order))
-    for axis, metric in zip(axes, metrics, strict=True):
-        axis.bar(x, order[metric], color=store.palette("targeting"))
-        axis.set_ylabel(metric)
-        axis.set_xticks([])
-    store.save(
-        figure,
-        "perturbation_summary",
-        "summary",
-        summary,
-        "one panel per quantity; axes are not shared",
     )
 
 
@@ -2146,12 +2460,13 @@ def target_in_de_table(adata: AnnData, *, control: str) -> pd.DataFrame:
 def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> pd.DataFrame:
     """Copy 2x2 figures whose target symbol is in that target's DE list.
 
-    Every passing target stays in ``DGE/Mixscape/figures``. This folder is the subset.
+    Every passing target stays in ``Mixscape/figures``. This folder is the subset.
     """
     table = target_in_de_table(adata, control=control)
-    data = store.data_dir("target_in_de", "target_in_de")
-    data.mkdir(parents=True, exist_ok=True)
-    table.to_csv(data / "target_in_de.tsv", sep="\t", index=False)
+    if store.plotting.get("save_plot_data", False):
+        data = store.data_dir("target_in_de", "target_in_de")
+        data.mkdir(parents=True, exist_ok=True)
+        table.to_csv(data / "target_in_de.tsv", sep="\t", index=False)
     destination = store.figure_dir("target_in_de", "target_in_de")
     destination.mkdir(parents=True, exist_ok=True)
     source = store.figure_dir("panel_mixscape_2x2", "mixscape")
@@ -2339,195 +2654,6 @@ def draw_target_in_de_gene_counts(
     )
 
 
-_EXCLUDED_TARGET_LABELS = {"", "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA"}
-_NOT_SINGLE_TARGET_STATUS = {
-    "no_guide",
-    "nt",
-    "single_nt",
-    "multi_guide",
-    "multi_excluded",
-    "flagged",
-    "flagged_high_guides",
-}
-
-
-def single_targeting_cell_counts(
-    cells: pd.DataFrame,
-    *,
-    catalog: list[str] | None = None,
-    control: str = "",
-) -> pd.DataFrame:
-    """Count single-target cells assigned to each targeting gene.
-
-    NT, no-guide, and multi-target cells are not added to a target. Targets listed
-    in ``catalog`` but absent here stay at 0 so the zero count can be reported.
-    """
-    excluded = set(_EXCLUDED_TARGET_LABELS)
-    excluded.add(control)
-    frame = cells
-    if "assignment_status" in frame.columns:
-        frame = frame[frame["assignment_status"].astype(str).eq("single_targeting")]
-    else:
-        if "n_targets" in frame.columns:
-            frame = frame[
-                pd.to_numeric(frame["n_targets"], errors="coerce").fillna(0).astype(int).eq(1)
-            ]
-        elif "n_guides" in frame.columns:
-            frame = frame[
-                pd.to_numeric(frame["n_guides"], errors="coerce").fillna(0).astype(int).eq(1)
-            ]
-        if "perturbation_status" in frame.columns:
-            frame = frame[~frame["perturbation_status"].astype(str).isin(_NOT_SINGLE_TARGET_STATUS)]
-    if frame.empty or "target_gene" not in frame.columns:
-        observed = pd.Series(dtype=int)
-    else:
-        genes = frame["target_gene"].astype(str)
-        observed = genes[~genes.isin(excluded)].value_counts()
-    names = {str(gene) for gene in observed.index if str(gene) not in excluded}
-    if catalog is not None:
-        names.update(str(gene) for gene in catalog if str(gene) not in excluded)
-    rows = [
-        {"target_gene": gene, "n_cells": int(observed.get(gene, 0))}
-        for gene in sorted(names, key=lambda gene: (-int(observed.get(gene, 0)), gene))
-    ]
-    return pd.DataFrame(rows, columns=["target_gene", "n_cells"])
-
-
-def target_cell_count_summary(table: pd.DataFrame) -> dict[str, int]:
-    counts = table["n_cells"].astype(int)
-    return {
-        "n_targets_zero": int((counts == 0).sum()),
-        "n_targets_ge_20": int((counts >= 20).sum()),
-        "n_targets_ge_40": int((counts >= 40).sum()),
-    }
-
-
-def target_cell_count_bars(table: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
-    """One blue bar per target with cells, highest first. Zeros are counted, not drawn."""
-    summary = target_cell_count_summary(table)
-    drawn = table[table["n_cells"].astype(int) > 0].reset_index(drop=True)
-    figure, axis = plt.subplots(figsize=(max(12.0, min(len(drawn), 800) * 0.02), 5.5))
-    axis.bar(
-        np.arange(len(drawn)),
-        drawn["n_cells"].astype(int),
-        color="#4C78A8",
-        width=1.0,
-        linewidth=0,
-    )
-    if len(drawn) <= 40:
-        axis.set_xticks(np.arange(len(drawn)))
-        axis.set_xticklabels(drawn["target_gene"].astype(str), rotation=90)
-    else:
-        axis.set_xticks([])
-        axis.set_xlabel(f"{len(drawn)} 个靶基因，按细胞数从高到低")
-    ceiling = float(drawn["n_cells"].max()) if len(drawn) else 1.0
-    axis.set_ylim(0, max(ceiling, 40.0) * 1.18)
-    axis.axhline(20, color="red", linewidth=1.0)
-    axis.axhline(40, color="red", linewidth=1.0)
-    axis.text(0, 20, ">=20", color="red", va="bottom", ha="left", fontsize=9)
-    axis.text(0, 40, ">=40", color="red", va="bottom", ha="left", fontsize=9)
-    axis.text(
-        0.98,
-        0.98,
-        (
-            f"细胞数 = 0 的靶基因：{summary['n_targets_zero']}\n"
-            f"细胞数 ≥ 20 的靶基因：{summary['n_targets_ge_20']}\n"
-            f"细胞数 ≥ 40 的靶基因：{summary['n_targets_ge_40']}"
-        ),
-        transform=axis.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-    )
-    axis.set_ylabel("细胞数")
-    return figure, drawn
-
-
-def draw_target_cell_counts(
-    store: FigureStore,
-    table: pd.DataFrame,
-    *,
-    source: str,
-) -> dict[str, int]:
-    summary = target_cell_count_summary(table)
-    summary["source"] = source
-    figure, _drawn = target_cell_count_bars(table)
-    folder = store.figure_dir("target_cell_counts", "qc")
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / "target_cell_counts.png"
-    figure.savefig(path, dpi=int(store.plotting.get("dpi", 300)), bbox_inches="tight")
-    plt.close(figure)
-    for stale in (path.with_suffix(".pdf"), path.with_suffix(".txt")):
-        if stale.exists():
-            stale.unlink()
-    counts = store.data_dir("target_cell_counts")
-    counts.mkdir(parents=True, exist_ok=True)
-    table.to_csv(counts / "target_cell_counts.tsv", sep="\t", index=False)
-    return summary
-
-
-def log2fc_bar_genes(frame: pd.DataFrame, target: str, *, n_top: int = 15) -> pd.DataFrame:
-    """Highest and lowest log2FC genes. The target symbol is kept even outside that window.
-
-    ``n_top`` matches pertpy ``plot_fold_change(..., n_top_vars=15)``: up to 15
-    increased genes and 15 decreased genes.
-    """
-    columns = ["gene_symbol", "log2fc"]
-    if frame.empty or "gene_symbol" not in frame.columns or "log2fc" not in frame.columns:
-        return pd.DataFrame(columns=columns)
-    work = frame.loc[:, columns].copy()
-    work["gene_symbol"] = work["gene_symbol"].astype(str)
-    work["log2fc"] = pd.to_numeric(work["log2fc"], errors="coerce")
-    work = work.dropna(subset=["log2fc"]).drop_duplicates("gene_symbol", keep="first")
-    ordered = work.sort_values(["log2fc", "gene_symbol"], ascending=[False, True])
-    increased = ordered[ordered["log2fc"] > 0].head(n_top)
-    decreased = ordered[ordered["log2fc"] < 0].nsmallest(n_top, "log2fc")
-    chosen = pd.concat([increased, decreased], ignore_index=True)
-    hit = ordered[ordered["gene_symbol"].eq(target)]
-    if not hit.empty and target not in set(chosen["gene_symbol"]):
-        chosen = pd.concat([chosen, hit.iloc[:1]], ignore_index=True)
-    chosen = chosen.drop_duplicates("gene_symbol").sort_values(
-        ["log2fc", "gene_symbol"], ascending=[False, True]
-    )
-    return chosen.reset_index(drop=True)
-
-
-def log2fc_bar_figure(genes: pd.DataFrame) -> Figure:
-    """Vertical log2FC bars. High values are dark red and low values are dark blue."""
-    from matplotlib.colors import TwoSlopeNorm
-
-    labels = genes["gene_symbol"].astype(str).tolist()
-    values = genes["log2fc"].to_numpy(dtype=float)
-    figure, axis = plt.subplots(figsize=(max(8.0, 0.32 * max(len(labels), 1)), 5))
-    limit = float(np.max(np.abs(values))) if len(values) else 1.0
-    if not np.isfinite(limit) or limit == 0:
-        limit = 1.0
-    colors = plt.get_cmap("RdBu_r")(TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)(values))
-    axis.bar(labels, values, color=colors)
-    axis.set_ylabel("Log2 fold change")
-    axis.set_xlabel("")
-    axis.tick_params(axis="x", labelrotation=90)
-    axis.set_title("")
-    return figure
-
-
-def save_target_log2fc_bar(
-    folder: Path,
-    target: str,
-    genes: pd.DataFrame,
-) -> Path:
-    selected = log2fc_bar_genes(genes, target, n_top=15)
-    figure = log2fc_bar_figure(selected)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{_safe(target)}_log2fc.png"
-    figure.savefig(path, dpi=300, bbox_inches="tight")
-    plt.close(figure)
-    for stale in (path.with_suffix(".pdf"), path.with_suffix(".txt")):
-        if stale.exists():
-            stale.unlink()
-    return path
-
-
 def draw_mixscape_target_panels(
     store: FigureStore,
     adata: AnnData,
@@ -2610,9 +2736,10 @@ def draw_mixscape_target_panels(
         record.update(status="plotted", reason="", n_heatmap_genes=n_genes)
         rows.append(record)
     selection = pd.DataFrame(rows)
-    panels = store.data_dir("mixscape_target_panels", "mixscape")
-    panels.mkdir(parents=True, exist_ok=True)
-    selection.to_csv(panels / "mixscape_target_panels.tsv", sep="\t", index=False)
+    if store.plotting.get("save_plot_data", False):
+        panels = store.data_dir("mixscape_target_panels", "mixscape")
+        panels.mkdir(parents=True, exist_ok=True)
+        selection.to_csv(panels / "mixscape_target_panels.tsv", sep="\t", index=False)
     export_target_in_de(store, adata, control=control)
     if selection.empty or (selection["status"] != "plotted").all():
         if selection.empty or not (selection["status"] == "plotted").any():
@@ -2652,7 +2779,11 @@ def _skipped_de_targets(adata: AnnData) -> list[str]:
 
 
 def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> None:
-    """Ridge plot of mixscale_score for the control and targets that passed the DE gate."""
+    """Ridge plot of mixscale_score for the control and targets that passed the DE gate.
+
+    Missing PNGs are expected when the Mixscale DE gate passes zero targets
+    (common with a temporary ``zero_guide`` control and weak/noisy effects).
+    """
     name = "mixscale_score_ridge"
     if adata is None or "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
         store.skip(name, "mixscale_not_run")
@@ -2663,6 +2794,9 @@ def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> Non
     if passed is None:
         store.skip(name, "de_gate_not_run")
         return
+    if not passed:
+        store.skip(name, "no_targets_passed_de_gate")
+        return
     labels = adata.obs["target_gene"].astype(str)
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce")
     identities = [control] if np.isfinite(scores[labels == control]).any() else []
@@ -2672,7 +2806,7 @@ def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> Non
     finite = scores[labels.isin(identities)]
     finite = finite[np.isfinite(finite)]
     if finite.empty or len(identities) < 2:
-        store.skip(name, "no_targets_with_de_genes")
+        store.skip(name, "no_targets_with_finite_scores")
         return
     grid = np.linspace(float(finite.min()) - 0.5, float(finite.max()) + 0.5, 200)
     figure, axis = plt.subplots(figsize=(8, max(4, 0.32 * len(identities))))
@@ -2812,6 +2946,9 @@ def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin
     passed = _passed_de_targets(adata, control)
     if passed is None:
         store.skip(name, "de_gate_not_run")
+        return
+    if not passed:
+        store.skip(name, "no_targets_passed_de_gate")
         return
     labels = adata.obs["target_gene"].astype(str).to_numpy()
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
@@ -3065,10 +3202,6 @@ def score_cell_cycle_after_log1p(
     adata.uns["cell_cycle_g2m_found"] = int(coverage["g2m_found"])
     adata.uns["cell_cycle_source"] = str(coverage.get("source", "scib"))
     return "scored_after_log1p"
-
-
-# Backward-compatible alias used by older call sites / notebooks.
-score_human_cell_cycle_after_log1p = score_cell_cycle_after_log1p
 
 
 def _prepare_umap_axis(axis: Axes, xlim: tuple[float, float], ylim: tuple[float, float]) -> None:

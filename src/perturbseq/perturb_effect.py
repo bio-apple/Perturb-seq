@@ -1,23 +1,19 @@
-"""Descriptive CPM effects and perturbation distances.
+"""Descriptive CPM effects.
 
 Mixscape and Mixscale live in ``perturbseq.mixscape`` and ``perturbseq.mixscale``.
+Cell-level E-test lives in ``perturbseq.distance_tests``.
 """
 
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 from anndata import AnnData
-from pertpy.tools import Distance, PseudobulkSpace
 from scipy import sparse
-from scipy.cluster.hierarchy import leaves_list, linkage
-from scipy.spatial.distance import squareform
-from sklearn.decomposition import PCA
-from sklearn.manifold import MDS
 
 from perturbseq.assign import STATUS_NT, STATUS_TARGET, control_cell_mask
 from perturbseq.config import control_spec, expected_expression
@@ -26,117 +22,6 @@ from perturbseq.io import sum_by_group
 from perturbseq.mixscape import PERTURBED
 
 DESCRIPTIVE_UNCERTAINTY = "descriptive_estimate_uncertainty_not_significance_test"
-
-
-def guide_pseudobulk(
-    adata: AnnData, config: dict[str, Any], *, branch: str = "main"
-) -> tuple[AnnData, pd.DataFrame]:
-    """Sum raw counts by real guide id.
-
-    ``main`` uses every analysis-eligible cell. ``sensitivity`` keeps perturbed
-    targeting cells and the same NT cells. A low guide count does not drop the
-    cell from the target aggregate; it only marks the guide ineligible.
-    """
-    control = control_spec(config)["control_label"]
-    identified = adata.obs["guide_id"].astype(str).ne("")
-    if branch == "sensitivity":
-        status = adata.obs["mixscape_status"].astype(str)
-        use = identified & (
-            (
-                (adata.obs["perturbation_status"].astype(str) == STATUS_TARGET)
-                & (status == PERTURBED)
-            )
-            | control_cell_mask(adata.obs, control_spec(config))
-        )
-    else:
-        use = identified
-    selected = adata[use.to_numpy()].copy()
-    if selected.n_obs == 0:
-        empty = AnnData(np.zeros((0, adata.n_vars)), var=adata.var.copy())
-        return empty, pd.DataFrame(columns=["guide_id", "target_gene", "n_cells", "total_counts"])
-    group_key = selected.obs["guide_id"].astype(str)
-    matrix = selected.layers["counts"]
-    summed, guide_ids = sum_by_group(matrix, group_key)
-    meta = (
-        selected.obs.groupby("guide_id", sort=False)
-        .agg(
-            target_gene=("target_gene", "first"),
-            n_cells=("target_gene", "size"),
-            guide_name=("guide_name", "first"),
-        )
-        .reindex(guide_ids)
-    )
-    meta["total_counts"] = summed.sum(axis=1)
-    meta["is_control"] = meta["target_gene"].astype(str) == control
-    pseudo = AnnData(X=np.rint(summed).astype(int), obs=meta, var=selected.var.copy())
-    pseudo.layers["counts_exact"] = summed
-    return pseudo, meta.reset_index().rename(columns={"index": "guide_id"})
-
-
-def perturbation_distance(
-    pseudobulk: AnnData,
-    config: dict[str, Any],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Energy distance between targets, using guide pseudobulks as the sample.
-
-    Guides are not biological replicates. Without an explicit
-    ``perturb.min_guide_replicates`` this returns empty tables instead of
-    inventing a replicate count. The cell-level E-test is a separate result.
-    """
-    perturb_cfg = config.get("perturb", {})
-    if "min_guide_replicates" not in perturb_cfg:
-        return pd.DataFrame(), pd.DataFrame()
-    control = control_spec(config)["control_label"]
-    min_reps = int(perturb_cfg["min_guide_replicates"])
-    metric = str(config["perturb"].get("distance_metric", "edistance"))
-    seed = int(config["runtime"]["seed"])
-    counts = pseudobulk.obs["target_gene"].astype(str).value_counts()
-    keep_targets = [
-        target for target, count in counts.items() if target != control and int(count) >= min_reps
-    ]
-    if len(keep_targets) < 3:
-        return pd.DataFrame(), pd.DataFrame()
-    subset = pseudobulk[pseudobulk.obs["target_gene"].astype(str).isin(keep_targets)].copy()
-    exact = subset.layers["counts_exact"] if "counts_exact" in subset.layers else subset.X
-    normalized = sc.pp.normalize_total(AnnData(exact), target_sum=1e4, inplace=False)["X"]
-    logged = np.log1p(np.asarray(normalized))
-    n_comps = max(2, min(30, subset.n_obs - 1, subset.n_vars - 1))
-    embedding = PCA(n_components=n_comps, random_state=seed).fit_transform(logged)
-    embedded = AnnData(logged, obs=subset.obs.copy())
-    embedded.obsm["X_pca"] = embedding
-    distance = Distance(metric=metric, obsm_key="X_pca")
-    matrix = distance.pairwise(embedded, groupby="target_gene", show_progressbar=False, n_jobs=1)
-    frame = pd.DataFrame(matrix)
-    frame = frame.loc[frame.index, frame.index]
-    values = frame.to_numpy(dtype=float)
-    values = (values + values.T) / 2
-    np.fill_diagonal(values, 0.0)
-    ordered = _cluster_order(values)
-    names = frame.index.to_numpy()[ordered]
-    clustered = pd.DataFrame(values[np.ix_(ordered, ordered)], index=names, columns=names)
-    coordinates = _embed_distance(clustered.to_numpy(dtype=float), seed)
-    embedding_table = pd.DataFrame(
-        {"target_gene": names, "dimension_1": coordinates[:, 0], "dimension_2": coordinates[:, 1]}
-    )
-    return clustered, embedding_table
-
-
-def _cluster_order(values: np.ndarray) -> np.ndarray:
-    if values.shape[0] < 3:
-        return np.arange(values.shape[0])
-    condensed = squareform(values, checks=False)
-    tree = linkage(condensed, method="average")
-    return leaves_list(tree)
-
-
-def _embed_distance(values: np.ndarray, seed: int) -> np.ndarray:
-    model = MDS(
-        n_components=2,
-        dissimilarity="precomputed",
-        random_state=seed,
-        normalized_stress="auto",
-    )
-    return np.asarray(model.fit_transform(values))
 
 
 def target_expression(adata: AnnData, config: dict[str, Any]) -> pd.DataFrame:
@@ -250,204 +135,6 @@ def _difference(target_mean: float, nt_mean: float) -> float:
     if not np.isfinite(target_mean) or not np.isfinite(nt_mean):
         return float("nan")
     return float(target_mean - nt_mean)
-
-
-TUTORIAL_DE_COLUMNS = [
-    "variable",
-    "baseMean",
-    "log_fc",
-    "lfcSE",
-    "stat",
-    "p_value",
-    "adj_p_value",
-    "contrast",
-    "branch",
-    "cell_type",
-]
-
-# pertpy DGE notebook order: edgeR, then PyDESeq2. Both are pseudobulk GLMs.
-TUTORIAL_PSEUDOBULK_METHODS = ("edger", "pydeseq2")
-
-
-def tutorial_differential_expression(
-    adata: AnnData, config: dict[str, Any], *, branch: str
-) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """Pseudobulk by biological sample, then the notebook's EdgeR and PyDESeq2 fits.
-
-    The pertpy differential-expression notebook aggregates counts per biological
-    sample and fits ``EdgeR`` and ``PyDESeq2`` (``fit``, then ``test_contrasts``
-    or ``compare_groups``). It does not run a cell-level rank test. pertpy 1.4
-    builds that pseudobulk with ``PseudobulkSpace.compute``. This pipeline has
-    one biological sample, so neither model is estimated and no p-values are
-    written. Guides are not replicates. Results stay out of the descriptive
-    effect tables.
-    """
-    from perturbseq.preprocess import assign_cell_type
-
-    spec = control_spec(config)
-    control = spec["control_label"]
-    sample_id = str(config["experiment"]["sample_id"])
-    assign_cell_type(adata, config)
-    statuses: list[dict[str, Any]] = []
-    frames: dict[str, list[pd.DataFrame]] = {method: [] for method in TUTORIAL_PSEUDOBULK_METHODS}
-    for cell_type, subset in _analysis_populations(adata):
-        mask = _contrast_mask(subset, branch, spec)
-        n_cells = int(mask.sum())
-        guides = (
-            subset.obs.loc[mask, "guide_id"].astype(str).nunique()
-            if n_cells and "guide_id" in subset.obs
-            else 0
-        )
-        n_target = 0
-        if n_cells:
-            n_target = int((subset.obs.loc[mask, "target_gene"].astype(str) != control).sum())
-        if n_cells == 0 or n_target == 0:
-            _skip_pseudobulk(
-                statuses, sample_id, branch, cell_type, n_cells, int(guides), "insufficient_cells"
-            )
-            continue
-        work = subset[mask].copy()
-        work.obs["biological_sample"] = sample_id
-        n_samples = int(work.obs["biological_sample"].astype(str).nunique())
-        sample_count = int(config["experiment"].get("biological_sample_count", 1))
-        if sample_count < 2 or n_samples < 2:
-            _skip_pseudobulk(
-                statuses,
-                sample_id,
-                branch,
-                cell_type,
-                n_cells,
-                int(guides),
-                "single_sample_de_not_estimable",
-            )
-            continue
-        for method in TUTORIAL_PSEUDOBULK_METHODS:
-            try:
-                frames[method].append(
-                    _pseudobulk_contrast(method, work, control, branch, cell_type)
-                )
-                statuses.append(
-                    _comparison_row(
-                        sample_id,
-                        branch,
-                        cell_type,
-                        "",
-                        method,
-                        "estimated",
-                        "",
-                        n_cells,
-                        int(guides),
-                    )
-                )
-            except Exception as exc:
-                statuses.append(
-                    _comparison_row(
-                        sample_id,
-                        branch,
-                        cell_type,
-                        "",
-                        method,
-                        "skipped",
-                        f"model_not_estimable:{exc}",
-                        n_cells,
-                        int(guides),
-                    )
-                )
-    results = {
-        method: (
-            pd.concat(rows, ignore_index=True)
-            if rows
-            else pd.DataFrame(columns=TUTORIAL_DE_COLUMNS)
-        )
-        for method, rows in frames.items()
-    }
-    return results, pd.DataFrame(statuses)
-
-
-def _skip_pseudobulk(
-    statuses: list[dict[str, Any]],
-    sample_id: str,
-    branch: str,
-    cell_type: str,
-    n_cells: int,
-    n_guides: int,
-    reason: str,
-) -> None:
-    for method in TUTORIAL_PSEUDOBULK_METHODS:
-        statuses.append(
-            _comparison_row(
-                sample_id,
-                branch,
-                cell_type,
-                "",
-                method,
-                "skipped",
-                reason,
-                n_cells,
-                n_guides,
-            )
-        )
-
-
-def _analysis_populations(adata: AnnData) -> list[tuple[str, AnnData]]:
-    if str(adata.uns.get("cell_type_scope", "unstratified")) != "annotated":
-        return [("ALL", adata)]
-    column = str(adata.uns.get("cell_type_col", "cell_type"))
-    groups = []
-    for name, index in adata.obs.groupby(column, observed=True).groups.items():
-        label = str(name)
-        if label in {"nan", "None", "<NA>", ""}:
-            continue
-        groups.append((label, adata[index]))
-    return groups or [("ALL", adata)]
-
-
-def _contrast_mask(adata: AnnData, branch: str, spec: dict[str, Any]) -> np.ndarray:
-    control = str(spec["control_label"])
-    target_gene = adata.obs["target_gene"].astype(str).to_numpy()
-    if "perturbation_status" in adata.obs:
-        nt = control_cell_mask(adata.obs, spec)
-        target = adata.obs["perturbation_status"].astype(str).to_numpy() == STATUS_TARGET
-    else:
-        nt = target_gene == control
-        target = ~nt
-    if branch == "sensitivity":
-        if "mixscape_status" not in adata.obs:
-            return np.zeros(adata.n_obs, dtype=bool)
-        target = target & (adata.obs["mixscape_status"].astype(str).to_numpy() == PERTURBED)
-    return nt | target
-
-
-def _pseudobulk_contrast(
-    method: str, work: AnnData, control: str, branch: str, cell_type: str
-) -> pd.DataFrame:
-    """Notebook call on pertpy 1.4: PseudobulkSpace sum, then fit and compare_groups.
-
-    The published notebook aggregates with decoupler and then calls
-    ``EdgeR`` / ``PyDESeq2`` ``fit`` plus ``test_contrasts`` or ``compare_groups``.
-    ``compare_groups`` is the multi-group form of that contrast and itself calls
-    ``test_contrasts``. pertpy 1.4 builds the same sum with ``PseudobulkSpace``.
-    """
-    from pertpy.tools import EdgeR, PyDESeq2
-
-    model_cls = {"edger": EdgeR, "pydeseq2": PyDESeq2}[method]
-    pdata = PseudobulkSpace().compute(
-        work,
-        target_col="biological_sample",
-        groups_col="target_gene",
-        layer_key="counts" if "counts" in work.layers else None,
-        mode="sum",
-    )
-    groups = [group for group in pdata.obs["target_gene"].astype(str).unique() if group != control]
-    model = model_cls(adata=pdata, design="~target_gene")
-    model.fit()
-    result = model.compare_groups(
-        pdata, column="target_gene", baseline=control, groups_to_compare=groups
-    )
-    result = result.copy()
-    result["branch"] = branch
-    result["cell_type"] = cell_type
-    return result
 
 
 def _bootstrap_parameters(config: dict[str, Any]) -> tuple[int, float, int]:
@@ -799,6 +486,9 @@ def descriptive_effects(
                     "bootstrap_status": boot_status,
                     "inference_status": "not_run_single_sample_descriptive",
                     "reason": "",
+                    "control_source": spec["control_source"],
+                    "control_label": control,
+                    "temporary_control": bool(spec["temporary"]),
                     "effect_status": np.where(both_zero, "not_detected_both", "descriptive"),
                 }
             )
@@ -1060,6 +750,9 @@ def _effect_columns() -> list[str]:
         "bootstrap_status",
         "inference_status",
         "reason",
+        "control_source",
+        "control_label",
+        "temporary_control",
         "effect_status",
     ]
 
@@ -1087,3 +780,52 @@ def _comparison_row(
         "n_guides": n_guides,
         "biological_sample_count": 1,
     }
+
+
+def write_descriptive_figures(
+    output_dir: Path,
+    config: dict[str, Any],
+    *,
+    effects: pd.DataFrame | None = None,
+    direction: pd.DataFrame | None = None,
+    guides: pd.DataFrame | None = None,
+) -> None:
+    """Write descriptive DE PNGs after the perturb step (E-test is separate)."""
+    from perturbseq.plotting import (
+        draw_descriptive_heatmap,
+        draw_guide_consistency,
+        draw_target_expression,
+        open_figure_store,
+    )
+
+    output_dir = Path(output_dir)
+    store = open_figure_store(output_dir, config, None)
+    # Cell-level Wilcoxon lives in the dge checkpoint; not a biological-replicate volcano.
+    store.skip("volcano", "see_wilcoxon_checkpoint")
+    store.skip("target_effect_forest", "see_wilcoxon_checkpoint")
+    if effects is None:
+        effects = _read_first(
+            output_dir / "DGE" / "descriptive" / "tables" / "effect_main.tsv",
+            output_dir / "effect_main.tsv",
+        )
+    draw_descriptive_heatmap(store, effects)
+    if direction is None:
+        direction = _read_first(
+            output_dir / "DGE" / "descriptive" / "tables" / "target_expression_effect.tsv",
+            output_dir / "target_expression_effect.tsv",
+            output_dir / "tables" / "target_expression.tsv",
+        )
+    draw_target_expression(store, direction)
+    if guides is None:
+        guides = _read_first(
+            output_dir / "DGE" / "descriptive" / "tables" / "guide_effects.tsv",
+            output_dir / "guide_effects.tsv",
+        )
+    draw_guide_consistency(store, guides)
+
+
+def _read_first(*paths: Path) -> pd.DataFrame:
+    for path in paths:
+        if path.exists():
+            return pd.read_csv(path, sep="\t")
+    return pd.DataFrame()

@@ -203,3 +203,69 @@ def _pca_on_scaled_hvg(adata: AnnData, n_comps: int, seed: int) -> None:
         "variance": work.uns["pca"]["variance"],
         "variance_ratio": work.uns["pca"]["variance_ratio"],
     }
+
+
+def write_preprocess_figures(
+    output_dir: Path, config: dict[str, Any], adata: AnnData
+) -> None:
+    """Write HVG / PCA / cluster / cell-cycle PNGs after preprocess."""
+    from perturbseq.config import default_markers
+    from perturbseq.plotting import (
+        draw_cluster_annotation,
+        draw_dotplot_markers,
+        draw_marker_detection_heatmap,
+        draw_pca_elbow,
+        draw_pca_scatter,
+        draw_umap,
+        draw_variable_features,
+        open_figure_store,
+        retire_removed_umaps,
+    )
+
+    output_dir = Path(output_dir)
+    store = open_figure_store(output_dir, config, adata)
+    retire_removed_umaps(output_dir)
+    draw_variable_features(store, adata)
+    draw_pca_elbow(store, adata)
+    draw_pca_scatter(store, adata)
+    draw_cluster_annotation(store, adata)
+    markers = default_markers(config)
+    draw_marker_detection_heatmap(store, adata, markers)
+    draw_dotplot_markers(store, adata, markers)
+    scope = str(adata.uns.get("cell_type_scope", "unstratified"))
+    labels = set(adata.obs["cell_type"].astype(str).unique()) if "cell_type" in adata.obs else set()
+    if "X_umap" in adata.obsm and scope == "annotated" and labels - {"ALL", "nan", "None", "<NA>"}:
+        draw_umap(store, adata, "cell_type", "umap_cell_type")
+    else:
+        store.skip("umap_cell_type", "unstratified_cell_type")
+    _write_cell_cycle_umap(output_dir, adata, config)
+
+
+def _write_cell_cycle_umap(
+    output_dir: Path, adata: AnnData, config: dict[str, Any]
+) -> None:
+    """Draw the cell-cycle UMAP when phase scores are already on the object."""
+    from perturbseq.config import control_spec
+    from perturbseq.plotting import draw_nt_perturbed_cell_cycle_umap
+
+    if "X_umap" not in adata.obsm or "phase" not in adata.obs.columns:
+        return
+    spec = control_spec(config)
+    control_label = str(spec["control_label"])
+    if spec["temporary"]:
+        control_values = (control_label,)
+        control_title = "zero-guide cells"
+    else:
+        control_values = tuple(
+            dict.fromkeys(
+                value for value in ("nt", control_label) if value and value not in {"nan", "None"}
+            )
+        )
+        control_title = "NT"
+    draw_nt_perturbed_cell_cycle_umap(
+        adata,
+        output_dir,
+        control_values=control_values,
+        control_title=control_title,
+        dpi=int(config.get("plotting", {}).get("dpi", 300)),
+    )

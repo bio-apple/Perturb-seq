@@ -2,7 +2,7 @@
 
 从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 与扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
 
-步骤：`io` → `assign` → `preprocess` → `mixscape` → `mixscale` → `perturb` → `report`。细则见 [docs/](docs/README.md)。
+步骤：`io` → `assign` → `preprocess` → `{dge ‖ mixscape ‖ mixscale}` → `perturb`。后三者只依赖 preprocess、互不依赖；默认全量跑时在 preprocess 之后**进程池并发**，再跑 perturb。图分目录 `Mixscape/`、`mixscale/` 等。各分析步结束时写出对应 PNG。成功跑完后磁盘只保留 `checkpoints/*.h5ad` 与 PNG。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
 
 ## 环境搭建
 
@@ -32,25 +32,29 @@ python -m perturbseq \
   --nt-control NT_NAME
 ```
 
-`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control` 时使用 `zero_guide` 临时对照。
+`NT_NAME` 换成参考表里的非靶向 guide 名。去掉 `--nt-control`，或指定了但数据中没有可用 NT 细胞时，使用 `zero_guide` 临时对照（结果里会标明 `temporary` / `zero_guide_cells`）。
 
 | 常用参数 | 说明 |
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
-| `--steps` | 默认 `all`；可逗号子集，如 `mixscape` 或 `mixscale --resume` |
-| UMI / ribo | 须显式 `--min-umi`+`--max-umi` 或 `--max-ribo-frac`；默认不做这两项过滤 |
+| `--steps` | 默认 `all`（preprocess 后三步并行）；可逗号子集，如 `mixscape --resume`；子集里含 ≥2 个 `dge`/`mixscape`/`mixscale` 时同样并行 |
+| UMI | 须显式 `--min-umi`+`--max-umi`；默认不做 UMI 绝对阈值过滤 |
 | 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
+| QC 指标 | `nCount` / `nFeature` / `percent.mt`（及可选 UMI 绝对阈值） |
 
 ## 输出概览
 
+成功结束后保留 **`checkpoints/*.h5ad`** 与各步 PNG。表与门槛等在对应 checkpoint 的 `uns`；图按步骤落在下列目录：
+
 | 目录 | 内容 |
 | --- | --- |
-| `qc/` | mRNA / gRNA 统计 |
-| `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
-| `DGE/Mixscape/` | Mixscape 门槛、摘要、class / 2x2 / fraction |
-| `DGE/mixscale/` | Mixscale ridge / scatter、门槛 |
-| `DGE/descriptive/` | 描述性 CPM log2FC 与相关效应表 |
-| `E-distance/` | 对当前对照的 E-test；可选 guide 伪批量距离 |
+| `checkpoints/` | 逐步 `*.h5ad`（含表 / 门槛 / 效应等 `uns`） |
+| `qc/figures/` | mRNA / gRNA / QC 统计图 |
+| `UMAP/figures/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
+| `Mixscape/figures/` | Mixscape class / 2x2 / fraction 等 |
+| `mixscale/figures/` | Mixscale ridge / scatter |
+| `DGE/descriptive/figures/` | 描述性 CPM log2FC 相关图 |
+| `E-distance/figures/` | 细胞级 E-test |
 
-图只写 PNG（`plotting.dpi` 默认 300）；无 PDF、无同名图旁 txt。配置与规则见 [docs/analysis.md](docs/analysis.md)，路径与跳过条件见 [docs/outputs.md](docs/outputs.md)。
+Wilcoxon（`dge`）无独立 PNG；结果在 `checkpoints/dge.h5ad`。图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。

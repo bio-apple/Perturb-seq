@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -73,6 +74,12 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     spec = control_spec(config)
     control = spec["control_label"]
     control_cells = control_cell_mask(adata.obs, spec)
+    adata.uns["control_source"] = spec["control_source"]
+    adata.uns["control_label"] = control
+    adata.uns["control_temporary"] = bool(spec["temporary"])
+    adata.uns["control_phrase"] = spec["control_phrase"]
+    adata.uns["control_note"] = spec["note"]
+    adata.uns["control_fallback_from"] = str(spec.get("fallback_from", ""))
     if spec["temporary"] and int(control_cells.sum()) == 0:
         adata.obs["mixscape_class"] = NOT_EVALUATED
         adata.obs["mixscape_class_global"] = NOT_EVALUATED
@@ -82,9 +89,6 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         return adata
     if spec["temporary"]:
         stamp_control_label(adata.obs, control_cells, "target_gene", control)
-        adata.uns["control_source"] = spec["control_source"]
-        adata.uns["control_label"] = control
-        adata.uns["control_note"] = spec["note"]
     mixscape_settings = config.get("mixscape", {})
     seed = int(config["runtime"]["seed"])
     if "highly_variable" not in adata.var:
@@ -137,10 +141,10 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     keep = labels.isin(passed | {control}).to_numpy()
     work = adata[keep, hvg].copy()
     requested_dims = int(mixscape_settings.get("n_dims", DEFAULT_SIGNATURE_NDIMS))
-    n_dims = _prepare_signature_dims(work, requested_dims, seed)
+    n_dims = prepare_signature_dims(work, requested_dims, seed)
     n_nt = int((work.obs["target_gene"].astype(str) == control).sum())
     if n_nt < 1:
-        raise ValueError("没有 NT 细胞，无法计算 perturbation signature。")
+        raise ValueError(f"没有对照细胞（{control}），无法计算 perturbation signature。")
     requested_neighbors = int(
         mixscape_settings.get("n_control_neighbors", VIGNETTE_CONTROL_NEIGHBORS)
     )
@@ -149,7 +153,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         adata.uns["mixscape_neighbor_note"] = (
             f"n_control_neighbors reduced from {requested_neighbors} to {n_neighbors}"
         )
-    split_by = _real_cell_type_split(work, config)
+    split_by = real_cell_type_split(work, config)
     signature_args: dict[str, Any] = {
         "pert_key": "target_gene",
         "control": control,
@@ -229,10 +233,10 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     return adata
 
 
-def _real_cell_type_split(adata: AnnData, config: dict[str, Any]) -> str | None:
+def real_cell_type_split(adata: AnnData, config: dict[str, Any]) -> str | None:
     """Return a real cell-type column. Never invent a replicate split."""
     key = None
-    for section in ("preprocess", "perturb", "mixscape"):
+    for section in ("preprocess", "perturb", "mixscape", "mixscale"):
         candidate = config.get(section, {}).get("cell_type_key")
         if candidate:
             key = str(candidate)
@@ -251,7 +255,7 @@ def _real_cell_type_split(adata: AnnData, config: dict[str, Any]) -> str | None:
     return key
 
 
-def _prepare_signature_dims(work: AnnData, requested: int, seed: int) -> int:
+def prepare_signature_dims(work: AnnData, requested: int, seed: int) -> int:
     """Width of the PCA used to find NT neighbors.
 
     Pertpy uses ``X_pca`` when the gene count exceeds Scanpy's PC threshold.
@@ -353,3 +357,73 @@ def mixscape_fraction(adata: AnnData) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def write_mixscape_figures(
+    output_dir: Path,
+    config: dict[str, Any],
+    adata: AnnData,
+    *,
+    fractions: pd.DataFrame | None = None,
+) -> None:
+    """Write Mixscape / Mixscape-UMAP PNGs at the end of the mixscape step."""
+    from perturbseq.config import control_spec
+    from perturbseq.plotting import (
+        draw_mixscape_class_counts,
+        draw_mixscape_class_global_umap,
+        draw_mixscape_fraction,
+        draw_mixscape_target_panels,
+        draw_target_de_counts,
+        draw_target_in_de_gene_counts,
+        draw_umap,
+        open_figure_store,
+    )
+
+    output_dir = Path(output_dir)
+    store = open_figure_store(output_dir, config, adata)
+    label = perturbation_type(config)
+    contrast = control_spec(config)["control_label"]
+    if "X_umap" in adata.obsm and "mixscape_class" in adata.obs:
+        draw_umap(store, adata, "mixscape_class", "umap_mixscape_class")
+    else:
+        store.skip("umap_mixscape_class", "missing_fields")
+    if "mixscape_class" in adata.obs and "X_umap_mixscape" in adata.obsm:
+        draw_umap(store, adata, "mixscape_class", "umap_mixscape", embedding="X_umap_mixscape")
+    else:
+        reason = (
+            "mixscape_not_run" if "mixscape_class" not in adata.obs else "signature_umap_not_run"
+        )
+        store.skip("umap_mixscape", reason)
+    draw_mixscape_class_global_umap(store, adata, label)
+    draw_mixscape_class_counts(store, adata, label)
+    plotting = config.get("plotting", {})
+    draw_mixscape_target_panels(
+        store,
+        adata,
+        label,
+        control=contrast,
+        seed=int(config["runtime"]["seed"]),
+        max_genes=int(plotting.get("mixscape_heatmap_max_genes", 20)),
+        max_cells=int(plotting.get("mixscape_heatmap_max_cells", 300)),
+        pval_cutoff=float(config.get("mixscape", {}).get("pval_cutoff", 0.05)),
+        lfc_line=float(config.get("mixscape", {}).get("logfc_threshold", 0.25)),
+    )
+    draw_target_de_counts(
+        store,
+        adata,
+        control=contrast,
+        min_de_genes=int(config.get("mixscape", {}).get("min_de_genes", 5)),
+    )
+    draw_target_in_de_gene_counts(
+        store,
+        adata,
+        control=contrast,
+        min_de_genes=int(config.get("mixscape", {}).get("min_de_genes", 5)),
+    )
+    if fractions is None:
+        stored = adata.uns.get("mixscape_summary")
+        if isinstance(stored, pd.DataFrame) and not stored.empty:
+            fractions = stored
+        else:
+            fractions = mixscape_fraction(adata) if "mixscape_status" in adata.obs else pd.DataFrame()
+    draw_mixscape_fraction(store, fractions)

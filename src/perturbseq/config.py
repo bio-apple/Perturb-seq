@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
-CRISPR_MODES = ("CRISPR_KO", "CRISPRi", "CRISPRa", "other")
 CRISPR_ALIASES = {
     "KO": "CRISPR_KO",
     "CRISPR_KO": "CRISPR_KO",
@@ -22,9 +22,30 @@ _ORGANISM_ERROR = "experiment.organism 只能填 human 或 mouse。"
 DIRECTIONS = ("down", "up", "bidirectional", "unknown")
 POLICIES = ("drop",)
 MITO_PREFIX_BY_ORGANISM = {"human": "MT-", "mouse": "mt-"}
-RIBO_PREFIXES_BY_ORGANISM = {"human": ("RPL", "RPS"), "mouse": ("Rpl", "Rps")}
-NO_NT_CONTROL = "no_nt_control"
 ZERO_GUIDE_LABEL = "zero_guide"
+# Default GEX marker panels for detection heatmap / dotplot when plotting.markers is unset.
+DEFAULT_MARKERS_BY_ORGANISM = {
+    "human": (
+        "ACTB",
+        "GAPDH",
+        "B2M",
+        "MALAT1",
+        "NEAT1",
+        "UBC",
+        "PPIA",
+        "EEF1A1",
+    ),
+    "mouse": (
+        "Actb",
+        "Gapdh",
+        "B2m",
+        "Malat1",
+        "Neat1",
+        "Ubc",
+        "Ppia",
+        "Eef1a1",
+    ),
+}
 CONTROL_SOURCE_ZERO = "zero_guide_cells"
 CONTROL_SOURCE_DESIGNED = "designed_nt"
 # Shared width for preprocess PCA (n_pcs) and Mixscape CalcPerturbSig (n_dims).
@@ -76,12 +97,6 @@ def read_config(path: str | Path) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ConfigError("配置文件必须是一个 YAML 映射。")
     loaded["_config_path"] = str(config_path.resolve())
-    return loaded
-
-
-def load_config(path: str | Path) -> dict[str, Any]:
-    loaded = read_config(path)
-    validate_config(loaded)
     return loaded
 
 
@@ -138,8 +153,6 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
             qc[key] = customer[key]
     if customer.get("max_mito_frac") is not None:
         qc["max_mito_frac"] = customer["max_mito_frac"]
-    if customer.get("max_ribo_frac") is not None:
-        qc["max_ribo_frac"] = customer["max_ribo_frac"]
 
     cell_type_key = _blank_to_none(customer.get("cell_type_key"))
     batch_key = _blank_to_none(customer.get("batch_key"))
@@ -195,6 +208,15 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "nt_control": None,
         "flag_guides_above": None,
     },
+    # Filled by assign via resolve_control_spec; single source of truth for contrasts.
+    "control": {
+        "control_source": None,
+        "control_label": None,
+        "temporary": None,
+        "control_phrase": None,
+        "note": None,
+        "fallback_from": None,
+    },
     "qc": {
         "min_cells_per_target": None,
         "min_cells_per_guide": None,
@@ -204,6 +226,7 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "min_genes": None,
         "max_genes": None,
         "max_mito_frac": None,
+        # Rejected in validate_config (unsupported key).
         "max_ribo_frac": None,
         "mito_gene_prefix": None,
         "mito_prefix": None,
@@ -245,12 +268,10 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "allow_random_split_replicates": None,
     },
     "perturb": {
-        "distance_metric": None,
         "mixscape_min_de_genes": None,
         "mixscape_logfc": None,
         "mixscape_pval": None,
         "cell_type_key": None,
-        "min_guide_replicates": None,
     },
     "target_expression": {
         "min_nt_detection_fraction": None,
@@ -271,6 +292,8 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "volcano_lfc": None,
         "heatmap_max_genes": None,
         "save_plot_data": None,
+        "hist_bins": None,
+        "markers": None,
         "palette": _ANY_KEYS,
     },
     "run": {"random_seed": None, "output_dir": None},
@@ -350,6 +373,10 @@ def validate_config(config: dict[str, Any]) -> None:
     labels["targets_per_cell"] = targets_per_cell
 
     qc = _section(config, "qc")
+    if "max_ribo_frac" in qc:
+        raise ConfigError(
+            "不支持 qc.max_ribo_frac：请删除该键（及命令行 --max-ribo-frac）。QC 指标为 nCount / nFeature / percent.mt。"
+        )
     for key in ("min_cells_per_target", "min_cells_per_guide"):
         value = qc.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -428,28 +455,122 @@ def nt_control_name(config: dict[str, Any]) -> str:
     return _optional_text(labels.get("nt_control"))
 
 
-def control_spec(config: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the contrast. A designed NT is never replaced by zero-guide cells.
+def _designed_control_spec(designed: str) -> dict[str, Any]:
+    return {
+        "control_source": CONTROL_SOURCE_DESIGNED,
+        "control_label": designed,
+        "temporary": False,
+        "control_phrase": designed,
+        "note": "",
+        "fallback_from": "",
+    }
 
-    Without ``labels.nt_control``, cells that have no detected guide RNA are a
-    temporary control. The label is ``zero_guide``, not a Non-Targeting guide name.
-    """
-    designed = nt_control_name(config)
-    if designed:
-        return {
-            "control_source": CONTROL_SOURCE_DESIGNED,
-            "control_label": designed,
-            "temporary": False,
-            "control_phrase": designed,
-            "note": "",
-        }
+
+def _temporary_control_spec(*, fallback_from: str = "") -> dict[str, Any]:
+    note = TEMPORARY_CONTROL_NOTE
+    if fallback_from:
+        note = (
+            f"{TEMPORARY_CONTROL_NOTE} "
+            f"已配置 labels.nt_control={fallback_from!r}，但数据中无可用设计 NT 细胞，"
+            "已回退到临时 zero_guide。"
+        )
     return {
         "control_source": CONTROL_SOURCE_ZERO,
         "control_label": ZERO_GUIDE_LABEL,
         "temporary": True,
         "control_phrase": "zero-guide cells",
-        "note": TEMPORARY_CONTROL_NOTE,
+        "note": note,
+        "fallback_from": fallback_from,
     }
+
+
+def bind_control_spec(config: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """Persist the resolved contrast so every step reads the same control_spec."""
+    block = {
+        "control_source": str(spec["control_source"]),
+        "control_label": str(spec["control_label"]),
+        "temporary": bool(spec["temporary"]),
+        "control_phrase": str(spec.get("control_phrase", spec["control_label"])),
+        "note": str(spec.get("note", "")),
+        "fallback_from": str(spec.get("fallback_from", "")),
+    }
+    config["control"] = block
+    return dict(block)
+
+
+def control_spec(config: dict[str, Any]) -> dict[str, Any]:
+    """Contrast for this run: designed NT when available, else temporary zero_guide.
+
+    After ``assign``, ``config['control']`` is the single source of truth (including
+    data-level fallback when ``labels.nt_control`` is set but no NT cells exist).
+    Before assign, this is provisional from ``labels.nt_control`` only.
+    """
+    block = config.get("control")
+    if isinstance(block, dict) and block.get("control_label") not in (None, ""):
+        return {
+            "control_source": str(block.get("control_source", CONTROL_SOURCE_ZERO)),
+            "control_label": str(block["control_label"]),
+            "temporary": bool(block.get("temporary", False)),
+            "control_phrase": str(
+                block.get("control_phrase", block["control_label"])
+            ),
+            "note": str(block.get("note", "")),
+            "fallback_from": str(block.get("fallback_from", "")),
+        }
+    designed = nt_control_name(config)
+    if designed:
+        return _designed_control_spec(designed)
+    return _temporary_control_spec()
+
+
+def resolve_control_spec(config: dict[str, Any], obs) -> dict[str, Any]:
+    """Finalize the contrast from config + assignment ledger (call in assign).
+
+    Designed NT wins only when usable NT cells exist. Otherwise zero-guide cells
+    become an explicit temporary control.
+    """
+    from perturbseq.assign import control_cell_mask
+
+    designed = nt_control_name(config)
+    if designed:
+        designed_spec = _designed_control_spec(designed)
+        mask = np.asarray(control_cell_mask(obs, designed_spec), dtype=bool)
+        if "qc_pass" in getattr(obs, "columns", []):
+            qc = obs["qc_pass"]
+            if getattr(qc, "dtype", None) is not None and str(qc.dtype) == "bool":
+                qc_ok = qc.fillna(False).to_numpy(dtype=bool)
+            else:
+                qc_ok = qc.astype(str).str.lower().isin(["true", "1"]).to_numpy()
+            mask = mask & np.asarray(qc_ok, dtype=bool)
+        if int(mask.sum()) > 0:
+            return bind_control_spec(config, designed_spec)
+        return bind_control_spec(config, _temporary_control_spec(fallback_from=designed))
+    return bind_control_spec(config, _temporary_control_spec())
+
+
+def restore_control_spec(config: dict[str, Any], adata) -> dict[str, Any] | None:
+    """Reload a previously resolved contrast from ``adata.uns`` (resume path)."""
+    uns = getattr(adata, "uns", None)
+    if not isinstance(uns, dict):
+        return None
+    label = uns.get("control_label")
+    source = uns.get("control_source")
+    if label in (None, "") or source in (None, ""):
+        return None
+    temporary = uns.get("control_temporary")
+    if temporary is None:
+        temporary = str(source) == CONTROL_SOURCE_ZERO
+    return bind_control_spec(
+        config,
+        {
+            "control_source": str(source),
+            "control_label": str(label),
+            "temporary": bool(temporary),
+            "control_phrase": str(uns.get("control_phrase", label)),
+            "note": str(uns.get("control_note", "")),
+            "fallback_from": str(uns.get("control_fallback_from", "")),
+        },
+    )
 
 
 def verify_species_consistency(
@@ -523,16 +644,25 @@ def verify_species_consistency(
     return config
 
 
-def ribo_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
-    """Ribosomal-protein symbol prefixes. Human is RPL/RPS, mouse is Rpl/Rps.
+def default_markers(config: dict[str, Any]) -> list[str]:
+    """Marker gene symbols for GEX detection heatmap / dotplot.
 
-    Matching is case-insensitive. These are not mitochondrial prefixes and not an rRNA gene set.
+    Prefer ``plotting.markers`` when set; otherwise organism-specific housekeeping
+    defaults from ``DEFAULT_MARKERS_BY_ORGANISM``.
     """
+    configured = config.get("plotting", {}).get("markers")
+    if configured is not None:
+        if not isinstance(configured, list | tuple) or not configured:
+            raise ConfigError("plotting.markers 必须是非空基因符号列表。")
+        markers = [str(gene).strip() for gene in configured if str(gene).strip()]
+        if not markers:
+            raise ConfigError("plotting.markers 必须是非空基因符号列表。")
+        return markers
     organism = str(config["experiment"].get("organism", ""))
-    prefixes = RIBO_PREFIXES_BY_ORGANISM.get(organism)
-    if prefixes is None:
+    defaults = DEFAULT_MARKERS_BY_ORGANISM.get(organism)
+    if defaults is None:
         raise ConfigError(_ORGANISM_ERROR)
-    return prefixes
+    return list(defaults)
 
 
 def mito_prefix(config: dict[str, Any]) -> str:
@@ -675,7 +805,6 @@ def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
 def _require_confirmed_qc(qc: dict[str, Any]) -> None:
     _require_gene_cutoffs(qc)
     _require_mito_cutoff(qc)
-    _optional_fraction(qc, "max_ribo_frac", "qc.max_ribo_frac")
     present = [key for key in _QC_CUTOFFS if qc.get(key) is not None]
     if not present:
         return
@@ -685,7 +814,6 @@ def _require_confirmed_qc(qc: dict[str, Any]) -> None:
             "或者全部留空（留空则不做 UMI 绝对阈值过滤）。"
             "线粒体比例上限由 qc.max_mito_frac 单独设置（默认 0.2）。"
             "表达基因数上下限由 qc.min_genes / qc.max_genes 单独设置。"
-            "核糖体比例上限由 --max-ribo-frac / qc.max_ribo_frac 显式给出，缺省则不做 ribo 过滤。"
         )
     for key in _QC_CUTOFFS:
         value = qc.get(key)
@@ -718,18 +846,6 @@ def _require_mito_cutoff(qc: dict[str, Any]) -> None:
     if not 0 <= float(value) <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")
     qc["max_mito_frac"] = float(value)
-
-
-def _optional_fraction(section: dict[str, Any], key: str, label: str) -> None:
-    """Validate one optional 0–1 cutoff. Absence is allowed."""
-    if section.get(key) is None:
-        return
-    value = section.get(key)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ConfigError(f"{label} 必须是数值。")
-    if not 0 <= float(value) <= 1:
-        raise ConfigError(f"{label} 必须在 0 到 1 之间。")
-    section[key] = float(value)
 
 
 def _blank_to_none(value: Any) -> str | None:

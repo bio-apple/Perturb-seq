@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -319,19 +320,30 @@ def control_cell_mask(obs: pd.DataFrame, spec: dict[str, Any]) -> np.ndarray:
         if "assignment_status" in obs.columns and "n_guides" in obs.columns:
             assignment = obs["assignment_status"].astype(str)
             n_guides = pd.to_numeric(obs["n_guides"], errors="coerce").fillna(0)
-            mask = (assignment.eq(STATUS_NO_GUIDE) & n_guides.eq(0)).to_numpy()
+            mask = _writable_bool(
+                (assignment.eq(STATUS_NO_GUIDE) & n_guides.eq(0)).to_numpy()
+            )
         else:
             label = str(spec.get("control_label", ""))
-            mask = _obs_eq(obs, "target_gene", label) | _obs_eq(obs, "perturbation_status", label)
+            mask = _writable_bool(
+                _obs_eq(obs, "target_gene", label) | _obs_eq(obs, "perturbation_status", label)
+            )
         qc_pass = _flag_column(obs, "qc_pass")
         if qc_pass is not None:
             mask &= qc_pass
         return mask & ~shallow
     label = str(spec.get("control_label", ""))
-    designed = _obs_eq(obs, "perturbation_status", STATUS_NT) | _obs_eq(obs, "target_gene", label)
+    designed = _writable_bool(
+        _obs_eq(obs, "perturbation_status", STATUS_NT) | _obs_eq(obs, "target_gene", label)
+    )
     if "assignment_status" in obs.columns:
         designed &= ~_obs_eq(obs, "assignment_status", STATUS_NO_GUIDE)
     return designed & ~(shallow & ~_single_nt_rows(obs))
+
+
+def _writable_bool(values: np.ndarray) -> np.ndarray:
+    """Copy boolean masks so in-place ``&=`` / ``|=`` works under pandas CoW."""
+    return np.array(values, dtype=bool, copy=True)
 
 
 def _flag_column(obs: pd.DataFrame, column: str) -> np.ndarray | None:
@@ -339,14 +351,18 @@ def _flag_column(obs: pd.DataFrame, column: str) -> np.ndarray | None:
         return None
     values = obs[column]
     if pd.api.types.is_bool_dtype(values):
-        return values.fillna(False).to_numpy(dtype=bool)
-    return values.astype(str).str.strip().str.lower().isin(["true", "1"]).to_numpy()
+        return _writable_bool(values.fillna(False).to_numpy(dtype=bool))
+    return _writable_bool(
+        values.astype(str).str.strip().str.lower().isin(["true", "1"]).to_numpy()
+    )
 
 
 def _low_library_no_guide_rows(obs: pd.DataFrame) -> np.ndarray:
     if "exclusion_reason_primary" not in obs.columns:
         return np.zeros(len(obs), dtype=bool)
-    return obs["exclusion_reason_primary"].astype(str).eq(LOW_LIBRARY_NO_GUIDE).to_numpy()
+    return _writable_bool(
+        obs["exclusion_reason_primary"].astype(str).eq(LOW_LIBRARY_NO_GUIDE).to_numpy()
+    )
 
 
 def _single_nt_rows(obs: pd.DataFrame) -> np.ndarray:
@@ -357,7 +373,7 @@ def _single_nt_rows(obs: pd.DataFrame) -> np.ndarray:
 def _obs_eq(obs: pd.DataFrame, column: str, value: str) -> np.ndarray:
     if column not in obs.columns:
         return np.zeros(len(obs), dtype=bool)
-    return obs[column].astype(str).eq(value).to_numpy()
+    return _writable_bool(obs[column].astype(str).eq(value).to_numpy())
 
 
 def _is_nt(guide_name: str, target_gene_name: str, nt_control: str) -> bool:
@@ -410,28 +426,12 @@ def mito_fraction(mito_counts: np.ndarray, total_counts: np.ndarray) -> np.ndarr
     """Share of library size on a 0–1 scale.
 
     A library size of 0 has no denominator, so the value is missing rather than 0.
-    Mitochondrial and ribosomal fractions both use this scale.
     """
     part = np.asarray(mito_counts, dtype=np.float64).ravel()
     total = np.asarray(total_counts, dtype=np.float64).ravel()
     fraction = np.full(total.shape, np.nan, dtype=np.float64)
     np.divide(part, total, out=fraction, where=total > 0)
     return fraction
-
-
-def ribo_symbol_mask(symbols: pd.Series, prefixes: tuple[str, ...]) -> np.ndarray:
-    """Ribosomal-protein genes by symbol prefix. Matching is case-insensitive.
-
-    Human prefixes are RPL and RPS. Mouse prefixes are Rpl and Rps. This is not
-    a mitochondrial test and it is not an rRNA gene set. MRPL/Mrpl do not match.
-    """
-    folded = symbols.astype(str).str.casefold()
-    mask = np.zeros(len(folded), dtype=bool)
-    for prefix in prefixes:
-        text = str(prefix).casefold()
-        if text:
-            mask |= folded.str.startswith(text).to_numpy()
-    return mask
 
 
 def capture_efficiency(guide_umi: np.ndarray, total_counts: np.ndarray) -> np.ndarray:
@@ -494,60 +494,11 @@ def capture_library_correlation(table: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
-def qc_metrics(
-    adata: AnnData,
-    mito_prefix: str,
-    ribo_prefixes: tuple[str, ...] = ("RPL", "RPS"),
-) -> pd.DataFrame:
-    counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
-    if sparse.issparse(counts):
-        total = np.asarray(counts.sum(axis=1)).ravel()
-        detected = np.asarray((counts > 0).sum(axis=1)).ravel()
-    else:
-        total = np.asarray(counts.sum(axis=1)).ravel()
-        detected = np.asarray((counts > 0).sum(axis=1)).ravel()
-    symbols = adata.var["gene_symbol"].astype(str)
-    mito = symbols.str.startswith(mito_prefix).to_numpy()
-    ribo = ribo_symbol_mask(symbols, ribo_prefixes)
-    mito_sum = _gene_block_sum(counts, mito, adata.n_obs)
-    ribo_sum = _gene_block_sum(counts, ribo, adata.n_obs)
-    if "guide_umi" in adata.obsm:
-        guide_block = adata.obsm["guide_umi"]
-        guide_total = np.asarray(guide_block.sum(axis=1)).ravel()
-    else:
-        guide_total = np.zeros(adata.n_obs, dtype=np.float64)
-    mito_frac = mito_fraction(mito_sum, total)
-    ribo_frac = mito_fraction(ribo_sum, total)
-    return pd.DataFrame(
-        {
-            "cell_barcode": adata.obs_names.astype(str),
-            "total_counts": total,
-            "n_genes_by_counts": detected,
-            "pct_counts_mito": mito_frac,
-            "pct_counts_ribo": ribo_frac,
-            "ribo_frac": ribo_frac,
-            "guide_umi_total": guide_total,
-            "grna_capture_efficiency": capture_efficiency(guide_total, total),
-        }
-    )
-
-
-def _gene_block_sum(counts: Any, mask: np.ndarray, n_obs: int) -> np.ndarray:
-    if not np.any(mask):
-        return np.zeros(n_obs, dtype=np.float64)
-    block = counts[:, mask]
-    if sparse.issparse(block):
-        return np.asarray(block.sum(axis=1)).ravel()
-    return np.asarray(block.sum(axis=1)).ravel()
-
-
 def derive_qc_thresholds(qc: dict[str, Any]) -> dict[str, float]:
     """Resolve QC cutoffs from fixed config / CLI values only.
 
     Gene bounds and ``max_mito_frac`` always come from software defaults or the
     CLI. UMI bounds apply only when both ``min_umi`` and ``max_umi`` are set.
-    Ribosome fraction applies only when ``max_ribo_frac`` is set. There is no
-    MAD / distribution-derived fallback.
     """
     if qc.get("min_genes") is None or qc.get("max_genes") is None:
         raise ValueError("缺少 qc.min_genes 或 qc.max_genes。")
@@ -561,8 +512,6 @@ def derive_qc_thresholds(qc: dict[str, Any]) -> dict[str, float]:
     if qc.get("min_umi") is not None and qc.get("max_umi") is not None:
         thresholds["min_umi"] = float(qc["min_umi"])
         thresholds["max_umi"] = float(qc["max_umi"])
-    if qc.get("max_ribo_frac") is not None:
-        thresholds["max_ribo_frac"] = float(qc["max_ribo_frac"])
     return thresholds
 
 
@@ -595,20 +544,19 @@ def apply_eligibility(
 ) -> pd.DataFrame:
     """Attach QC, every exclusion reason, and one primary reason per cell.
 
-    ``low_library_rule`` is retained for ledger compatibility but is disabled
-    after MAD-based QC removal (pass ``None`` or ``applied=False``). Retention
-    uses unique target-gene count (``n_targets``), not guide count.
+    ``low_library_rule`` is kept for the filter-stage ledger; pass ``None`` or
+    ``applied=False`` so that stage adds zero exclusions. Retention uses unique
+    target-gene count (``n_targets``), not guide count.
     """
     table = annotated.copy()
-    for column in ("total_counts", "n_genes_by_counts", "mito_frac", "ribo_frac"):
+    for column in ("total_counts", "n_genes_by_counts", "mito_frac"):
         if column not in table.columns:
             raise ValueError(f"缺少 {column}，不能把未计算的 QC 默认为通过。")
         table[column] = pd.to_numeric(table[column], errors="coerce")
     total = table["total_counts"].to_numpy(dtype=float)
     genes = table["n_genes_by_counts"].to_numpy(dtype=float)
     mito = table["mito_frac"].to_numpy(dtype=float)
-    ribo = table["ribo_frac"].to_numpy(dtype=float)
-    finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito) & np.isfinite(ribo)
+    finite = np.isfinite(total) & np.isfinite(genes) & np.isfinite(mito)
     if "max_genes" not in thresholds:
         raise ValueError("缺少 max_genes，不能把未计算的基因数 QC 默认为通过。")
     empty = np.zeros(len(table), dtype=bool)
@@ -620,11 +568,6 @@ def apply_eligibility(
     high_genes = finite & (genes >= float(thresholds["max_genes"]))
     # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.2).
     high_mito = finite & (mito >= float(thresholds["max_mito_frac"]))
-    high_ribo = (
-        finite & (ribo > float(thresholds["max_ribo_frac"]))
-        if "max_ribo_frac" in thresholds
-        else empty
-    )
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
     qc_pass = (
         finite
@@ -633,7 +576,6 @@ def apply_eligibility(
         & ~low_genes
         & ~high_genes
         & ~high_mito
-        & ~high_ribo
         & ~low_library
     )
     qc_reasons = []
@@ -651,8 +593,6 @@ def apply_eligibility(
             reasons.append("high_genes")
         if high_mito[index]:
             reasons.append("high_mito")
-        if high_ribo[index]:
-            reasons.append("high_ribo")
         if low_library[index]:
             reasons.append(LOW_LIBRARY_NO_GUIDE)
         qc_reasons.append(json.dumps(reasons))
@@ -876,3 +816,86 @@ def cells_per_target(table: pd.DataFrame, min_cells_per_guide: int) -> pd.DataFr
             }
         )
     return pd.DataFrame(rows).sort_values("n_cells", ascending=False)
+
+
+def write_qc_figures(
+    output_dir: Path,
+    config: dict[str, Any],
+    adata: AnnData | None = None,
+    *,
+    cell_status: pd.DataFrame | None = None,
+    targets: pd.DataFrame | None = None,
+) -> None:
+    """Write QC / assignment PNGs at the end of the assign step."""
+    from perturbseq.config import control_spec
+    from perturbseq.plotting import (
+        draw_assignment_status,
+        draw_cells_per_target,
+        draw_guides_per_cell,
+        draw_qc_histograms,
+        draw_qc_scatter,
+        draw_scatter_ncount_nfeature_gex,
+        draw_temporary_control_qc,
+        open_figure_store,
+        remove_qc_violin_products,
+        remove_temporary_control_qc,
+    )
+
+    output_dir = Path(output_dir)
+    remove_qc_violin_products(output_dir)
+    store = open_figure_store(output_dir, config, adata)
+    if cell_status is None:
+        ledger_path = output_dir / "cell_status.tsv"
+        cell_status = (
+            pd.read_csv(ledger_path, sep="\t") if ledger_path.exists() else pd.DataFrame()
+        )
+    if not cell_status.empty and "assignment_status" in cell_status.columns:
+        draw_assignment_status(store, cell_status["assignment_status"])
+        draw_guides_per_cell(store, cell_status["n_guides"])
+    else:
+        for name in ("assignment_status_bar", "guides_per_cell"):
+            store.skip(name, "missing_fields")
+    if targets is None:
+        targets_path = output_dir / "qc" / "tables" / "cells_per_target.tsv"
+        targets = (
+            pd.read_csv(targets_path, sep="\t") if targets_path.exists() else pd.DataFrame()
+        )
+    draw_cells_per_target(store, targets, int(config["qc"]["min_cells_per_target"]))
+    qc_table, qc_note = _qc_population(cell_status, adata)
+    if qc_table.empty:
+        for name in (
+            "hist_ncount",
+            "hist_nfeature",
+            "hist_percent_mt_gex",
+            "qc_scatter",
+            "scatter_ncount_nfeature_gex",
+        ):
+            store.skip(name, "missing_fields")
+    else:
+        draw_qc_histograms(store, qc_table, config, population=qc_note)
+        draw_qc_scatter(store, qc_table, int(config["runtime"]["seed"]), population=qc_note)
+        draw_scatter_ncount_nfeature_gex(
+            store, qc_table, int(config["runtime"]["seed"]), population=qc_note
+        )
+    if control_spec(config)["temporary"]:
+        draw_temporary_control_qc(store, cell_status)
+    else:
+        remove_temporary_control_qc(output_dir)
+    # plot_manifest is ephemeral; lean cleanup removes it after the run.
+
+
+def _qc_population(cell_status: pd.DataFrame, adata: AnnData | None) -> tuple[pd.DataFrame, str]:
+    """Prefer the full annotated ledger, which is recorded before analysis filtering."""
+    mito = {"mito_frac", "pct_counts_mito"}
+    needed = {"total_counts", "n_genes_by_counts"}
+    if (
+        not cell_status.empty
+        and needed.issubset(cell_status.columns)
+        and mito & set(cell_status.columns)
+    ):
+        return cell_status, "before filtering; full annotated cells"
+    if adata is not None:
+        frame = adata.obs.reset_index(drop=False)
+        if needed.issubset(frame.columns) and mito & set(frame.columns):
+            return frame, "analysis object; full annotated QC columns were absent"
+    return pd.DataFrame(), ""

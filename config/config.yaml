@@ -1,10 +1,14 @@
 # 分析软件默认参数。
-# 步骤：io → assign → preprocess → mixscape → mixscale → perturb → report。
+# 步骤：io → assign → preprocess → dge → mixscape → mixscale → perturb。
+# dge / mixscape / mixscale 三者互不依赖（均只依赖 preprocess），结果分目录：
+#   wilcoxon/  Mixscape/  mixscale/
+# 参考：pertpy WilcoxonTest；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
-# 非靶向对照和 CRISPR 模式（--crispr-mode：KO / i / a / other → experiment.crispr_mode）由命令行传入。
+# 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
+# 未给 --nt-control，或给了但数据中无可用 NT 细胞时，assign 解析为临时 zero_guide 对照
+# （control_source=zero_guide_cells；见 docs/analysis.md § 对照）。不宜当作设计 NT 解读。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
 # 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可保留但实现不切换格式。
-# guide 伪批量距离须显式写 perturb.min_guide_replicates；默认不写则跳过。
 input:
   barcode_policy: strict
 labels:
@@ -15,10 +19,10 @@ labels:
   # 同一靶基因的多条 guide（如双 guide 文库）仍算单靶，不进 multi_guide。
   targets_per_cell: 1
 qc:
+  # QC 指标：n_genes（nFeature）、mito_frac（percent.mt）；可选成对 UMI（nCount）。
   # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
   # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。
   # UMI：须同时给出 min_umi / max_umi（命令行或本文件），否则不做 UMI 绝对阈值过滤。
-  # 核糖体：须显式给出 max_ribo_frac，否则不做 ribo 过滤。不再使用 MAD。
   min_genes: 200
   max_genes: 6000
   max_mito_frac: 0.2
@@ -41,7 +45,7 @@ mixscape:
   logfc_threshold: 0.25
   pval_cutoff: 0.05
   max_de_genes: 100
-  # CalcPerturbSig 维数；与 preprocess.n_pcs 一致（本流水线 30；Seurat vignette 曾用 40）。
+  # CalcPerturbSig 维数；与 preprocess.n_pcs 一致（默认 30）。
   # num.neighbors=20。矩阵比请求维数小时才截断。
   n_dims: 30
   n_control_neighbors: 20
@@ -66,17 +70,14 @@ statistics:
   # 百分位区间的水平，取 (0, 1) 内的数。
   bootstrap_ci: 0.95
   min_nt_cells: 20
-  # descriptive 模式下不用于效应表；保留键以免旧配置报未知键。更换后端前不要解读为组间 FDR。
+  # descriptive 模式下不用于效应表；校验识别该键。不要解读为组间 FDR。
   fdr_threshold: 0.05
   allow_random_split_replicates: false
 perturb:
-  distance_metric: edistance
   mixscape_min_de_genes: 5
   # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致。Mixscale 不读此键。
   mixscape_logfc: 0.25
   mixscape_pval: 0.05
-  # 可选：取消下一行注释并设正整数后，才写 E-distance 下的 guide 伪批量距离。
-  # min_guide_replicates: 2
 target_expression:
   min_nt_detection_fraction: 0.05
   min_nt_mean_cpm: 1.0
@@ -85,7 +86,8 @@ target_expression:
 singler:
   enabled: true
 plotting:
-  # 实现只写 PNG；保留 formats 以免旧配置报未知键。
+  # 实现只写 PNG；formats 键可存在（默认 [png]），不切换格式。
+  # 图风格对齐 Library-D（白底、浅灰网格、全边框、navy 直方图）。
   formats:
     - png
   mixscape_heatmap_max_genes: 20
@@ -93,12 +95,16 @@ plotting:
   dpi: 300
   width: 8
   height: 6
-  theme: whitegrid
+  theme: white
+  hist_bins: 50
+  # GEX marker 热图/点图基因列表；null 则用人/鼠默认 housekeeping（见 config.DEFAULT_MARKERS_BY_ORGANISM）。
+  markers: null
   max_legend_categories: 20
   scatter_max_points: 50000
   volcano_lfc: 1.0
   heatmap_max_genes: 50
-  save_plot_data: true
+  # false：不写图旁 plot_data/*.tsv；流水线结束还会清理非 checkpoint / 非 PNG 产物。
+  save_plot_data: false
   palette:
     nt: '#7F7F7F'
     targeting: '#1F77B4'

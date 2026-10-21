@@ -21,7 +21,7 @@ from anndata import AnnData
 from pertpy.tools import DistanceTest
 
 from perturbseq.assign import control_cell_mask
-from perturbseq.config import NO_NT_CONTROL, ZERO_GUIDE_LABEL, control_spec
+from perturbseq.config import ZERO_GUIDE_LABEL, control_spec
 
 INFERENCE = "within_sample_distance_test"
 INFERENCE_NOTE = (
@@ -112,14 +112,18 @@ def write_edistance_results(
     spec = control_spec(config)
     contrast = spec["control_label"]
     n_control = int(control_cell_mask(adata.obs, spec).sum()) if adata.n_obs else 0
-    if spec["temporary"] and n_control == 0:
-        (figures / "edistance_etest.skipped.txt").write_text("no_zero_guide_cells\n")
+    if n_control == 0:
+        reason = "no_zero_guide_cells" if spec["temporary"] else "no_designed_nt_cells"
+        print(f"  E-distance skipped: {reason}", flush=True)
+        _clear_edistance_skip_markers(figures)
         return pd.DataFrame()
     if not contrast:
-        (figures / "edistance_etest.skipped.txt").write_text(NO_NT_CONTROL + "\n")
+        print("  E-distance skipped: missing_control_label", flush=True)
+        _clear_edistance_skip_markers(figures)
         return pd.DataFrame()
     if _OBSM_KEY not in adata.obsm:
-        (figures / "edistance_etest.skipped.txt").write_text("missing_X_pca\n")
+        print("  E-distance skipped: missing_X_pca", flush=True)
+        _clear_edistance_skip_markers(figures)
         return pd.DataFrame()
     gate, source = _load_de_gate(adata, output_dir)
     groups, rule = _select_groups(gate, contrast, source)
@@ -137,24 +141,20 @@ def write_edistance_results(
         selection_rule=rule,
         show_progressbar=show_progressbar,
     )
-    table.to_csv(tables / "edistance_etest.tsv", sep="\t", index=False)
-    plot_edistance_test(table, figures / "edistance_etest.png")
+    # Lean outputs: PNG only; table stays in the perturb checkpoint via caller if needed.
+    if not table.empty:
+        plot_edistance_test(table, figures / "edistance_etest.png")
+    _clear_edistance_skip_markers(figures)
+    stale_table = tables / "edistance_etest.tsv"
+    if stale_table.exists():
+        stale_table.unlink()
     return table
 
 
-def refresh_edistance_figure(
-    output_dir: Path, adata: AnnData | None, config: dict[str, Any]
-) -> None:
-    """Redraw the scatter from the saved table, or compute it if the table is absent."""
-    table_path = output_dir / "E-distance" / "tables" / "edistance_etest.tsv"
-    figure_path = output_dir / "E-distance" / "figures" / "edistance_etest.png"
-    if table_path.is_file():
-        table = pd.read_csv(table_path, sep="\t")
-        if not table.empty and {"group", "contrast", "pvalue", "distance"}.issubset(table.columns):
-            plot_edistance_test(table, figure_path)
-        return
-    if adata is not None and _OBSM_KEY in adata.obsm:
-        write_edistance_results(output_dir, adata, config)
+def _clear_edistance_skip_markers(figures: Path) -> None:
+    skipped = figures / "edistance_etest.skipped.txt"
+    if skipped.exists():
+        skipped.unlink()
 
 
 def plot_edistance_test(table: pd.DataFrame, path: Path) -> None:
@@ -243,7 +243,11 @@ def _pca_view(
 
 
 def _load_de_gate(adata: AnnData, output_dir: Path) -> tuple[pd.DataFrame | None, str]:
+    gate = adata.uns.get("mixscape_de_gate") if adata.uns is not None else None
+    if isinstance(gate, pd.DataFrame) and not gate.empty:
+        return gate, "adata.uns['mixscape_de_gate']"
     for relative in (
+        Path("Mixscape") / "tables" / "mixscape_de_gate.tsv",
         Path("DGE") / "Mixscape" / "tables" / "mixscape_de_gate.tsv",
         Path("DGE") / "mixscape" / "tables" / "mixscape_de_gate.tsv",
         Path("DGE") / "tables" / "mixscape_de_gate.tsv",
@@ -252,9 +256,6 @@ def _load_de_gate(adata: AnnData, output_dir: Path) -> tuple[pd.DataFrame | None
         path = output_dir / relative
         if path.is_file():
             return pd.read_csv(path, sep="\t"), str(relative)
-    gate = adata.uns.get("mixscape_de_gate") if adata.uns is not None else None
-    if isinstance(gate, pd.DataFrame) and not gate.empty:
-        return gate, "adata.uns['mixscape_de_gate']"
     return None, ""
 
 
