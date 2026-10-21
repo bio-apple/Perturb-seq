@@ -1614,18 +1614,20 @@ def draw_annotation_cell_cycle_panel(
     store.save(figure, name, "plot", summary, method)
 
 
-def draw_qc_scatter(
+def draw_qc_scatter_panel(
     store: FigureStore,
     metrics: pd.DataFrame,
     seed: int,
     *,
     population: str = "qc metrics",
 ) -> None:
-    """Seurat FeatureScatter analogue: nCount vs percent.mt, and nCount vs nFeature."""
+    """1×2 QC scatter panel: nCount vs percent.mt and nCount vs nFeature."""
+    name = _QC_SCATTER_PANEL_NAME
+    _remove_legacy_qc_scatters(store.output_dir)
     mito = _mito_column(metrics)
     needed = {"total_counts", "n_genes_by_counts"}
     if metrics.empty or mito is None or not needed.issubset(metrics.columns):
-        store.skip("qc_scatter", "missing_fields")
+        store.skip(name, "missing_fields")
         return
     limit = int(store.plotting.get("scatter_max_points", 50000))
     shown = metrics
@@ -1633,34 +1635,41 @@ def draw_qc_scatter(
         shown = metrics.sample(limit, random_state=seed)
     scaled_all, note = percent_mt_values(metrics)
     scaled = scaled_all.loc[shown.index]
-    figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+    ncount = pd.to_numeric(shown["total_counts"], errors="coerce").to_numpy(dtype=float)
+    nfeature = pd.to_numeric(shown["n_genes_by_counts"], errors="coerce").to_numpy(dtype=float)
+    percent_mt = scaled.to_numpy(dtype=float)
     fill = store.palette("hist_fill", _HIST_FILL)
+    figure, axes = plt.subplots(1, 2, figsize=(10.8, 5.0))
     axes[0].scatter(
-        shown["total_counts"], scaled, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True
+        ncount, percent_mt, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True, zorder=2
     )
     axes[0].set_xlabel("nCount_RNA")
     axes[0].set_ylabel("percent.mt")
     axes[0].set_title("nCount vs percent.mt", loc="left", fontsize=11)
     axes[1].scatter(
-        shown["total_counts"],
-        shown["n_genes_by_counts"],
-        s=8,
-        linewidths=0,
-        c=fill,
-        alpha=0.55,
-        rasterized=True,
+        ncount, nfeature, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True, zorder=2
     )
     axes[1].set_xlabel("nCount_RNA")
     axes[1].set_ylabel("nFeature_RNA")
     axes[1].set_title("nCount vs nFeature", loc="left", fontsize=11)
     for axis in axes:
         _style_library_d(axis)
+    table = pd.DataFrame(
+        {
+            "nCount_RNA": ncount,
+            "nFeature_RNA": nfeature,
+            "percent.mt": percent_mt,
+        }
+    )
     store.save(
         figure,
-        "qc_scatter",
+        name,
         "qc",
-        shown,
-        f"FeatureScatter nCount vs percent.mt ({note}) and nFeature; {population}; seed={seed}",
+        table,
+        (
+            "1x2 QC scatter panel; FeatureScatter nCount vs percent.mt / nFeature "
+            f"({note}); {population}; seed={seed}"
+        ),
     )
 
 

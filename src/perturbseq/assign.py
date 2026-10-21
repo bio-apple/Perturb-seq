@@ -812,8 +812,7 @@ def write_qc_figures(
         draw_cells_per_target,
         draw_guides_per_cell,
         draw_qc_metrics_panel,
-        draw_qc_scatter,
-        draw_scatter_ncount_nfeature_gex,
+        draw_qc_scatter_panel,
         draw_temporary_control_qc,
         open_figure_store,
         remove_qc_violin_products,
@@ -840,16 +839,11 @@ def write_qc_figures(
     draw_cells_per_target(store, targets, int(config["qc"]["min_cells_per_target"]))
     qc_table, qc_note = _qc_population(cell_status, adata)
     if qc_table.empty:
-        for name in (
-            "qc_metrics_panel",
-            "qc_scatter",
-            "scatter_ncount_nfeature_gex",
-        ):
+        for name in ("qc_metrics_panel", "qc_scatter_panel"):
             store.skip(name, "missing_fields")
     else:
         draw_qc_metrics_panel(store, qc_table, config, population=qc_note)
-        draw_qc_scatter(store, qc_table, int(config["runtime"]["seed"]), population=qc_note)
-        draw_scatter_ncount_nfeature_gex(
+        draw_qc_scatter_panel(
             store, qc_table, int(config["runtime"]["seed"]), population=qc_note
         )
     if control_spec(config)["temporary"]:

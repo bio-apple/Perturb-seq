@@ -66,7 +66,7 @@
 | `qc/guides_per_cell.png` | 每细胞 guide 条数 |
 | `qc/cells_per_target_bar.png` | 靶基因细胞数 |
 | `qc/qc_metrics_panel.png` | 2×3 QC：上行 Seurat 风格 violin（nFeature / nCount / percent.mt）+ jitter；下行 Library-D 直方图（同三指标）。轴标签英文；Identity=`sample_id` |
-| `qc/qc_scatter.png` / `scatter_ncount_nfeature_gex.png` | QC 散点 |
+| `qc/qc_scatter_panel.png` | 1×2 QC 散点：nCount vs percent.mt；nCount vs nFeature |
 | `qc/temporary_control_qc.png` | 仅临时 zero-guide 对照时；组标签 `zero-guide` / `targeting`（纯英文） |
 
 ### preprocess → `qc/` + `UMAP/`

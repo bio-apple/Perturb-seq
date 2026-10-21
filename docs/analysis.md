@@ -211,7 +211,7 @@ QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount �
 
 默认剔除 mito 比例 ≥ 20%：`qc.max_mito_frac=0.2`。`--max-mito-frac` 可覆盖。原因码 `high_mito`。
 
-> **警示**：20% 是软件固定默认，不是按本样本自适应。肿瘤、高代谢或线粒体相关扰动应先看 `qc_metrics_panel`（含 percent.mt violin/直方图）/ `qc_scatter` / `scatter_ncount_nfeature_gex`，再决定是否调低/调高；过度过滤会丢掉真实生物学变异。
+> **警示**：20% 是软件固定默认，不是按本样本自适应。肿瘤、高代谢或线粒体相关扰动应先看 `qc_metrics_panel`（含 percent.mt violin/直方图）/ `qc_scatter_panel`，再决定是否调低/调高；过度过滤会丢掉真实生物学变异。
 
 ### 文库大小（nCount）
 
