@@ -382,6 +382,15 @@ def _run_parallel_analysis(
             if errors:
                 raise SystemExit("并行分析失败: " + "; ".join(errors))
         merged = _merge_post_preprocess_products(preprocess_adata, product_paths)
+        # Mixscale worker runs without Mixscape labels; redraw when both are present.
+        if (
+            "mixscale" in batch
+            and "mixscape_status" in merged.obs
+            and "mixscale_score" in merged.obs
+            and isinstance(merged.uns.get("mixscale_de_gate"), pd.DataFrame)
+        ):
+            print("  redrawing Mixscale figures with Mixscape NT/NP/KO labels…", flush=True)
+            write_mixscale_figures(folder, config, merged)
     return timings, merged
 
 
@@ -416,7 +425,7 @@ def _parallel_step_worker(
 
 
 def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, Path]):
-    """Build perturb input: preprocess + Mixscape labels + Wilcoxon status if present."""
+    """Build perturb input: preprocess + Mixscape/Mixscale products + Wilcoxon status."""
     import gc
 
     import h5py
@@ -446,6 +455,21 @@ def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, P
                 adata.uns[key] = mix.uns[key]
         mix.file.close()
         del mix
+        gc.collect()
+    mixscale_path = Path(product_paths["mixscale"]) if "mixscale" in product_paths else None
+    if mixscale_path is not None and mixscale_path.exists():
+        from perturbseq.mixscale import MIXSCALE_LAYER
+
+        scale = sc.read_h5ad(mixscale_path, backed="r")
+        if "mixscale_score" in scale.obs.columns:
+            adata.obs["mixscale_score"] = scale.obs["mixscale_score"].to_numpy()
+        if MIXSCALE_LAYER in scale.layers:
+            adata.layers[MIXSCALE_LAYER] = scale.layers[MIXSCALE_LAYER][...]
+        for key in list(scale.uns.keys()):
+            if str(key).startswith("mixscale"):
+                adata.uns[key] = scale.uns[key]
+        scale.file.close()
+        del scale
         gc.collect()
     dge_path = Path(product_paths["dge"]) if "dge" in product_paths else None
     if dge_path is not None and dge_path.exists():

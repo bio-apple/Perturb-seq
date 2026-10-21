@@ -203,11 +203,45 @@ def _write_mixscale_signature_rows(adata: AnnData, work: AnnData) -> None:
 def write_mixscale_figures(
     output_dir: Path, config: dict[str, Any], adata: AnnData
 ) -> None:
-    """Write Mixscale ridge / scatter PNGs at the end of the mixscale step."""
-    from perturbseq.plotting import draw_mixscale_ridge, draw_mixscale_scatter, open_figure_store
+    """Write Mixscale ridge / scatter / DE-count / DE-heatmap PNGs."""
+    from perturbseq.mixscape import perturbation_type
+    from perturbseq.plotting import (
+        draw_mixscale_de_heatmaps,
+        draw_mixscale_ridge,
+        draw_mixscale_scatter,
+        draw_target_de_counts,
+        draw_target_in_de_gene_counts,
+        open_figure_store,
+    )
 
     output_dir = Path(output_dir)
     store = open_figure_store(output_dir, config, adata)
     contrast = control_spec(config)["control_label"]
-    draw_mixscale_ridge(store, adata, contrast)
-    draw_mixscale_scatter(store, adata, contrast)
+    plotting = config.get("plotting", {})
+    params = de_gate_parameters(config)
+    prtb = perturbation_type(config)
+    draw_mixscale_ridge(store, adata, contrast, perturbation_label=prtb)
+    draw_mixscale_scatter(store, adata, contrast, perturbation_label=prtb)
+    draw_target_de_counts(
+        store,
+        adata,
+        control=contrast,
+        min_de_genes=int(params["min_de_genes"]),
+        source="mixscale",
+    )
+    draw_target_in_de_gene_counts(
+        store,
+        adata,
+        control=contrast,
+        min_de_genes=int(params["min_de_genes"]),
+        source="mixscale",
+    )
+    draw_mixscale_de_heatmaps(
+        store,
+        adata,
+        control=contrast,
+        seed=int(config["runtime"]["seed"]),
+        max_genes=int(plotting.get("mixscape_heatmap_max_genes", 20)),
+        max_cells=int(plotting.get("mixscape_heatmap_max_cells", 300)),
+        perturbation_label=prtb,
+    )

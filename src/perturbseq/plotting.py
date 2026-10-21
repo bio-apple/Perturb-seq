@@ -57,7 +57,7 @@ _QC_SCATTER_PANEL_NAME = "qc_scatter_panel"
 _LEGACY_QC_HIST_NAMES = ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex")
 _LEGACY_QC_SCATTER_NAMES = ("qc_scatter", "scatter_ncount_nfeature_gex")
 _MARKER_HEATMAP_CMAP = "Blues"
-_DOTPLOT_CMAP = "Purples"
+_DOTPLOT_CMAP = "Blues"
 # Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
 _MIXSCAPE_FIGURES = frozenset(
     {
@@ -86,14 +86,19 @@ def _output_bucket(name: str, section: str) -> str:
     # Signature UMAPs may pass section "mixscape"; the image still goes to UMAP/.
     if name.startswith("umap_"):
         return "umap"
+    # Mixscale section / heatmap stems win before shared DE-count names.
+    if (
+        section in {"mixscale", "mixscale_target_in_de"}
+        or name in _MIXSCALE_FIGURES
+        or name.endswith("_mixscale_heatmap")
+    ):
+        return "mixscale"
     if (
         section in {"mixscape", "target_in_de"}
         or name in _MIXSCAPE_FIGURES
         or name.endswith("_mixscape_2x2")
     ):
         return "mixscape"
-    if section == "mixscale" or name in _MIXSCALE_FIGURES:
-        return "mixscale"
     if section == "wilcoxon" or name.startswith("wilcoxon_"):
         return "wilcoxon"
     if section in {"de", "dge"} or name in _DESCRIPTIVE_FIGURES:
@@ -160,6 +165,8 @@ class FigureStore:
         if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
             root = _dge_bucket_root(self.output_dir, bucket)
             if bucket == "mixscape" and section == "target_in_de":
+                return root / "target_in_de"
+            if bucket == "mixscale" and section == "mixscale_target_in_de":
                 return root / "target_in_de"
             return root
         return self.output_dir / section
@@ -1709,19 +1716,30 @@ def _resolve_marker_indices(
     return found, indices, missing
 
 
-def _cluster_display_labels(adata: AnnData) -> pd.Series:
-    """Leiden id, optionally annotated with majority cell_type (Library-D style)."""
-    clusters = adata.obs["leiden"].astype(str)
-    if "cell_type" not in adata.obs.columns:
-        return clusters
-    types = adata.obs["cell_type"].astype(str)
+def _cluster_annotation_column(adata: AnnData) -> str | None:
+    """Prefer SingleR labels, then cell_type, for ``cluster: annotation`` row names."""
     skip = {"ALL", "nan", "None", "<NA>", ""}
-    if not (set(types.unique()) - skip):
+    for column in ("singler_label", "cell_type"):
+        if column not in adata.obs.columns:
+            continue
+        values = adata.obs[column].astype(str)
+        if set(values.unique()) - skip:
+            return column
+    return None
+
+
+def _cluster_display_labels(adata: AnnData) -> pd.Series:
+    """Leiden id, optionally ``{leiden}: {annotation}`` (SingleR / cell_type)."""
+    clusters = adata.obs["leiden"].astype(str)
+    column = _cluster_annotation_column(adata)
+    if column is None:
         return clusters
+    types = adata.obs[column].astype(str)
+    skip = {"ALL", "nan", "None", "<NA>", ""}
     mapping: dict[str, str] = {}
-    frame = adata.obs.assign(_cluster=clusters, _cell_type=types)
+    frame = adata.obs.assign(_cluster=clusters, _annot=types)
     for cluster, block in frame.groupby("_cluster", sort=False):
-        majority = block["_cell_type"].value_counts()
+        majority = block["_annot"].value_counts()
         majority = majority[~majority.index.isin(skip)]
         if majority.empty:
             mapping[str(cluster)] = str(cluster)
@@ -1782,7 +1800,7 @@ def _marker_by_cluster_table(
 
 
 def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
-    """Fraction of cells detecting each marker gene, by Leiden cluster."""
+    """Fraction detected by cluster; white panel, Blues cmap, annotated row labels."""
     name = "marker_detection_heatmap"
     if "leiden" not in adata.obs:
         store.skip(name, "missing_leiden")
@@ -1798,9 +1816,15 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
     matrix = table.pivot(index="cluster", columns="gene", values="fraction_detected")
     matrix = matrix.reindex(columns=found)
     sample = str(store.context.get("sample", "sample"))
-    height = max(4.5, 0.45 * len(matrix) + 2.0)
-    width = max(8.0, 0.55 * len(found) + 3.5)
+    annot_col = _cluster_annotation_column(adata) or "leiden"
+    # Long annotated labels need left margin; widen with gene count.
+    label_width = float(max((len(str(label)) for label in matrix.index), default=8))
+    height = max(4.5, 0.48 * len(matrix) + 2.2)
+    width = max(9.0, 0.55 * len(found) + 3.8 + min(label_width * 0.08, 4.0))
     figure, axis = store._figure(width=width, height=height)
+    figure.perturbseq_skip_tight_layout = True
+    figure.patch.set_facecolor("white")
+    axis.set_facecolor("white")
     image = axis.imshow(
         matrix.to_numpy(dtype=float),
         aspect="auto",
@@ -1810,23 +1834,31 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
         interpolation="nearest",
     )
     axis.set_xticks(np.arange(len(found)))
-    axis.set_xticklabels(found, rotation=45, ha="right")
+    axis.set_xticklabels(found, rotation=45, ha="right", fontsize=9, color="black")
     axis.set_yticks(np.arange(len(matrix.index)))
-    axis.set_yticklabels(matrix.index.astype(str))
+    axis.set_yticklabels(matrix.index.astype(str), fontsize=9, color="black")
     axis.set_xlabel("")
     axis.set_ylabel("")
-    axis.set_title(f"{sample} marker detection by cluster", loc="left", fontsize=12)
+    axis.set_title(f"{sample} marker detection by cluster", loc="left", fontsize=12, color="black")
     axis.set_xticks(np.arange(-0.5, len(found), 1), minor=True)
     axis.set_yticks(np.arange(-0.5, len(matrix.index), 1), minor=True)
-    axis.grid(which="minor", color="white", linestyle="-", linewidth=1.2)
+    axis.grid(which="minor", color="white", linestyle="-", linewidth=1.4, zorder=3)
     axis.tick_params(which="minor", bottom=False, left=False)
+    axis.tick_params(colors="black", length=0)
     for spine in axis.spines.values():
-        spine.set_visible(False)
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(0.9)
     colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
-    colorbar.set_label("Fraction detected")
+    colorbar.set_label("Fraction detected", color="black")
+    colorbar.ax.yaxis.set_tick_params(color="black")
+    plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="black")
+    left = min(0.42, 0.12 + label_width * 0.012)
+    figure.subplots_adjust(left=left, right=0.88, bottom=0.18, top=0.90)
     method = (
-        f"fraction detected per Leiden cluster; cmap={_MARKER_HEATMAP_CMAP}; "
-        f"markers={','.join(found)}"
+        f"fraction detected per Leiden cluster; row labels from {annot_col} "
+        f"as 'leiden: annotation' when available; cmap={_MARKER_HEATMAP_CMAP}; "
+        f"white panel + black border; markers={','.join(found)}"
     )
     if missing:
         method += f"; missing={','.join(missing)}"
@@ -1834,7 +1866,11 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
 
 
 def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
-    """Dot plot: size = detection fraction, color = mean expression (Library-D dark panel)."""
+    """Seurat-style marker dotplot: white panel; size=% expressed; color=average expression.
+
+    Cluster rows use the same ``leiden: annotation`` labels as
+    ``marker_detection_heatmap`` (SingleR / cell_type when available).
+    """
     name = "dotplot_markers"
     if "leiden" not in adata.obs:
         store.skip(name, "missing_leiden")
@@ -1849,68 +1885,92 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
         return
     clusters = list(dict.fromkeys(table["cluster"].astype(str)))
     try:
-        clusters = sorted(clusters, key=lambda value: (int(str(value).split(":", 1)[0]), str(value)))
+        clusters = sorted(
+            clusters, key=lambda value: (int(str(value).split(":", 1)[0]), str(value))
+        )
     except ValueError:
         clusters = sorted(clusters)
     cluster_pos = {cluster: index for index, cluster in enumerate(clusters)}
     gene_pos = {gene: index for index, gene in enumerate(found)}
-    height = max(4.2, 0.38 * len(clusters) + 1.8)
-    width = max(8.4, 0.55 * len(found) + 3.2)
-    figure, axis = plt.subplots(figsize=(width, height), facecolor="black")
-    axis.set_facecolor("black")
+    annot_col = _cluster_annotation_column(adata) or "leiden"
+    label_width = float(max((len(str(label)) for label in clusters), default=8))
+    height = max(4.5, 0.42 * len(clusters) + 2.0)
+    width = max(9.5, 0.55 * len(found) + 4.5 + min(label_width * 0.08, 4.0))
+    figure, axis = plt.subplots(figsize=(width, height))
+    figure.perturbseq_skip_tight_layout = True
+    figure.patch.set_facecolor("white")
+    axis.set_facecolor("white")
     x = table["gene"].map(gene_pos).to_numpy(dtype=float)
     y = table["cluster"].map(cluster_pos).to_numpy(dtype=float)
-    sizes = 20.0 + 180.0 * table["fraction_detected"].to_numpy(dtype=float)
+    frac = table["fraction_detected"].to_numpy(dtype=float)
+    # Seurat-like size scale: empty → full circle.
+    sizes = 8.0 + 220.0 * np.clip(frac, 0.0, 1.0)
     points = axis.scatter(
         x,
         y,
         s=sizes,
         c=table["mean_expression"].to_numpy(dtype=float),
         cmap=_DOTPLOT_CMAP,
-        edgecolors="none",
-        zorder=2,
+        edgecolors="#333333",
+        linewidths=0.25,
+        zorder=3,
     )
     axis.set_xticks(np.arange(len(found)))
-    axis.set_xticklabels(found, rotation=45, ha="right", color="white")
+    axis.set_xticklabels(found, rotation=45, ha="right", color="black", fontsize=8)
     axis.set_yticks(np.arange(len(clusters)))
-    axis.set_yticklabels(clusters, color="white")
+    axis.set_yticklabels(clusters, color="black", fontsize=8)
     axis.set_xlim(-0.6, len(found) - 0.4)
     axis.set_ylim(-0.6, len(clusters) - 0.4)
     axis.invert_yaxis()
-    axis.tick_params(colors="white", labelsize=8)
+    axis.tick_params(colors="black", length=0, pad=3)
+    axis.grid(True, which="major", color=_GRID_MAJOR, linewidth=0.55, zorder=0)
+    axis.set_axisbelow(True)
     for spine in axis.spines.values():
-        spine.set_color("white")
-        spine.set_linewidth(0.6)
-    axis.grid(False)
-    colorbar = figure.colorbar(points, ax=axis, fraction=0.046, pad=0.08)
-    colorbar.set_label("Mean expression", color="white")
-    colorbar.ax.yaxis.set_tick_params(color="white")
-    plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="white")
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(0.8)
+    sample = str(store.context.get("sample", "sample"))
+    axis.set_title(f"{sample} marker expression by cluster", loc="left", fontsize=12, color="black")
+    left = min(0.08 + label_width * 0.006, 0.38)
+    figure.subplots_adjust(left=left, right=0.72, bottom=0.18, top=0.90)
+    # Seurat order on the right: Percent Expressed (size) above Average Expression (color).
+    size_fracs = (0.0, 0.25, 0.5, 0.75, 1.0)
     size_handles = [
         Line2D(
             [0],
             [0],
             marker="o",
             color="none",
-            markerfacecolor="white",
-            markersize=np.sqrt(20 + 180 * frac) / 2,
-            label=f"{int(frac * 100)}%",
+            markerfacecolor="#6BAED6",
+            markeredgecolor="#333333",
+            markeredgewidth=0.4,
+            markersize=max(3.0, np.sqrt(8.0 + 220.0 * value) / 2.2),
+            label=str(int(value * 100)),
         )
-        for frac in (0.25, 0.5, 0.75, 1.0)
+        for value in size_fracs
     ]
     legend = axis.legend(
         handles=size_handles,
-        title="Fraction of cells",
+        title="Percent Expressed",
         loc="upper left",
-        bbox_to_anchor=(1.22, 1.0),
-        labelcolor="white",
-        fontsize=7,
-        title_fontsize=8,
+        bbox_to_anchor=(1.02, 1.0),
+        labelcolor="black",
+        fontsize=8,
+        title_fontsize=9,
         frameon=False,
+        borderaxespad=0.0,
+        handletextpad=0.6,
     )
-    plt.setp(legend.get_title(), color="white")
+    plt.setp(legend.get_title(), color="black")
+    axis.add_artist(legend)
+    colorbar = figure.colorbar(points, ax=axis, fraction=0.04, pad=0.12, shrink=0.55, anchor=(0.0, 0.15))
+    colorbar.set_label("Average Expression", color="black", fontsize=9)
+    colorbar.ax.yaxis.set_tick_params(color="black", labelsize=8)
+    plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="black")
     method = (
-        f"dotplot size=fraction_detected color=mean_expression; cmap={_DOTPLOT_CMAP}; "
+        "Seurat-style dotplot; white panel; size=Percent Expressed; "
+        f"color=Average Expression ({_DOTPLOT_CMAP}); "
+        f"row labels from {annot_col} as 'leiden: annotation' when available; "
         f"markers={','.join(found)}"
     )
     if missing:
@@ -2452,7 +2512,7 @@ def _annotate_heatmap_groups(
     n_genes: int,
     display_names: dict[str, str],
 ) -> None:
-    """Label NP, NT and KO inside the axes. Heatmap color is only the z-score."""
+    """Label NP / NT / KO (or CRISPR-mode label) inside the axes."""
     axis.set_ylim(n_genes - 0.5, -2.0)
     for key, start, end in spans:
         width = end - start
@@ -2466,7 +2526,7 @@ def _annotate_heatmap_groups(
             align="center",
             linewidth=0.4,
         )
-        label = key if key in {"NP", "NT", "KO"} else str(display_names.get(key, key))
+        label = str(display_names.get(key, key))
         axis.text(
             (start + end - 1) / 2.0,
             -1.25,
@@ -2535,13 +2595,13 @@ def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label:
     status = _status_labels(adata.obs["mixscape_status"])
     targets = adata.obs["target_gene"].astype(str)
     probability = adata.obs["mixscape_class_p"].astype(float)
-    control_name = "zero-guide cells" if (status == "zero_guide").any() else "NT"
+    prtb = str(perturbation_label or "KO")
+    # Short NT / NP / KO ticks avoid overlap under the shared 2x2 title.
+    control_name = "zero-guide" if (status == "zero_guide").any() else "NT"
     groups = {
         control_name: probability[status.isin(["nt", "zero_guide"])],
-        f"{target} NP": probability[(targets == target) & (status == "non_perturbed")],
-        f"{target} {perturbation_label}": probability[
-            (targets == target) & (status == "perturbed")
-        ],
+        "NP": probability[(targets == target) & (status == "non_perturbed")],
+        prtb: probability[(targets == target) & (status == "perturbed")],
     }
     order = list(groups)
     long = pd.DataFrame(
@@ -2561,10 +2621,12 @@ def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label:
         jitter=0.25,
     )
     axis.set_ylim(-0.05, 1.05)
-    axis.set_title("mixscape posterior probabilities")
-    axis.set_xlabel("Identity")
-    axis.set_ylabel("")
-    axis.tick_params(axis="x", labelrotation=20)
+    axis.set_title("Posterior probability", fontsize=11, pad=8)
+    axis.set_xlabel("")
+    axis.set_ylabel("P(perturbed)", fontsize=9, labelpad=10)
+    axis.tick_params(axis="x", labelrotation=0, labelsize=9)
+    axis.tick_params(axis="y", labelsize=8)
+    axis.yaxis.set_major_locator(plt.MaxNLocator(6))
 
 
 def _draw_perturb_score(
@@ -2597,6 +2659,7 @@ def _draw_perturb_score(
         fill=True,
         ax=axis,
         legend=True,
+        warn_singular=False,
     )
     rng = np.random.default_rng(seed)
     ymax = axis.get_ylim()[1]
@@ -2609,9 +2672,16 @@ def _draw_perturb_score(
         linewidths=0,
         alpha=0.45,
     )
-    axis.set_xlabel("perturbation score")
-    axis.set_ylabel("Cell density")
-    axis.set_title(target)
+    axis.set_xlabel("perturbation score", fontsize=9)
+    axis.set_ylabel("Cell density", fontsize=9)
+    axis.set_title("Perturbation score", fontsize=11, pad=8)
+    axis.tick_params(labelsize=8)
+    legend = axis.get_legend()
+    if legend is not None:
+        legend.set_title("")
+        legend.set_frame_on(False)
+        for text in legend.get_texts():
+            text.set_fontsize(7)
 
 
 def _draw_volcano_axis(
@@ -2622,6 +2692,7 @@ def _draw_volcano_axis(
     *,
     target: str = "",
     control: str = "",
+    max_labels: int = 3,
 ) -> None:
     colors = {"not DE": "#BDBDBD", "Up": "#E41A1C", "Down": "#377EB8"}
     for direction, color in colors.items():
@@ -2633,16 +2704,35 @@ def _draw_volcano_axis(
     axis.axvline(-lfc_line, color="black", linestyle="--", linewidth=0.6)
     if 0 < pval_cutoff < 1:
         axis.axhline(-np.log10(pval_cutoff), color="black", linestyle="--", linewidth=0.6)
-    labeled = table[table["direction"] != "not DE"].nsmallest(8, "adj_p_value")
-    for record in labeled.itertuples(index=False):
-        axis.text(record.log_fc, record.neg_log10_adj_p, str(record.gene), fontsize=6)
+    de = table[table["direction"] != "not DE"]
+    labeled = de.nsmallest(int(max_labels), "adj_p_value") if not de.empty else de
+    y_max = float(np.nanmax(table["neg_log10_adj_p"])) if len(table) else 1.0
+    if not np.isfinite(y_max) or y_max <= 0:
+        y_max = 1.0
+    for offset, record in enumerate(labeled.itertuples(index=False)):
+        # Alternate left/right so labels do not stack on the same side.
+        x_off = 6 if offset % 2 == 0 else -6
+        y_off = 8 + 10 * (offset // 2)
+        axis.annotate(
+            str(record.gene),
+            (record.log_fc, record.neg_log10_adj_p),
+            textcoords="offset points",
+            xytext=(x_off, y_off),
+            fontsize=6,
+            color="#333333",
+            ha="left" if x_off > 0 else "right",
+            clip_on=False,
+        )
+    axis.set_ylim(-0.05 * y_max, y_max * 1.18)
     if target and control:
-        axis.set_xlabel(f"logFC ({target} vs {_contrast_name(control)})")
-        axis.set_title("cell-level Wilcoxon, not a replicate test")
+        axis.set_xlabel(f"logFC ({target} vs {_contrast_name(control)})", fontsize=8)
+        axis.set_title("Cell-level Wilcoxon", fontsize=11, pad=8)
     else:
-        axis.set_xlabel("log_fc")
-    axis.set_ylabel("-log10 adj_p_value")
-    axis.legend(frameon=False, fontsize=7)
+        axis.set_xlabel("log_fc", fontsize=9)
+        axis.set_title("Volcano", fontsize=11, pad=8)
+    axis.set_ylabel("-log10 adj_p", fontsize=9)
+    axis.tick_params(labelsize=8)
+    axis.legend(frameon=False, fontsize=7, loc="lower right")
 
 
 def _heatmap_panel(
@@ -2718,17 +2808,29 @@ def _heatmap_panel(
         axis,
         spans,
         int(genes.size),
-        {"NP": f"{target} NP", "NT": "NT", "KO": f"{target} {perturbation_label}"},
+        {"NP": "NP", "NT": "NT", "KO": str(perturbation_label or "KO")},
     )
-    axis.set_title(f"{target} Top {genes.size}")
+    axis.set_title(f"Top {genes.size} genes", fontsize=11, pad=10)
     return int(genes.size)
 
 
-def target_in_de_table(adata: AnnData, *, control: str) -> pd.DataFrame:
+def _de_gate_keys(source: str) -> tuple[str, str]:
+    """``uns`` keys for Mixscape or Mixscale DE gate / gene tables."""
+    if source == "mixscale":
+        return "mixscale_de_gate", "mixscale_de_genes"
+    if source == "mixscape":
+        return "mixscape_de_gate", "mixscape_de_genes"
+    raise ValueError(f"unknown DE source: {source}")
+
+
+def target_in_de_table(
+    adata: AnnData, *, control: str, source: str = "mixscape"
+) -> pd.DataFrame:
     """Passed targets, and whether each target symbol is exactly in its own DE list."""
     columns = ["target_gene", "target_in_de", "n_de_genes", "logfc", "adj_p"]
-    gate = adata.uns.get("mixscape_de_gate")
-    genes = adata.uns.get("mixscape_de_genes")
+    gate_key, genes_key = _de_gate_keys(source)
+    gate = adata.uns.get(gate_key)
+    genes = adata.uns.get(genes_key)
     if not isinstance(gate, pd.DataFrame) or gate.empty or "passed" not in gate.columns:
         return pd.DataFrame(columns=columns)
     if not isinstance(genes, pd.DataFrame):
@@ -2763,11 +2865,11 @@ def target_in_de_table(adata: AnnData, *, control: str) -> pd.DataFrame:
 
 
 def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> pd.DataFrame:
-    """Copy 2x2 figures whose target symbol is in that target's DE list.
+    """Copy Mixscape 2x2 figures whose target symbol is in that target's DE list.
 
     Every passing target stays in ``Mixscape/``. This folder is the subset.
     """
-    table = target_in_de_table(adata, control=control)
+    table = target_in_de_table(adata, control=control, source="mixscape")
     if store.plotting.get("save_plot_data", False):
         data = store.data_dir("target_in_de", "target_in_de")
         data.mkdir(parents=True, exist_ok=True)
@@ -2787,6 +2889,33 @@ def export_target_in_de(store: FigureStore, adata: AnnData, *, control: str) -> 
     return table
 
 
+def export_mixscale_target_in_de(
+    store: FigureStore, adata: AnnData, *, control: str
+) -> pd.DataFrame:
+    """Copy Mixscale DE heatmaps whose target symbol is in that target's DE list.
+
+    Passing-target heatmaps stay in ``mixscale/``. ``mixscale/target_in_de/`` is the subset.
+    """
+    table = target_in_de_table(adata, control=control, source="mixscale")
+    if store.plotting.get("save_plot_data", False):
+        data = store.data_dir("target_in_de", "mixscale_target_in_de")
+        data.mkdir(parents=True, exist_ok=True)
+        table.to_csv(data / "target_in_de.tsv", sep="\t", index=False)
+    destination = store.figure_dir("target_in_de", "mixscale_target_in_de")
+    destination.mkdir(parents=True, exist_ok=True)
+    source = store.figure_dir("panel_mixscale_heatmap", "mixscale")
+    hits = set(table.loc[table["target_in_de"].astype(bool), "target_gene"].astype(str))
+    keep = {f"{_safe(target)}_mixscale_heatmap" for target in hits}
+    for stem in keep:
+        src = source / f"{stem}.png"
+        if src.exists():
+            shutil.copy2(src, destination / src.name)
+    for path in destination.glob("*_mixscale_heatmap.*"):
+        if path.suffix != ".png" or path.stem not in keep:
+            path.unlink()
+    return table
+
+
 def analysis_target_genes(adata: AnnData, control: str) -> list[str]:
     """Unique targeting genes in the analysis object. The control label is excluded."""
     if "target_gene" not in adata.obs:
@@ -2799,12 +2928,16 @@ def analysis_target_genes(adata: AnnData, control: str) -> list[str]:
     return sorted(names)
 
 
-def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5) -> pd.DataFrame:
+def target_de_count_table(
+    adata: AnnData, *, control: str, min_de_genes: int = 5, source: str = "mixscape"
+) -> pd.DataFrame:
     """Three counts: all targets, targets with enough DE genes, targets inside their DE list."""
     targets = analysis_target_genes(adata, control)
     target_set = set(targets)
-    gate = adata.uns.get("mixscape_de_gate")
-    genes = adata.uns.get("mixscape_de_genes")
+    gate_key, genes_key = _de_gate_keys(source)
+    gate = adata.uns.get(gate_key)
+    genes = adata.uns.get(genes_key)
+    label = "Mixscape" if source == "mixscape" else "Mixscale"
     with_de: list[str] = []
     if isinstance(gate, pd.DataFrame) and not gate.empty and "passed" in gate.columns:
         enough = gate["passed"].astype(bool) & (gate["n_de_genes"].astype(int) >= int(min_de_genes))
@@ -2825,7 +2958,7 @@ def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5
             "key": ["n_targets", "n_targets_with_de", "n_targets_in_own_de"],
             "label": [
                 "all targets",
-                "passed Mixscape DE gate",
+                f"passed {label} DE gate",
                 "target in own DE list",
             ],
             "n": [len(targets), len(with_de), len(in_own_list)],
@@ -2833,8 +2966,11 @@ def target_de_count_table(adata: AnnData, *, control: str, min_de_genes: int = 5
     )
 
 
-def target_de_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
+def target_de_count_bars(
+    counts: pd.DataFrame, *, source: str = "mixscape"
+) -> tuple[Figure, pd.DataFrame]:
     """Three blue bars with integer labels. Order is total, with DE, target-in-DE."""
+    label = "Mixscape" if source == "mixscape" else "Mixscale"
     frame = counts.copy().reset_index(drop=True)
     figure, axis = plt.subplots(figsize=(8, 5))
     axis.bar(frame["label"].astype(str), frame["n"].astype(int), color="#4C78A8")
@@ -2851,35 +2987,45 @@ def target_de_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
         )
     axis.set_ylabel("n targets")
     axis.set_title(
-        "Mixscape DE-gate counts (cell-level Wilcoxon; not a biological-replicate test)"
+        f"{label} DE-gate counts (cell-level Wilcoxon; not a biological-replicate test)"
     )
     return figure, frame
 
 
 def draw_target_de_counts(
-    store: FigureStore, adata: AnnData, *, control: str, min_de_genes: int = 5
+    store: FigureStore,
+    adata: AnnData,
+    *,
+    control: str,
+    min_de_genes: int = 5,
+    source: str = "mixscape",
 ) -> None:
     name = "target_de_counts"
+    section = "mixscale" if source == "mixscale" else "plot"
+    label = "Mixscape" if source == "mixscape" else "Mixscale"
+    gate_key, _ = _de_gate_keys(source)
     if adata is None or "target_gene" not in adata.obs:
-        store.skip(name, "missing_fields")
+        store.skip(name, "missing_fields", section=section)
         return
-    if not isinstance(adata.uns.get("mixscape_de_gate"), pd.DataFrame):
-        store.skip(name, "de_gate_not_run")
+    if not isinstance(adata.uns.get(gate_key), pd.DataFrame):
+        store.skip(name, "de_gate_not_run", section=section)
         return
-    frame = target_de_count_table(adata, control=control, min_de_genes=min_de_genes)
-    figure, frame = target_de_count_bars(frame)
+    frame = target_de_count_table(
+        adata, control=control, min_de_genes=min_de_genes, source=source
+    )
+    figure, frame = target_de_count_bars(frame, source=source)
     store.save(
         figure,
         name,
-        "plot",
+        section,
         frame,
-        "Mixscape DE-gate target counts (cell-level Wilcoxon); not a biological-replicate test; "
+        f"{label} DE-gate target counts (cell-level Wilcoxon); not a biological-replicate test; "
         "integer labels; blue bars",
     )
 
 
 def target_in_de_gene_count_table(
-    adata: AnnData, *, control: str, min_de_genes: int = 5
+    adata: AnnData, *, control: str, min_de_genes: int = 5, source: str = "mixscape"
 ) -> pd.DataFrame:
     """Targets that passed the DE gate and contain their own symbol in the stored DE list.
 
@@ -2887,7 +3033,7 @@ def target_in_de_gene_count_table(
     is capped at ``max_de_genes`` and ranked by raw p. The match is exact.
     """
     columns = ["target_gene", "n_de_genes"]
-    table = target_in_de_table(adata, control=control)
+    table = target_in_de_table(adata, control=control, source=source)
     if table.empty:
         return pd.DataFrame(columns=columns)
     excluded = {"", "nt", "zero_guide", "no_guide", "nan", "None", "<NA>", "NA", str(control)}
@@ -2902,8 +3048,11 @@ def target_in_de_gene_count_table(
     return ordered.reset_index(drop=True)
 
 
-def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataFrame]:
+def target_in_de_gene_count_bars(
+    counts: pd.DataFrame, *, source: str = "mixscape"
+) -> tuple[Figure, pd.DataFrame]:
     """One bar per qualifying target. Height and the integer label are full n_de_genes."""
+    label = "Mixscape" if source == "mixscape" else "Mixscale"
     frame = counts.copy().reset_index(drop=True)
     figure, axis = plt.subplots(figsize=(max(8.0, 0.7 * max(len(frame), 1)), 5.6))
     axis.bar(
@@ -2922,9 +3071,9 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
             va="bottom",
             fontsize=10,
         )
-    axis.set_ylabel("n DE genes (Mixscape gate list)")
+    axis.set_ylabel(f"n DE genes ({label} gate list)")
     axis.set_title(
-        "Targets with own gene in Mixscape DE list (not a between-group inference)"
+        f"Targets with own gene in {label} DE list (not a between-group inference)"
     )
     if len(frame) > 40:
         axis.set_xticks([])
@@ -2939,26 +3088,36 @@ def target_in_de_gene_count_bars(counts: pd.DataFrame) -> tuple[Figure, pd.DataF
 
 
 def draw_target_in_de_gene_counts(
-    store: FigureStore, adata: AnnData, *, control: str, min_de_genes: int = 5
+    store: FigureStore,
+    adata: AnnData,
+    *,
+    control: str,
+    min_de_genes: int = 5,
+    source: str = "mixscape",
 ) -> None:
     name = "target_in_de_gene_counts"
+    section = "mixscale" if source == "mixscale" else "plot"
+    label = "Mixscape" if source == "mixscape" else "Mixscale"
+    gate_key, _ = _de_gate_keys(source)
     if adata is None or "target_gene" not in adata.obs:
-        store.skip(name, "missing_fields")
+        store.skip(name, "missing_fields", section=section)
         return
-    if not isinstance(adata.uns.get("mixscape_de_gate"), pd.DataFrame):
-        store.skip(name, "de_gate_not_run")
+    if not isinstance(adata.uns.get(gate_key), pd.DataFrame):
+        store.skip(name, "de_gate_not_run", section=section)
         return
-    frame = target_in_de_gene_count_table(adata, control=control, min_de_genes=min_de_genes)
+    frame = target_in_de_gene_count_table(
+        adata, control=control, min_de_genes=min_de_genes, source=source
+    )
     if frame.empty:
-        store.skip(name, "no_targets_in_own_de")
+        store.skip(name, "no_targets_in_own_de", section=section)
         return
-    figure, frame = target_in_de_gene_count_bars(frame)
+    figure, frame = target_in_de_gene_count_bars(frame, source=source)
     store.save(
         figure,
         name,
-        "plot",
+        section,
         frame,
-        "Mixscape DE-gate targets whose stored DE list contains their own symbol; "
+        f"{label} DE-gate targets whose stored DE list contains their own symbol; "
         "bar height is full n_de_genes; not a biological-replicate test",
     )
 
@@ -3010,8 +3169,9 @@ def draw_mixscape_target_panels(
             record.update(status="skipped", reason="volcano_not_estimable")
             rows.append(record)
             continue
-        figure, axes = plt.subplots(2, 2, figsize=(14, 10))
-        figure.perturbseq_manual_layout = True
+        figure, axes = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=False)
+        # 2x2 needs its own margins; do not use single-panel perturbseq_manual_layout.
+        figure.perturbseq_skip_tight_layout = True
         _draw_posterior(axes[0, 0], adata, str(target), perturbation_label)
         _draw_perturb_score(axes[0, 1], adata, str(target), perturbation_label, seed)
         _draw_volcano_axis(
@@ -3021,6 +3181,7 @@ def draw_mixscape_target_panels(
             pval_cutoff,
             target=str(target),
             control=str(control),
+            max_labels=3,
         )
         n_genes = _heatmap_panel(
             axes[1, 1],
@@ -3031,7 +3192,11 @@ def draw_mixscape_target_panels(
             max_genes=max_genes,
             max_cells=max_cells,
         )
-        figure.suptitle(f"{target} vs {control}")
+        contrast = _contrast_name(str(control))
+        figure.suptitle(f"{target} vs {contrast}", fontsize=14, y=0.98)
+        figure.subplots_adjust(
+            left=0.10, right=0.96, bottom=0.08, top=0.90, wspace=0.42, hspace=0.52
+        )
         store.save(
             figure,
             f"{_safe(str(target))}_mixscape_2x2",
@@ -3087,8 +3252,336 @@ def _skipped_de_targets(adata: AnnData) -> list[str]:
     return [str(gene) for gene in adata.uns.get("mixscale_unscored_targets", [])]
 
 
-def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> None:
-    """Ridge plot of mixscale_score for the control and targets that passed the DE gate.
+def _mixscale_de_gene_indices(
+    adata: AnnData, target: str, *, max_genes: int
+) -> tuple[np.ndarray, list[str]]:
+    """Indices and display symbols for Mixscale_DoHeatmap-style DE features.
+
+    Target symbol is placed first when present. Remaining genes follow stored
+    ``mixscale_de_genes`` ordered by logFC descending (tutorial), capped at
+    ``max_genes`` including the target row.
+    """
+    genes = adata.uns.get("mixscale_de_genes")
+    if not isinstance(genes, pd.DataFrame) or genes.empty:
+        return np.asarray([], dtype=int), []
+    subset = genes[genes["target_gene"].astype(str) == str(target)].copy()
+    if subset.empty:
+        return np.asarray([], dtype=int), []
+    if "logfc" in subset.columns:
+        subset = subset.sort_values("logfc", ascending=False, kind="mergesort")
+    elif "rank" in subset.columns:
+        subset = subset.sort_values("rank", ascending=True, kind="mergesort")
+    var_names = adata.var_names.astype(str).to_numpy()
+    symbols = (
+        adata.var["gene_symbol"].astype(str).to_numpy()
+        if "gene_symbol" in adata.var.columns
+        else var_names
+    )
+    name_to_index = {name: index for index, name in enumerate(var_names)}
+    symbol_to_index = {symbol: index for index, symbol in enumerate(symbols)}
+    ordered: list[int] = []
+    labels: list[str] = []
+    seen: set[int] = set()
+
+    def _push(index: int, label: str) -> None:
+        if index in seen:
+            return
+        seen.add(index)
+        ordered.append(index)
+        labels.append(label)
+
+    target_index = symbol_to_index.get(str(target))
+    if target_index is None:
+        target_index = name_to_index.get(str(target))
+    if target_index is not None:
+        _push(int(target_index), str(target))
+    gene_col = "gene" if "gene" in subset.columns else "gene_symbol"
+    symbol_col = "gene_symbol" if "gene_symbol" in subset.columns else gene_col
+    for record in subset.itertuples(index=False):
+        if len(ordered) >= int(max_genes):
+            break
+        gene_name = str(getattr(record, gene_col))
+        symbol = str(getattr(record, symbol_col))
+        index = name_to_index.get(gene_name)
+        if index is None:
+            index = symbol_to_index.get(symbol)
+        if index is None:
+            continue
+        _push(int(index), symbol if symbol else gene_name)
+    return np.asarray(ordered, dtype=int), labels
+
+
+def _mixscale_classified_masks(
+    adata: AnnData, target: str, control: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """NT / NP / KO index arrays for one target; ``True`` when Mixscape classes exist."""
+    labels = adata.obs["target_gene"].astype(str).to_numpy()
+    if "mixscape_status" not in adata.obs:
+        nt = np.flatnonzero(labels == str(control))
+        ko = np.flatnonzero(labels == str(target))
+        return nt, np.asarray([], dtype=int), ko, False
+    status = _status_labels(adata.obs["mixscape_status"]).to_numpy()
+    nt = _control_positions(status)
+    if nt.size == 0:
+        nt = np.flatnonzero(labels == str(control))
+    np_cells = np.flatnonzero((labels == str(target)) & (status == "non_perturbed"))
+    ko = np.flatnonzero((labels == str(target)) & (status == "perturbed"))
+    if np_cells.size == 0 and ko.size == 0:
+        # Mixscape present but this target was not classified → Mixscale_DoHeatmap 2-group.
+        ko = np.flatnonzero(labels == str(target))
+        return nt, np.asarray([], dtype=int), ko, False
+    return nt, np_cells, ko, True
+
+
+def _order_by_mixscale_score(
+    index: np.ndarray, scores: np.ndarray, cap: int, seed: int
+) -> np.ndarray:
+    chosen = _group_index(np.asarray(index, dtype=int), cap, seed)
+    if chosen.size == 0:
+        return chosen
+    finite = np.isfinite(scores[chosen])
+    ordered = chosen[finite][np.argsort(scores[chosen[finite]], kind="mergesort")]
+    missing = chosen[~finite]
+    return np.concatenate([ordered, missing]) if missing.size else ordered
+
+
+def _mixscale_heatmap_blocks(
+    adata: AnnData,
+    target: str,
+    control: str,
+    *,
+    seed: int,
+    max_cells: int,
+) -> tuple[np.ndarray, list[str], str]:
+    """Cell columns and NP/NT/KO labels; within each block order by ``mixscale_score``."""
+    scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
+    nt, np_cells, ko, used_mixscape = _mixscale_classified_masks(adata, target, control)
+    nt_ord = _order_by_mixscale_score(nt, scores, max_cells, seed + 2)
+    np_ord = _order_by_mixscale_score(np_cells, scores, max_cells, seed + 1)
+    ko_ord = _order_by_mixscale_score(ko, scores, max_cells, seed)
+    if nt_ord.size == 0 or (ko_ord.size == 0 and np_ord.size == 0):
+        return np.asarray([], dtype=int), [], "missing_nt_or_perturbed"
+    # Mixscale panels: NT | NP | KO (CRISPR-mode label on KO block). Mixscape 2x2 stays NP|NT|KO.
+    pieces: list[np.ndarray] = [nt_ord]
+    group_labels = ["NT"] * int(nt_ord.size)
+    if used_mixscape and np_ord.size:
+        pieces.append(np_ord)
+        group_labels.extend(["NP"] * int(np_ord.size))
+    if ko_ord.size:
+        pieces.append(ko_ord)
+        group_labels.extend(["KO"] * int(ko_ord.size))
+    columns = np.concatenate(pieces)
+    if used_mixscape and np_ord.size and ko_ord.size:
+        mode = "mixscape_nt_np_ko"
+    elif used_mixscape:
+        mode = "mixscape_nt_ko" if ko_ord.size else "mixscape_nt_np"
+    else:
+        mode = "mixscale_nt_perturbed"
+    return columns, group_labels, mode
+
+
+def _draw_mixscale_de_heatmap(
+    axis: Axes,
+    adata: AnnData,
+    target: str,
+    *,
+    control: str,
+    seed: int,
+    max_genes: int,
+    max_cells: int,
+    perturbation_label: str = "KO",
+) -> int:
+    """Mixscale DE heatmap: NT/NP/KO blocks when Mixscape labels exist, else NT|perturbed."""
+    if "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
+        axis.set_axis_off()
+        axis.set_title(f"{target}: mixscale_not_run")
+        return 0
+    columns, group_labels, mode = _mixscale_heatmap_blocks(
+        adata, target, control, seed=seed, max_cells=max_cells
+    )
+    if columns.size == 0:
+        axis.set_axis_off()
+        axis.set_title(f"{target}: missing NT or PRTB cells")
+        return 0
+    genes, gene_labels = _mixscale_de_gene_indices(adata, target, max_genes=max_genes)
+    if genes.size == 0:
+        axis.set_axis_off()
+        axis.set_title(f"{target}: no Mixscale DE genes")
+        return 0
+    values = _row_matrix(adata, columns, genes, None).T
+    center = values.mean(axis=1, keepdims=True)
+    scale = values.std(axis=1, keepdims=True)
+    scale[scale == 0] = 1
+    scaled = (values - center) / scale
+    counts = [group_labels.count(key) for key in ("NP", "NT", "KO") if group_labels.count(key)]
+    largest = max(counts) if counts else int(columns.size)
+    gap = max(6, int(round(0.08 * largest)))
+    gapped, spans = gapped_heatmap_matrix(scaled, group_labels, gap=gap)
+    axis.imshow(
+        np.ma.masked_invalid(gapped),
+        aspect="auto",
+        cmap=_heatmap_cmap(),
+        vmin=-2,
+        vmax=2,
+        interpolation="none",
+    )
+    axis.set_yticks(np.arange(genes.size))
+    axis.set_yticklabels(gene_labels, fontsize=6)
+    axis.set_xticks([])
+    control_block = "zero-guide" if str(control) == ZERO_GUIDE_LABEL else "NT"
+    prtb = str(perturbation_label or "KO")
+    _annotate_heatmap_groups(
+        axis,
+        spans,
+        int(genes.size),
+        {"NP": "NP", "NT": control_block, "KO": prtb},
+    )
+    axis.set_title(f"{target} Mixscale DE (n={genes.size}; {mode})")
+    return int(genes.size)
+
+
+def draw_mixscale_de_heatmaps(
+    store: FigureStore,
+    adata: AnnData,
+    *,
+    control: str,
+    seed: int,
+    max_genes: int = 20,
+    max_cells: int = 300,
+    perturbation_label: str = "KO",
+) -> None:
+    """One Mixscale DE heatmap per DE-gate target; copy target-in-own-DE to ``target_in_de/``.
+
+    Prefer Mixscape ``mixscape_status`` blocks NP | NT | KO (CRISPR-mode label). Without
+    Mixscape classes, fall back to Mixscale_DoHeatmap: NT | all target cells, ordered by
+    ``mixscale_score``. Features = target gene + Mixscale DE list.
+    """
+    if adata is None or "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
+        store.skip("mixscale_de_heatmaps", "mixscale_not_run", section="mixscale")
+        return
+    if not isinstance(adata.uns.get("mixscale_de_gate"), pd.DataFrame):
+        store.skip("mixscale_de_heatmaps", "de_gate_not_run", section="mixscale")
+        return
+    if not isinstance(adata.uns.get("mixscale_de_genes"), pd.DataFrame):
+        store.skip("mixscale_de_heatmaps", "de_genes_missing", section="mixscale")
+        return
+    passed = _passed_de_targets(adata, control)
+    if passed is None:
+        store.skip("mixscale_de_heatmaps", "de_gate_not_run", section="mixscale")
+        return
+    if not passed:
+        store.skip("mixscale_de_heatmaps", "no_targets_passed_de_gate", section="mixscale")
+        return
+    prtb = str(perturbation_label or "KO")
+    rows = []
+    for target in sorted(passed):
+        record = {"target_gene": target, "status": "plotted", "reason": "", "n_heatmap_genes": 0}
+        figure, axis = plt.subplots(figsize=(10, 6))
+        figure.perturbseq_manual_layout = True
+        try:
+            n_genes = _draw_mixscale_de_heatmap(
+                axis,
+                adata,
+                str(target),
+                control=control,
+                seed=seed,
+                max_genes=max_genes,
+                max_cells=max_cells,
+                perturbation_label=prtb,
+            )
+        except Exception as exc:
+            plt.close(figure)
+            record.update(status="skipped", reason=f"heatmap_failed:{exc}")
+            rows.append(record)
+            continue
+        if n_genes == 0:
+            plt.close(figure)
+            record.update(status="skipped", reason="no_genes_or_cells")
+            rows.append(record)
+            continue
+        _, _, mode = _mixscale_heatmap_blocks(
+            adata, str(target), control, seed=seed, max_cells=max_cells
+        )
+        store.save(
+            figure,
+            f"{_safe(str(target))}_mixscale_heatmap",
+            "mixscale",
+            pd.DataFrame(
+                {
+                    "target_gene": [target],
+                    "n_heatmap_genes": [n_genes],
+                    "control": [control],
+                    "grouping": [mode],
+                    "perturbation_label": [prtb],
+                }
+            ),
+            (
+                f"Mixscale DE {target} vs {_contrast_name(control)}; grouping={mode}; "
+                f"blocks NP/NT/{prtb} when Mixscape labels exist else NT|perturbed; "
+                f"cells ordered by mixscale_score within block; heatmap genes={n_genes}; "
+                "not a biological-replicate test"
+            ),
+        )
+        record["n_heatmap_genes"] = n_genes
+        record["grouping"] = mode
+        rows.append(record)
+    selection = pd.DataFrame(rows)
+    if store.plotting.get("save_plot_data", False):
+        panels = store.data_dir("mixscale_de_heatmaps", "mixscale")
+        panels.mkdir(parents=True, exist_ok=True)
+        selection.to_csv(panels / "mixscale_de_heatmaps.tsv", sep="\t", index=False)
+    export_mixscale_target_in_de(store, adata, control=control)
+    if selection.empty or not (selection["status"] == "plotted").any():
+        store.skip("mixscale_de_heatmaps", "no_heatmaps_plotted", section="mixscale")
+
+
+def _mixscale_ridge_identities(
+    adata: AnnData, control: str, passed: set[str], perturbation_label: str
+) -> tuple[list[str], dict[str, np.ndarray], str]:
+    """Ridge row labels and boolean masks; prefer NT / NP / KO when Mixscape exists."""
+    labels = adata.obs["target_gene"].astype(str).to_numpy()
+    scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
+    prtb = str(perturbation_label or "KO")
+    identities: list[str] = []
+    masks: dict[str, np.ndarray] = {}
+
+    def _add(name: str, mask: np.ndarray) -> None:
+        values = scores[mask]
+        if np.isfinite(values).any():
+            identities.append(name)
+            masks[name] = mask
+
+    used_mixscape = False
+    if "mixscape_status" in adata.obs:
+        status = _status_labels(adata.obs["mixscape_status"]).to_numpy()
+        control_mask = np.isin(status, ["nt", "zero_guide"])
+        if not control_mask.any():
+            control_mask = labels == str(control)
+        _add("NT" if str(control) != ZERO_GUIDE_LABEL else "zero-guide", control_mask)
+        for gene in sorted(passed):
+            np_mask = (labels == gene) & (status == "non_perturbed")
+            ko_mask = (labels == gene) & (status == "perturbed")
+            if np_mask.any() or ko_mask.any():
+                used_mixscape = True
+                _add(f"{gene} NP", np_mask)
+                _add(f"{gene} {prtb}", ko_mask)
+            else:
+                _add(gene, labels == gene)
+    else:
+        _add(_contrast_name(control) if control == ZERO_GUIDE_LABEL else str(control), labels == str(control))
+        for gene in sorted(passed):
+            _add(gene, labels == gene)
+    mode = "mixscape_nt_np_ko" if used_mixscape else "mixscale_by_target"
+    return identities, masks, mode
+
+
+def draw_mixscale_ridge(
+    store: FigureStore,
+    adata: AnnData,
+    control: str,
+    perturbation_label: str = "KO",
+) -> None:
+    """Ridge of mixscale_score; NT/NP/KO rows when Mixscape labels exist.
 
     Missing PNGs are expected when the Mixscale DE gate passes zero targets
     (common with a temporary ``zero_guide`` control and weak/noisy effects).
@@ -3106,24 +3599,26 @@ def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> Non
     if not passed:
         store.skip(name, "no_targets_passed_de_gate")
         return
-    labels = adata.obs["target_gene"].astype(str)
-    scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce")
-    identities = [control] if np.isfinite(scores[labels == control]).any() else []
-    for identity in sorted(passed):
-        if np.isfinite(scores[labels == identity]).any():
-            identities.append(identity)
-    finite = scores[labels.isin(identities)]
-    finite = finite[np.isfinite(finite)]
-    if finite.empty or len(identities) < 2:
+    scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
+    identities, masks, mode = _mixscale_ridge_identities(
+        adata, control, passed, perturbation_label
+    )
+    if len(identities) < 2:
         store.skip(name, "no_targets_with_finite_scores")
         return
-    grid = np.linspace(float(finite.min()) - 0.5, float(finite.max()) + 0.5, 200)
+    finite_values = np.concatenate(
+        [scores[masks[name]][np.isfinite(scores[masks[name]])] for name in identities]
+    )
+    if finite_values.size == 0:
+        store.skip(name, "no_targets_with_finite_scores")
+        return
+    grid = np.linspace(float(finite_values.min()) - 0.5, float(finite_values.max()) + 0.5, 200)
     figure, axis = plt.subplots(figsize=(8, max(4, 0.32 * len(identities))))
     figure.perturbseq_manual_layout = True
     cmap = plt.get_cmap("turbo")
     rows = []
     for index, identity in enumerate(identities):
-        values = scores[labels == identity].to_numpy(dtype=float)
+        values = scores[masks[identity]]
         values = values[np.isfinite(values)]
         color = cmap(index / max(len(identities) - 1, 1))
         if values.size >= 2 and float(np.std(values)) > 0:
@@ -3141,24 +3636,23 @@ def draw_mixscale_ridge(store: FigureStore, adata: AnnData, control: str) -> Non
             }
         )
     axis.set_yticks(range(len(identities)))
-    axis.set_yticklabels([_contrast_name(str(identity)) for identity in identities], fontsize=7)
+    axis.set_yticklabels(identities, fontsize=7)
     axis.set_xlabel("mixscale_score")
     axis.set_ylabel("Identity")
-    axis.set_title(f"mixscale_score; control = {_contrast_name(control)}")
+    axis.set_title(f"mixscale_score; grouping={mode}; control = {_contrast_name(control)}")
     axis.set_ylim(-0.2, len(identities))
     table = pd.DataFrame(rows)
     skipped = _skipped_de_targets(adata)
     skipped_text = ",".join(skipped) if skipped else "none"
-    unscored_passed = sorted(set(passed) - set(identities))
-    unscored_text = ",".join(unscored_passed) if unscored_passed else "none"
     store.save(
         figure,
         name,
         "mixscale",
         table,
-        "Mixscale ridge of targets that passed the DE gate; "
+        "Mixscale ridge; prefer NT/NP/"
+        f"{perturbation_label} when Mixscape labels exist else one row per target; "
         "score is perturbation strength, not editing success; no legend; "
-        f"skipped_targets={skipped_text}; unscored_passed_targets={unscored_text}",
+        f"grouping={mode}; skipped_targets={skipped_text}",
     )
 
 
@@ -3236,13 +3730,19 @@ def _fallback_only(scores: np.ndarray) -> bool:
     return bool(finite.size) and bool(np.all(np.abs(finite - 1.0) <= 1e-8))
 
 
-def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin: int = 10) -> None:
+def draw_mixscale_scatter(
+    store: FigureStore,
+    adata: AnnData,
+    control: str,
+    nbin: int = 10,
+    perturbation_label: str = "KO",
+) -> None:
     """Connected scatter of target-gene expression across mixscale score bins.
 
-    One facet per target that passed the DE gate and has a real finite score.
-    NT is not a facet. A target whose scores are all the software fallback 1 is
-    omitted. ``nbin`` is 10, matching the Mixscale tutorial, and every qualifying
-    target is drawn.
+    One facet per DE-gate target. When Mixscape NP/KO labels exist, each facet
+    draws separate NP and KO curves (NT mean as a dashed reference). Without
+    Mixscape, one curve per target (Mixscale_ScatterPlot). Fallback score ``1``
+    targets are omitted. ``nbin`` defaults to 10.
     """
     name = "mixscale_scatter"
     if adata is None or "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
@@ -3262,11 +3762,18 @@ def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin
     labels = adata.obs["target_gene"].astype(str).to_numpy()
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
     control = str(control)
+    prtb = str(perturbation_label or "KO")
+    status = (
+        _status_labels(adata.obs["mixscape_status"]).to_numpy()
+        if "mixscape_status" in adata.obs
+        else None
+    )
     fallback: list[str] = []
     unscored: list[str] = []
     missing: list[str] = []
     case_insensitive: list[str] = []
     frames: list[pd.DataFrame] = []
+    nt_refs: dict[str, float] = {}
     for gene in sorted(passed):
         if gene == control:
             continue
@@ -3284,10 +3791,28 @@ def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin
             continue
         if match == "case_insensitive_symbol":
             case_insensitive.append(gene)
-        use = chosen & np.isfinite(scores)
-        binned = _mixscale_expression_bins(scores[use], expression[use], nbin)
-        binned.insert(0, "target_gene", gene)
-        frames.append(binned)
+        control_mask = labels == control
+        if status is not None:
+            control_mask = np.isin(status, ["nt", "zero_guide"]) | control_mask
+        if control_mask.any() and np.isfinite(expression[control_mask]).any():
+            nt_refs[gene] = float(np.nanmean(expression[control_mask]))
+        class_masks: list[tuple[str, np.ndarray]] = []
+        if status is not None:
+            np_mask = chosen & (status == "non_perturbed") & np.isfinite(scores)
+            ko_mask = chosen & (status == "perturbed") & np.isfinite(scores)
+            if np_mask.any():
+                class_masks.append(("NP", np_mask))
+            if ko_mask.any():
+                class_masks.append((prtb, ko_mask))
+        if not class_masks:
+            class_masks.append(("all", chosen & np.isfinite(scores)))
+        for class_name, mask in class_masks:
+            if int(mask.sum()) < 2:
+                continue
+            binned = _mixscale_expression_bins(scores[mask], expression[mask], nbin)
+            binned.insert(0, "target_gene", gene)
+            binned.insert(1, "class", class_name)
+            frames.append(binned)
     if not frames:
         store.skip(name, "no_scored_de_targets")
         return
@@ -3295,34 +3820,46 @@ def draw_mixscale_scatter(store: FigureStore, adata: AnnData, control: str, nbin
     genes = table["target_gene"].drop_duplicates().tolist()
     ncol = int(np.ceil(np.sqrt(len(genes))))
     nrow = int(np.ceil(len(genes) / ncol))
-    figure, axes = plt.subplots(nrow, ncol, figsize=(3.1 * ncol, 2.45 * nrow), squeeze=False)
-    colors = sns.color_palette("husl", n_colors=len(genes))
+    figure, axes = plt.subplots(
+        nrow, ncol, figsize=(3.4 * ncol, 2.7 * nrow), squeeze=False
+    )
+    figure.perturbseq_skip_tight_layout = True
+    class_colors = {"NP": "#c9c9c9", prtb: "#EE6A50", "all": "#4C78A8"}
     for index, gene in enumerate(genes):
         axis = axes[index // ncol, index % ncol]
         piece = table[table["target_gene"] == gene]
-        axis.plot(
-            piece["bin"],
-            piece["mean_expression"],
-            color=colors[index],
-            marker="o",
-            linewidth=1.4,
-            markersize=4.5,
-        )
-        axis.set_title(gene, fontsize=10)
+        for class_name, sub in piece.groupby("class", sort=False):
+            axis.plot(
+                sub["bin"],
+                sub["mean_expression"],
+                color=class_colors.get(str(class_name), "#4C78A8"),
+                marker="o",
+                linewidth=1.4,
+                markersize=4.5,
+                label=str(class_name),
+            )
+        if gene in nt_refs:
+            axis.axhline(nt_refs[gene], color="#7d7d7d", linestyle="--", linewidth=0.8, label="NT")
+        axis.set_title(gene, fontsize=10, pad=6)
         axis.set_xlim(0.5, nbin + 0.5)
         axis.tick_params(labelsize=8)
+        if piece["class"].nunique() > 1 or gene in nt_refs:
+            axis.legend(frameon=False, fontsize=6, loc="best")
     for index in range(len(genes), nrow * ncol):
         axes[index // ncol, index % ncol].axis("off")
-    figure.supxlabel("bins for perturbation scores")
-    figure.supylabel("expression levels of target")
+    figure.supxlabel("bins for perturbation scores", y=0.02)
+    figure.supylabel("expression levels of target", x=0.02)
+    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.10, top=0.92, wspace=0.35, hspace=0.40)
     failed = [gene for gene in _skipped_de_targets(adata) if gene and gene != control]
+    used_mixscape = "class" in table.columns and set(table["class"].astype(str)) - {"all"}
     store.save(
         figure,
         name,
         "mixscale",
         table,
-        "Mixscale_ScatterPlot; quantile bins of mixscale_score within each target; "
-        "NT excluded; y is that target gene's own log-normalized expression; no legend; "
+        "Mixscale_ScatterPlot; quantile bins of mixscale_score; "
+        f"grouping={'mixscape_np_ko' if used_mixscape else 'by_target'}; "
+        "NT mean dashed when available; y is target gene log-normalized expression; "
         f"n_targets={len(genes)}; nbin={nbin}; control={control}; "
         f"case_insensitive_y={','.join(case_insensitive) or 'none'}; "
         f"omitted_failed_de={','.join(sorted(set(failed))) or 'none'}; "

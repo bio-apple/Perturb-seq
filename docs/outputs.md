@@ -26,7 +26,7 @@
 | `qc/` | assign / preprocess QC 图 |
 | `UMAP/` | 表达 UMAP、簇注释、细胞周期；Mixscape signature UMAP |
 | `Mixscape/` | Mixscape 图 |
-| `mixscale/` | Mixscale ridge / scatter |
+| `mixscale/` | Mixscale ridge / scatter / DE 计数 / DE 热图 |
 | `DGE/` | 描述性效应图 |
 | `E-distance/` | E-test 散点 |
 
@@ -53,7 +53,7 @@
 | 路径 | 内容 |
 | --- | --- |
 | `qc/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA |
-| `qc/marker_detection_heatmap.png`、`dotplot_markers.png` | marker |
+| `qc/marker_detection_heatmap.png`、`dotplot_markers.png` | marker；白底；行=注释簇名；dotplot 为 Seurat 式 Percent/Average 双图例 |
 | `UMAP/umap_cell_type.png` | 真实细胞类型（有注释时） |
 | `UMAP/umap_annotation_cell_cycle_panel.png` | 2 行组合：上行 Leiden + SingleR；下行 Perturbed / 对照 / Cell Cycle |
 
@@ -70,7 +70,9 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `mixscale/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 箱线 |
+| `mixscale/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 分箱散点；有 Mixscape 标签时按 NT/NP/KO（或 KD/OE）分行或分线 |
+| `mixscale/target_de_counts.png`、`target_in_de_gene_counts.png` | Mixscale DE 门计数（对标 Mixscape 同名图） |
+| `mixscale/{靶基因}_mixscale_heatmap.png`、`target_in_de/...` | Mixscale DE 热图：有 Mixscape 时列块 **NT \| NP \| KO**；否则 NT \| perturbed；`target_in_de/` 为「靶基因在自身 DE 列表」子集 |
 
 ### perturb → `DGE/` + `E-distance/`
 

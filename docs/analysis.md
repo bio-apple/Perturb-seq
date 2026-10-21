@@ -75,7 +75,7 @@ flowchart TD
 | `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` |
 | `dge` | pertpy `WilcoxonTest`（与另两者独立；无独立 PNG） | — |
 | `mixscape` | Seurat Mixscape：分类 + `X_pert`；写出 Mixscape / 相关 UMAP | **`Mixscape/`**、`UMAP/` |
-| `mixscale` | Mixscale：自算签名 + 分数；写出 ridge / scatter | **`mixscale/`** |
+| `mixscale` | Mixscale：自算签名 + 分数；写出 ridge / scatter / DE 计数 / DE 热图 | **`mixscale/`** |
 | `perturb` | 描述性效应、E-test；写出描述性图与 E-test 图 | `DGE/`、`E-distance/` |
 
 图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `**/*.png`（细节见 [outputs.md](outputs.md)）。
@@ -213,7 +213,7 @@ QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount �
 
 ### GEX marker 图
 
-`preprocess` 后写出 `marker_detection_heatmap` 与 `dotplot_markers`。基因列表优先读 `plotting.markers`；未配置时按 `experiment.organism` 使用默认 housekeeping（人类：`ACTB,GAPDH,B2M,MALAT1,NEAT1,UBC,PPIA,EEF1A1`；小鼠对应首字母小写形式）。仅使用矩阵中存在的基因；全缺失则 skip。
+`preprocess` 后写出 `marker_detection_heatmap` 与 `dotplot_markers`（白底 Library-D / Seurat 点图风格）。基因列表优先读 `plotting.markers`；未配置时按 `experiment.organism` 使用默认 housekeeping（人类：`ACTB,GAPDH,B2M,MALAT1,NEAT1,UBC,PPIA,EEF1A1`；小鼠对应首字母小写形式）。仅使用矩阵中存在的基因；全缺失则 skip。行标签优先 `singler_label`（否则 `cell_type`）拼成 `leiden: annotation`；无注释时退回裸 Leiden id。点图：点大小 = Percent Expressed，颜色 = Average Expression（右侧双图例）。
 
 ### gRNA 捕获
 
@@ -334,13 +334,17 @@ log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
 | `logfc_threshold`（\|logFC\|） | **0.1** | **0.1** | — |
 | `min_de_genes` | 5 | 5 | — |
 | `pval_cutoff` | 0.05 | 0.05 | — |
-| 主要产物 | KO/NP 分类、signature UMAP | `mixscale_score` | 靶 vs 对照 DE 表 |
+| 主要产物 | KO/NP 分类、signature UMAP、2×2、DE 计数 | `mixscale_score`、DE 计数、DE 热图 | 靶 vs 对照 DE 表 |
 
-Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscale 假分数 `1` 置缺失。
+Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscape 2×2（`Mixscape/{靶}_mixscape_2x2.png`）为后验 / 扰动分数 / 细胞级火山 / Top 基因热图；热图列块为 **NP | NT | KO**（CRISPRi/a 时 KO 块显示 KD/OE）。Mixscale 假分数 `1` 置缺失。
 
-**无 ridge / scatter**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` 记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。可调 `mixscale.logfc_threshold` / `min_de_genes`。
+Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscale_de_genes']`（非 Mixscape）写出与 Mixscape 对称的计数图与热图：`mixscale/target_de_counts.png`、`target_in_de_gene_counts.png`、`{靶}_mixscale_heatmap.png`；「靶基因 symbol 精确出现在自身 DE 列表」的热图再复制到 `mixscale/target_in_de/`（对标 `Mixscape/target_in_de/`）。
 
-> **口径**：三者独立；KO/NP 与 Mixscale 分数都不是生物学重复推断；Wilcoxon p 为细胞级。
+**Mixscale 分组（现状）**：官方 [Mixscale_DoHeatmap](https://satijalab.github.io/Mixscale/) 只有 NT vs 全部靶向细胞并按 `mixscale_score` 排序，不做 NP/KO 分类。本流水线在**同跑且已合并 Mixscape 标签**时，热图 / ridge / scatter 优先按 **NT | NP | KO**（默认；CRISPRi→KD、CRISPRa→OE、other→PT）分块或分面，块内仍按 `mixscale_score` 排序；无 Mixscape 分类时回退为文档等价的 NT | perturbed。并行步结束后若两者皆有，会重画 `mixscale/` 图以带上 NT/NP/KO。
+
+**无 ridge / scatter / DE 热图**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` / DE 热图记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。可调 `mixscale.logfc_threshold` / `min_de_genes`。
+
+> **口径**：计算上三者独立；作图在合并后可对齐 Mixscape 标签。KO/NP 与 Mixscale 分数都不是生物学重复推断；Wilcoxon p 为细胞级。
 
 ---
 
