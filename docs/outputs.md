@@ -6,7 +6,7 @@
 
 | 保留 | 说明 |
 | --- | --- |
-| `**/*.png` | 各步分析目录下的 PNG（直接写在目录根，如 `qc/*.png`、`DGE/*.png`） |
+| `**/*.png` | 各步分析目录下的 PNG（直接写在目录根，如 `qc/*.png`、`Mixscape/*.png`） |
 
 跑程中可能短暂写出 TSV / JSON / YAML 等中间文件；结束时的 lean cleanup 只留下 PNG。`--validate-only` 不做 cleanup（校验文件留在输出目录）。不写出 `checkpoints/*.h5ad`，不支持 `--resume`；需从 `io` 起连续运行（通常 `--steps all`）。
 
@@ -27,8 +27,6 @@
 | `UMAP/` | 表达 UMAP、簇注释、细胞周期；Mixscape signature UMAP |
 | `Mixscape/` | Mixscape 图 |
 | `mixscale/` | Mixscale ridge / scatter / DE 计数 / DE 热图 |
-| `DGE/` | 描述性效应图 |
-| `E-distance/` | E-test 散点 |
 
 `mixscape` / `mixscale` 互不依赖；并行步之间用**临时目录**交换 AnnData，跑完即删，不落盘到输出目录。
 
@@ -62,7 +60,7 @@
 | 路径 | 内容 |
 | --- | --- |
 | `UMAP/umap_mixscape_class.png` / `umap_mixscape.png` / `umap_mixscape_class_global.png` | Mixscape UMAP |
-| `Mixscape/mixscape_class_global_bar.png`、`mixscape_fraction_bar.png` | 分类计数 / 比例 |
+| `Mixscape/mixscape_class_global_bar.png` | 分类计数 |
 | `Mixscape/{靶基因}_mixscape_2x2.png`、`target_in_de/...` | 火山 + 热图 |
 | `Mixscape/target_de_counts.png`、`target_in_de_gene_counts.png` | DE 计数 |
 
@@ -73,11 +71,3 @@
 | `mixscale/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 分箱散点；有 Mixscape 标签时按 NT/NP/KO（或 KD/OE）分行或分线 |
 | `mixscale/target_de_counts.png`、`target_in_de_gene_counts.png` | Mixscale DE 门计数（对标 Mixscape 同名图） |
 | `mixscale/{靶基因}_mixscale_heatmap.png`、`target_in_de/...` | Mixscale DE 热图：有 Mixscape 时列块 **NT \| NP \| KO**；否则 NT \| perturbed；`target_in_de/` 为「靶基因在自身 DE 列表」子集 |
-
-### perturb → `DGE/` + `E-distance/`
-
-| 路径 | 内容 |
-| --- | --- |
-| `DGE/de_gene_heatmap.png` | 描述性 log2FC |
-| `DGE/guide_consistency.png`、`target_expression_effect.png` | guide / 靶基因自身表达 |
-| `E-distance/edistance_etest.png` | 细胞级 E-test |

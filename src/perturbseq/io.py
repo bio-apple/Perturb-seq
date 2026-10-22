@@ -467,21 +467,3 @@ def _guide_umi_agreement(annotated: pd.DataFrame, wanted: pd.Index) -> dict[str,
         "n_compared": int(ok.sum()),
         "median_relative_difference": float(np.median(relative)),
     }
-
-
-def sum_by_group(
-    matrix: sparse.spmatrix | np.ndarray, groups: pd.Series
-) -> tuple[np.ndarray, pd.Index]:
-    """Sum rows by group label. The grand total is unchanged."""
-    labels = groups.astype(str)
-    codes, uniques = pd.factorize(labels, sort=True)
-    indicator = sparse.csr_matrix(
-        (np.ones(len(codes), dtype=np.float64), (codes, np.arange(len(codes)))),
-        shape=(len(uniques), len(codes)),
-    )
-    if sparse.issparse(matrix):
-        summed = indicator @ matrix.astype(np.float64)
-        dense = np.asarray(summed.toarray() if sparse.issparse(summed) else summed)
-    else:
-        dense = np.asarray(indicator @ np.asarray(matrix, dtype=np.float64))
-    return dense, pd.Index(uniques.astype(str))

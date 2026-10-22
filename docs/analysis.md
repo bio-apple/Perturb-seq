@@ -12,12 +12,9 @@
 6. [QC](#qc)
 7. [分配](#分配)
 8. [Barcode](#barcode)
-9. [统计](#统计)
-10. [Mixscape 与 Mixscale](#mixscape-与-mixscale)
-11. [相对对照的标准化](#相对对照的标准化)
-12. [预处理与簇注释](#预处理与簇注释)
-13. [扰动距离](#扰动距离)
-14. [靶基因表达](#靶基因表达)
+9. [Mixscape 与 Mixscale](#mixscape-与-mixscale)
+10. [相对对照的标准化](#相对对照的标准化)
+11. [预处理与簇注释](#预处理与簇注释)
 
 ---
 
@@ -26,10 +23,16 @@
 `--steps` 默认 `all`。依赖关系：
 
 ```text
-io → assign → preprocess → { mixscape ‖ mixscale } → perturb
+io → assign → preprocess → 分析步（按 CRISPR 模式选型）
 ```
 
-`mixscape` / `mixscale` 只依赖 `preprocess`，彼此无边；同一次 `run` 里两者都待跑时用进程池**并发**执行（各进程读临时 preprocess 副本，写各自 PNG 目录；进程间用临时目录交换，**不**写出 `checkpoints/`）。仅指定其中一步时仍串行。`perturb` 在两者之后：以 preprocess 为底，合并本轮 Mixscape 标签（sensitivity 分支需要 Mixscape；Mixscale 分数不并入 perturb 表，仅用于 `mixscale/` 图）。
+| `--crispr-mode` | `--steps all` 时的分析步 |
+| --- | --- |
+| `KO`（默认） | `mixscape` |
+| `i` / `a` | `mixscale` |
+| `other` | 无（仅 `io,assign,preprocess`；不做 Mixscape / Mixscale） |
+
+`mixscape` / `mixscale` 只依赖 `preprocess`。默认 `all` 按模式只跑其中一步（`other` 则不跑）。KO/i/a 若命令行**显式**同时指定两者，用进程池**并发**（各进程读临时 preprocess 副本；**不**写 `checkpoints/`）；仅一步时串行。两者都跑完且已有 Mixscape 标签时，会重画 `mixscale/` 图以便按 NT|NP|KO 分面。`other` 下显式 `--steps` 含 `mixscape` / `mixscale` 会拒绝。
 
 不支持 `--resume` / 不落盘 h5ad：`--steps` 须从 `io` 起连续跑（通常 `--steps all`）。
 
@@ -47,21 +50,19 @@ flowchart TD
   NT --> PRE
   ZG --> PRE
 
-  PRE["preprocess<br/>归一化 · HVG · PCA/neighbors<br/>Leiden/UMAP · 可选 Harmony/细胞周期"] --> PAR
+  PRE["preprocess<br/>归一化 · HVG · PCA/neighbors<br/>Leiden/UMAP · 可选 Harmony/细胞周期"] --> MODE{"--steps all<br/>按 crispr_mode"}
+  MODE -->|"KO"| MX["mixscape"]
+  MODE -->|"i / a"| MS["mixscale"]
+  MODE -->|"other"| PRE_ONLY["停在 preprocess<br/>不做 Mixscape / Mixscale"]
+  MODE -->|"KO/i/a 显式同时指定"| BOTH["mixscape ‖ mixscale"]
 
-  subgraph PAR["并行（两步同跑时 ProcessPool；受 runtime.n_threads 上限）"]
-    MX["mixscape<br/>pertpy Mixscape"]
-    MS["mixscale<br/>pertpy Mixscale<br/>X_pert_mixscale"]
-  end
-
-  MX --> OUT_MX["Mixscape/<br/>layer X_pert"]
+  MX --> OUT_MX["Mixscape/"]
   MS --> OUT_MS["mixscale/"]
-
-  PRE --> PT
-  MX -.->|"合并 mixscape 标签"| PT
-  PT["perturb<br/>描述性 CPM · E-test"] --> OUT_DGE["DGE/"]
-  PT --> OUT_ED["E-distance/"]
-  PT --> OUT["**/*.png only"]
+  BOTH --> OUT_MX
+  BOTH --> OUT_MS
+  PRE_ONLY --> OUT["**/*.png only"]
+  OUT_MX --> OUT
+  OUT_MS --> OUT
 ```
 
 | 步骤 | 作用 | 输出目录 |
@@ -69,9 +70,8 @@ flowchart TD
 | `io` | 读入矩阵 / 参考 / 分配（账本在内存） | — |
 | `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/` |
 | `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` |
-| `mixscape` | pertpy `Mixscape`：DE 门 → `perturbation_signature` → 分类；`X_pert`；写出 Mixscape / 相关 UMAP | **`Mixscape/`**、`UMAP/` |
-| `mixscale` | pertpy `Mixscale`：独立 DE 门 → 自算签名 → `mixscale_score`；`X_pert_mixscale`；写出 ridge / scatter / DE 计数 / DE 热图 | **`mixscale/`** |
-| `perturb` | 描述性效应、E-test；写出描述性图与 E-test 图 | `DGE/`、`E-distance/` |
+| `mixscape` | 默认用于 **KO**；pertpy `Mixscape`：DE 门 → 签名 → 分类 | **`Mixscape/`**、`UMAP/` |
+| `mixscale` | 默认用于 **CRISPRi / CRISPRa**；pertpy `Mixscale`：独立 DE 门 → `mixscale_score` | **`mixscale/`** |
 
 图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `**/*.png`（细节见 [outputs.md](outputs.md)）。
 
@@ -79,13 +79,15 @@ flowchart TD
 
 | 情形 | 行为 |
 | --- | --- |
-| `--steps all`（默认） | preprocess 之后 mixscape 与 mixscale 并发，再跑 perturb |
-| `--steps` 含 `mixscape` 与 `mixscale` 且从 `io` 连续跑到该处 | 一并并发 |
+| `--steps all` + `KO` | 只跑 `mixscape` |
+| `--steps all` + `i` / `a` | 只跑 `mixscale` |
+| `--steps all` + `other` | 仅 `io,assign,preprocess`（不做 Mixscape / Mixscale） |
+| `other` + 显式含 `mixscape` / `mixscale` | 拒绝（SystemExit） |
+| KO/i/a 显式同时含 `mixscape` 与 `mixscale` | 进程池并发 |
 | 只指定两者之一（仍须从 `io` 起） | 单进程串行 |
 | 共享输入 | 各 worker 读**临时** preprocess.h5ad（非输出目录） |
-| 输出隔离 | `mixscape`→`Mixscape/`；`mixscale`→`mixscale/`；日志带 `[step]` 前缀，可能交错 |
-| 线程 | 默认 `runtime.n_threads = max(1, CPU//3)`；限制 OpenMP/BLAS/`scanpy.n_jobs` 与 ProcessPool `max_workers` |
-| 资源 | 并发时峰值内存约 ×2；matplotlib 用 `Agg` |
+| 输出隔离 | `mixscape`→`Mixscape/`；`mixscale`→`mixscale/` |
+| 线程 | 默认 `runtime.n_threads = max(1, CPU//3)` |
 
 `preprocess.n_pcs` 与 `mixscape.n_dims` 须同为 30。
 
@@ -101,7 +103,7 @@ flowchart TD
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`，默认 `KO` |
-| `--steps` | 见上；须从 `io` 起；`mixscape` 与 `mixscale` 同跑时并发 |
+| `--steps` | 默认 `all` 按 `crispr_mode` 选型（KO→mixscape；i/a→mixscale；other→仅至 preprocess）；须从 `io` 起；KO/i/a 显式同写两者时可并发 |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
@@ -140,20 +142,20 @@ flowchart TD
 
 对外写 `KO` / `i` / `a` / `other`（`--crispr-mode` → `experiment.crispr_mode`）。解析后内部为 `CRISPR_KO` / `CRISPRi` / `CRISPRa` / `other`；完整名别名可接受，但错误信息与默认参数对外只用简写。
 
-| CLI / 配置 | 内部枚举 | 预期方向 |
-| --- | --- | --- |
-| 缺省 / `KO` | `CRISPR_KO` | `not_required` |
-| `i` | `CRISPRi` | `down` |
-| `a` | `CRISPRa` | `up` |
-| `other` | `other` | 须同时给 `--crispr-description` 与 `--expected-direction`（`down` / `up` / `bidirectional` / `unknown`） |
+| CLI / 配置 | 内部枚举 | 预期方向 | `--steps all` 分析 |
+| --- | --- | --- | --- |
+| 缺省 / `KO` | `CRISPR_KO` | `not_required` | Mixscape |
+| `i` | `CRISPRi` | `down` | Mixscale |
+| `a` | `CRISPRa` | `up` | Mixscale |
+| `other` | `other` | 须同时给 `--crispr-description` 与 `--expected-direction`（`down` / `up` / `bidirectional` / `unknown`） | 无（停在 preprocess） |
 
-模式不由矩阵或分配文件改写，也不由 guide 名猜测。
+模式不由矩阵或分配文件改写，也不由 guide 名猜测。KO/i/a 下显式 `--steps` 可覆盖默认选型（例如 KO 样本也可手动加 `mixscale`）；`other` 不可含 `mixscape` / `mixscale`。
 
 ---
 
 ## 对照
 
-单一来源：`control_spec(config)`。`assign` 用账本调用 `resolve_control_spec` 写入 `config['control']`、`adata.uns`；后续 Mixscape / Mixscale / perturb 只读该解析结果（同一次运行内存传递）。
+单一来源：`control_spec(config)`。`assign` 用账本调用 `resolve_control_spec` 写入 `config['control']`、`adata.uns`；后续 Mixscape / Mixscale 只读该解析结果（同一次运行内存传递）。
 
 ### 设计 NT
 
@@ -170,7 +172,7 @@ flowchart TD
 
 - `control_source=zero_guide_cells`，标签 `zero_guide`，`temporary_control=true`
 - 细胞：分配表里 0 条 guide，以及仅矩阵、记为 `no_guide` 的细胞（须通过 QC）
-- 描述性 CPM log2FC / Mixscape / Mixscale / E-distance 均相对该对照继续跑（无对照细胞时各步显式 skip，原因如 `no_zero_guide_cells`）
+- Mixscape / Mixscale 均相对该对照继续跑（无对照细胞时各步显式 skip，原因如 `no_zero_guide_cells`）
 
 `multi_guide` 与 `single_targeting` 不是对照。输入目录另有一份 `*.positive_cell_guide_assignments.csv` 时停止。
 
@@ -258,49 +260,9 @@ low_library_no_guide → no_guide → multi_guide → low_guide_umi → qc_faile
 
 ---
 
-## 统计
-
-`statistics.mode` 只能是 `descriptive`。`guide_exploratory` → `unsupported_inference_backend`。`allow_random_split_replicates: true` 被拒绝。
-
-> **警示**：单样本描述性模式。效应表无组间推断 p/FDR；bootstrap 区间是样本内不确定性，不能当作生物学重复置信区间或显著性检验。
-
-### 描述性 log2FC
-
-按靶基因加总原始计数 → CPM：
-
-```text
-log2((CPM_target + pseudocount_cpm) / (CPM_control + pseudocount_cpm))
-```
-
-两侧计数都为 0 → `log2fc_descriptive` 缺失，`effect_status=not_detected_both`。
-
-| 表（`perturb` 步内存 `adata.uns`；图在 `DGE/`） | 分支 |
-| --- | --- |
-| `effect_main` | 全部可分析细胞 |
-| `effect_sensitivity` | Mixscape `perturbed` + 同一批对照 |
-
-`pvalue` / `fdr` / `ci_lower` / `ci_upper` 为 NA，`inference_status=not_run_single_sample_descriptive`。Mixscape 2×2、Mixscale 分数、E-test 分别在 Mixscape 图 / `obs['mixscale_score']` / `uns['edistance_etest']`。
-
-### Bootstrap
-
-`bootstrap_n`（默认 200）、`bootstrap_ci`（默认 0.95）、种子 `runtime.seed`。
-
-| 侧 | 单位 |
-| --- | --- |
-| 靶基因 ≥2 条 guide | 按 guide 有放回 |
-| 靶基因仅 1 条 guide | 按细胞有放回 |
-| 设计 NT ≥2 条 guide | 按 guide |
-| 设计 NT 1 条 / `zero_guide` | 按细胞 |
-
-每次靶基因与对照同时重抽。列：`log2fc_bootstrap_ci_*`、`bootstrap_unit`、`bootstrap_n`、`bootstrap_ci_level`、`uncertainty_meaning`（固定 `descriptive_estimate_uncertainty_not_significance_test`）、`bootstrap_status`。
-
-无细胞类型注释时 `cell_type=ALL`，`cell_type_scope=unstratified`。
-
----
-
 ## Mixscape 与 Mixscale
 
-两个**互不依赖**的步骤（`perturbseq.mixscape` / `perturbseq.mixscale`），均只依赖 `preprocess`；默认全量跑时两者并发（见上文「并行触发与限制」）。实现对齐 pertpy 1.x API：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert` 或分类标签。
+两个**互不依赖**的步骤（`perturbseq.mixscape` / `perturbseq.mixscale`），均只依赖 `preprocess`。`--steps all` 按 CRISPR 模式只跑其一（KO→Mixscape；i/a→Mixscale）；`other` 不跑这两步。KO/i/a 显式同写两者时才并发（见上文「并行触发与限制」）。实现对齐 pertpy 1.x API：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert` 或分类标签。
 
 | | Mixscape | Mixscale |
 | --- | --- | --- |
@@ -331,14 +293,12 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 | 步骤 | 输入 | 相对对照？ | 口径 |
 | --- | --- | --- | --- |
 | 预处理 `X` | counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
-| 表达 PCA / 邻居 / Leiden / UMAP | HVG 上 `sc.pp.scale`（全分析细胞）→ PCA | 否 | 描述性表达空间；**不用于**扰动分类或描述性 log2FC |
+| 表达 PCA / 邻居 / Leiden / UMAP | HVG 上 `sc.pp.scale`（全分析细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
 | Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide` |
 | Mixscape `X_pert` | pertpy `perturbation_signature`：减 k 个最近对照邻域均值（线性空间取均值再 `log1p`） | 是 | 对齐 Seurat `CalcPerturbSig`；在未 scale 的 log1p 上算 |
 | Mixscape 分类 GMM | `X_pert` 上 DE 基因，`scale=True` | 是（签名内再基因 scale） | 对齐 `RunMixscape` 的 `scale.data` |
 | Mixscape signature UMAP | `X_pert` → PCA（`zero_center=True`，不基因 scale）→ UMAP | 是 | 坐标在 `X_umap_mixscape` |
 | Mixscale | 自算 `X_pert_mixscale`，`scale=True`；对照细胞分数为 0 | 是 | 与 Mixscape 步骤独立；连续扰动强度 |
-| 描述性效应 | 原始 counts 加总 → CPM log2FC vs 对照 | 是（比值） | **不是**基因级 Z-score |
-| E-distance | 预处理 `X_pca` | 对比组是对照，嵌入不是签名 | 不用 `X_pert`；细胞置换 → 样本内距离检验 |
 | 热图着色 | 展示时行 z-score | 仅作图 | 不改 `X` / `X_pert` |
 
 无设计 NT 时，上表「对照」一律为临时 `zero_guide`。不要把表达 UMAP/Leiden 当作「已相对对照标准化后的扰动结构」。
@@ -370,27 +330,5 @@ PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**�
 ### 簇注释
 
 对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
-
----
-
-## 扰动距离
-
-| 产物 | 条件 | 口径 |
-| --- | --- | --- |
-| `E-distance/` E-test | 有对照与 `X_pca` | 表达 PCA 上相对对照；**细胞置换**，样本内距离检验，不是生物学重复 FDR |
-
-实现用 pertpy 的 energy-distance 统计量，但**不**物化 N×N pairwise 矩阵（按组流式置换）。`edistance.n_perms` 默认 1000；超大对照（常见于临时 zero-guide）按 `edistance.max_contrast_cells`（默认 4000）随机下采样。
-
-图为 `E-distance/edistance_etest.png`。
-
----
-
-## 靶基因表达
-
-`uns['target_expression_effect']`（`perturb` 步内存）：靶基因自身 RNA 的描述性 CPM log2FC；图在 `DGE/`。
-
-| `target_expression_status` | 原因 |
-| --- | --- |
-| `not_evaluable` | `gene_not_in_rna` / `nt_expression_below_threshold` / `insufficient_cells` |
 
 路径与图见 [outputs.md](outputs.md)。

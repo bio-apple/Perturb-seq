@@ -53,7 +53,6 @@ from perturbseq.config import (
     validate_config,
     verify_species_consistency,
 )
-from perturbseq.distance_tests import write_edistance_results
 from perturbseq.io import (
     InputMismatch,
     load_sample,
@@ -62,13 +61,8 @@ from perturbseq.io import (
     read_reference,
 )
 from perturbseq.mixscale import run_mixscale, write_mixscale_figures
-from perturbseq.mixscape import mixscape_fraction, run_mixscape, write_mixscape_figures
+from perturbseq.mixscape import run_mixscape, write_mixscape_figures
 from perturbseq.outputs import cleanup_lean_outputs
-from perturbseq.perturb_effect import (
-    descriptive_effects,
-    target_direction_table,
-    write_descriptive_figures,
-)
 from perturbseq.preprocess import preprocess, write_preprocess_figures
 
 STEPS = [
@@ -77,10 +71,16 @@ STEPS = [
     "preprocess",
     "mixscape",
     "mixscale",
-    "perturb",
 ]
-# After preprocess these two only read preprocess AnnData and write disjoint PNG dirs.
+# After preprocess these only read preprocess AnnData and write disjoint PNG dirs.
 PARALLEL_ANALYSIS_STEPS = ("mixscape", "mixscale")
+# ``--steps all`` picks analysis by CRISPR mode (KO→Mixscape; i/a→Mixscale; other→none).
+MODE_ANALYSIS_STEPS = {
+    "CRISPR_KO": ("mixscape",),
+    "CRISPRi": ("mixscale",),
+    "CRISPRa": ("mixscale",),
+    "other": (),
+}
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -156,7 +156,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--steps",
         default="all",
-        help="all, or a comma-separated subset starting from io (no checkpoints / --resume)",
+        help=(
+            "all（按 CRISPR 模式选分析：KO→mixscape；i/a→mixscale；other→仅 io,assign,preprocess），"
+            "或从 io 起的逗号分隔步骤（other 不可含 mixscape/mixscale；无 checkpoints / --resume）"
+        ),
     )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
@@ -190,15 +193,44 @@ def main(argv: list[str] | None = None) -> None:
         _validate_barcodes(folder, config)
         print(f"Validated {folder}", flush=True)
         return
-    steps = (
-        STEPS
-        if args.steps.strip() == "all"
-        else [step.strip() for step in args.steps.split(",") if step.strip()]
-    )
+    steps = _resolve_steps(config, args.steps)
+    run(config, steps)
+
+
+def _resolve_steps(config: dict[str, Any], raw: str) -> list[str]:
+    """Expand ``all`` by CRISPR mode, or parse an explicit comma-separated list."""
+    text = str(raw).strip()
+    mode = str(config["experiment"]["crispr_mode"])
+    if text == "all":
+        analysis = MODE_ANALYSIS_STEPS.get(mode)
+        if analysis is None:
+            raise SystemExit(f"未知 CRISPR 模式 {mode!r}，无法展开 --steps all。")
+        steps = ["io", "assign", "preprocess", *analysis]
+        if mode == "other":
+            print(
+                f"  steps=all → {', '.join(steps)} "
+                f"(crispr_mode=other；other 不做 Mixscape / Mixscale，仅跑至 preprocess)",
+                flush=True,
+            )
+        else:
+            print(
+                f"  steps=all → {', '.join(steps)} (crispr_mode={mode}; KO→mixscape, i/a→mixscale)",
+                flush=True,
+            )
+        return steps
+    steps = [step.strip() for step in text.split(",") if step.strip()]
     unknown = [step for step in steps if step not in STEPS]
     if unknown:
         raise SystemExit(f"未知步骤: {', '.join(unknown)}")
-    run(config, steps)
+    if mode == "other":
+        forbidden = [step for step in steps if step in PARALLEL_ANALYSIS_STEPS]
+        if forbidden:
+            raise SystemExit(
+                "experiment.crispr_mode=other 时不做 Mixscape / Mixscale："
+                f"请勿在 --steps 中指定 {', '.join(forbidden)}。"
+                "可用 --steps all 或 io,assign,preprocess。"
+            )
+    return steps
 
 
 def run(config: dict[str, Any], steps: list[str]) -> None:
@@ -289,12 +321,6 @@ def run(config: dict[str, Any], steps: list[str]) -> None:
             info["cell_cycle_note"] = state["adata"].uns.get("cell_cycle_note", "")
             write_preprocess_figures(folder, config, state["adata"])
             state["preprocess_adata"] = state["adata"]
-        elif step == "perturb":
-            if state["adata"] is None:
-                raise SystemExit(
-                    "缺少 preprocess / 并行分析结果：请从 io 起连续跑到 perturb（--steps all）。"
-                )
-            state["adata"] = _step_perturb(folder, config, state["adata"])
         else:
             raise SystemExit(f"未知步骤: {step}")
         info.setdefault("steps", {})[step] = {"seconds": round(time.time() - step_started, 3)}
@@ -419,7 +445,7 @@ def _parallel_step_worker(
 
 
 def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, Path]):
-    """Build perturb input: preprocess + Mixscape/Mixscale products."""
+    """Merge Mixscape / Mixscale products onto the preprocess AnnData."""
     import gc
 
     adata = preprocess_adata.copy()
@@ -700,9 +726,7 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
         adata.obs["mixscape_status"] = "not_evaluated"
         adata.obs["mixscape_class"] = "not_evaluated"
         adata.obs["mixscape_class_raw"] = "not_evaluated"
-        fractions = mixscape_fraction(adata)
-        adata.uns["mixscape_summary"] = fractions
-        write_mixscape_figures(folder, config, adata, fractions=fractions)
+        write_mixscape_figures(folder, config, adata)
         return adata
     if not config.get("mixscape", {}).get("cell_type_key") and not config["perturb"].get(
         "cell_type_key"
@@ -719,9 +743,7 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
         adata.obs["mixscape_class"] = "not_evaluated"
         adata.obs["mixscape_class_raw"] = "not_evaluated"
         adata.uns["mixscape_skip_reason"] = f"mixscape_failed:{exc}"
-    fractions = mixscape_fraction(adata)
-    adata.uns["mixscape_summary"] = fractions
-    write_mixscape_figures(folder, config, adata, fractions=fractions)
+    write_mixscape_figures(folder, config, adata)
     return adata
 
 
@@ -737,89 +759,6 @@ def _step_mixscale(folder: Path, config: dict[str, Any], adata):
         adata.uns["mixscale_status"] = f"failed:{mixscale_exc}"
     write_mixscale_figures(folder, config, adata)
     return adata
-
-
-def _step_perturb(folder: Path, config: dict[str, Any], adata):
-    """Descriptive effects and cell-level E-test (figures only; no checkpoint)."""
-    import gc
-
-    comparisons = []
-    spec = control_spec(config)
-    if spec["temporary"]:
-        print(f"  temporary control warning: {spec['note']}", flush=True)
-    if "mixscape_status" not in adata.obs:
-        adata.obs["mixscape_status"] = "not_evaluated"
-        adata.obs["mixscape_class"] = "not_evaluated"
-    slim = _edistance_pca_view(adata)
-    edistance = write_edistance_results(folder, slim, config)
-    del slim
-    gc.collect()
-    if isinstance(edistance, pd.DataFrame) and not edistance.empty:
-        adata.uns["edistance_etest"] = edistance
-    main_effects, main_guides, main_status = descriptive_effects(adata, config, branch="main")
-    sens_effects, sens_guides, sens_status = descriptive_effects(
-        adata, config, branch="sensitivity"
-    )
-    guides = pd.concat([main_guides, sens_guides], ignore_index=True)
-    direction = pd.concat(
-        [
-            target_direction_table(adata, config, branch="main"),
-            target_direction_table(adata, config, branch="sensitivity"),
-        ],
-        ignore_index=True,
-    )
-    adata.uns["effect_main"] = main_effects
-    adata.uns["effect_sensitivity"] = sens_effects
-    adata.uns["guide_effects"] = guides
-    adata.uns["target_expression_effect"] = direction
-    comparisons_table = pd.concat(
-        [main_status, sens_status, pd.DataFrame(comparisons)],
-        ignore_index=True,
-    )
-    adata.uns["comparison_status"] = comparisons_table
-    write_descriptive_figures(
-        folder,
-        config,
-        effects=main_effects,
-        direction=direction,
-        guides=guides,
-    )
-    return adata
-
-
-def _edistance_pca_view(adata):
-    """Minimal AnnData for pertpy E-test (obs labels + X_pca + Mixscape DE gate)."""
-    from anndata import AnnData
-
-    keep_obs = [
-        column
-        for column in (
-            "target_gene",
-            "n_targets",
-            "n_guides",
-            "perturbation_status",
-            "assignment_status",
-            "qc_pass",
-            "exclusion_reason_primary",
-        )
-        if column in adata.obs.columns
-    ]
-    view = AnnData(obs=adata.obs[keep_obs].copy())
-    view.obsm["X_pca"] = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
-    gate = adata.uns.get("mixscape_de_gate")
-    if isinstance(gate, pd.DataFrame):
-        view.uns["mixscape_de_gate"] = gate
-    for key in (
-        "control_label",
-        "control_source",
-        "control_temporary",
-        "control_phrase",
-        "control_note",
-        "control_fallback_from",
-    ):
-        if key in adata.uns:
-            view.uns[key] = adata.uns[key]
-    return view
 
 
 def _score_cell_cycle(adata, config: dict[str, Any]) -> None:
@@ -1079,9 +1018,7 @@ def _h5_safe_strings(frame: pd.DataFrame) -> pd.DataFrame:
         if series.dtype != object and not pd.api.types.is_string_dtype(series):
             continue
         non_null = series[series.notna()]
-        if len(non_null) and isinstance(
-            non_null.iloc[0], (list, tuple, dict, set, np.ndarray)
-        ):
+        if len(non_null) and isinstance(non_null.iloc[0], (list, tuple, dict, set, np.ndarray)):
             continue
         out[column] = series.astype("string").fillna("").astype(str)
     return out

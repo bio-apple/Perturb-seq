@@ -6,11 +6,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from anndata import AnnData
 from scipy import sparse
 
-from perturbseq.assign import STATUS_NT, STATUS_TARGET, control_cell_mask
+from perturbseq.assign import STATUS_NT, control_cell_mask
 from perturbseq.config import DEFAULT_SIGNATURE_NDIMS, ZERO_GUIDE_LABEL, control_spec
 
 PERTURBED = "perturbed"
@@ -167,6 +166,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     embedding, umap_status = _signature_umap(work, seed, n_dims)
     # scale=True matches Seurat RunMixscape's scale.data on the PRTB assay for GMM.
     # Do not add a second gene-level Z-score versus pooled NT/zero_guide means on X.
+    # test_method omitted: use pertpy Mixscape.mixscape default (pertpy 1.4.0: wilcoxon).
     mix_args: dict[str, Any] = {
         "pert_key": "target_gene",
         "control": control,
@@ -176,7 +176,6 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "logfc_threshold": params["logfc_threshold"],
         "pval_cutoff": params["pval_cutoff"],
         "iter_num": int(mixscape_settings.get("iter_num", 10)),
-        "test_method": "wilcoxon",
         "perturbation_type": label,
         "random_state": seed,
         "scale": True,
@@ -220,7 +219,8 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "umap_neighbors_metric": "cosine",
         "umap_key": "X_umap_mixscape",
         "iter_num": int(mixscape_settings.get("iter_num", 10)),
-        "test_method": "wilcoxon",
+        # Recorded for provenance; call omits test_method so pertpy default applies.
+        "test_method": "pertpy_default",
         "fine_mode": False,
         "scale": True,
         "control_relative": (
@@ -336,50 +336,26 @@ def _normalize_mixscape(value: str, control: str, label: str) -> str:
     return AMBIGUOUS
 
 
-def mixscape_fraction(adata: AnnData) -> pd.DataFrame:
-    targeting = adata.obs[adata.obs["perturbation_status"] == STATUS_TARGET]
-    rows = []
-    for target, group in targeting.groupby("target_gene", sort=False):
-        counts = group["mixscape_status"].value_counts()
-        total = int(len(group))
-        rows.append(
-            {
-                "target_gene": target,
-                "n_cells": total,
-                "n_perturbed": int(counts.get(PERTURBED, 0)),
-                "n_non_perturbed": int(counts.get(NON_PERTURBED, 0)),
-                "n_ambiguous": int(counts.get(AMBIGUOUS, 0)),
-                "fraction_perturbed": float(counts.get(PERTURBED, 0) / total) if total else 0.0,
-                "fraction_non_perturbed": float(counts.get(NON_PERTURBED, 0) / total)
-                if total
-                else 0.0,
-                "fraction_ambiguous": float(counts.get(AMBIGUOUS, 0) / total) if total else 0.0,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def write_mixscape_figures(
     output_dir: Path,
     config: dict[str, Any],
     adata: AnnData,
-    *,
-    fractions: pd.DataFrame | None = None,
 ) -> None:
     """Write Mixscape / Mixscape-UMAP PNGs at the end of the mixscape step."""
     from perturbseq.config import control_spec
     from perturbseq.plotting import (
         draw_mixscape_class_counts,
         draw_mixscape_class_global_umap,
-        draw_mixscape_fraction,
         draw_mixscape_target_panels,
         draw_target_de_counts,
         draw_target_in_de_gene_counts,
         draw_umap,
         open_figure_store,
+        retire_removed_mixscape_fraction,
     )
 
     output_dir = Path(output_dir)
+    retire_removed_mixscape_fraction(output_dir)
     store = open_figure_store(output_dir, config, adata)
     label = perturbation_type(config)
     contrast = control_spec(config)["control_label"]
@@ -420,10 +396,3 @@ def write_mixscape_figures(
         control=contrast,
         min_de_genes=int(config.get("mixscape", {}).get("min_de_genes", 5)),
     )
-    if fractions is None:
-        stored = adata.uns.get("mixscape_summary")
-        if isinstance(stored, pd.DataFrame) and not stored.empty:
-            fractions = stored
-        else:
-            fractions = mixscape_fraction(adata) if "mixscape_status" in adata.obs else pd.DataFrame()
-    draw_mixscape_fraction(store, fractions)

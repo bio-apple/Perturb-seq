@@ -64,20 +64,11 @@ _MIXSCAPE_FIGURES = frozenset(
         "target_de_counts",
         "target_in_de_gene_counts",
         "target_in_de",
-        "mixscape_fraction_bar",
         "mixscape_target_panels",
         "mixscape_class_global_bar",
     }
 )
 _MIXSCALE_FIGURES = frozenset({"mixscale_score_ridge", "mixscale_scatter"})
-# Descriptive CPM log2FC figures written under DGE/ (perturb step).
-_DESCRIPTIVE_FIGURES = frozenset(
-    {
-        "de_gene_heatmap",
-        "target_expression_effect",
-        "guide_consistency",
-    }
-)
 
 
 def _output_bucket(name: str, section: str) -> str:
@@ -97,21 +88,16 @@ def _output_bucket(name: str, section: str) -> str:
         or name.endswith("_mixscape_2x2")
     ):
         return "mixscape"
-    if section in {"de", "dge"} or name in _DESCRIPTIVE_FIGURES:
-        return "descriptive"
     if name in _QC_FIGURES:
         return "qc"
     return "main"
 
 
 def _analysis_output_root(output_dir: Path, bucket: str) -> Path:
-    # Mixscape / Mixscale roots; descriptive perturb PNGs live directly under DGE/.
     if bucket == "mixscape":
         return output_dir / "Mixscape"
     if bucket == "mixscale":
         return output_dir / "mixscale"
-    if bucket == "descriptive":
-        return output_dir / "DGE"
     raise ValueError(f"不是分析输出桶: {bucket}")
 
 
@@ -155,7 +141,7 @@ class FigureStore:
             return self.output_dir / "UMAP"
         if bucket == "qc":
             return self.output_dir / "qc"
-        if bucket in {"mixscape", "mixscale", "descriptive"}:
+        if bucket in {"mixscape", "mixscale"}:
             root = _analysis_output_root(self.output_dir, bucket)
             if bucket == "mixscape" and section == "target_in_de":
                 return root / "target_in_de"
@@ -170,7 +156,7 @@ class FigureStore:
             return self.output_dir / "UMAP" / "tables"
         if bucket == "qc":
             return self.output_dir / "qc" / "tables"
-        if bucket in {"mixscape", "mixscale", "descriptive"}:
+        if bucket in {"mixscape", "mixscale"}:
             return _analysis_output_root(self.output_dir, bucket) / "plot_data"
         return self.plot_data
 
@@ -237,17 +223,6 @@ class FigureStore:
             Path("figures") / "mixscale" / f"{name}.png",
             Path("figures") / "de" / f"{name}.png",
             Path("figures") / section / f"{name}.png" if section else Path("figures") / f"{name}.png",
-            Path("DGE") / "figures" / "mixscape" / f"{name}.png",
-            Path("DGE") / "figures" / "mixscape" / f"{name}.txt",
-            Path("DGE") / "figures" / "mixscape" / f"{name}.pdf",
-            Path("DGE") / "figures" / "mixscale" / f"{name}.png",
-            Path("DGE") / "figures" / "mixscale" / f"{name}.txt",
-            Path("DGE") / "figures" / "mixscale" / f"{name}.pdf",
-            Path("DGE") / "figures" / "de" / f"{name}.png",
-            Path("DGE") / "figures" / "plot" / f"{name}.png",
-            Path("DGE") / "figures" / "target_in_de" / f"{name}.png",
-            Path("DGE") / "plot_data" / f"{name}.tsv",
-            Path("DGE") / "plot_data" / f"{name}.skipped.txt",
             Path("plot_data") / f"{name}.tsv",
             Path("plot_data") / f"{name}.skipped.txt",
             # Prior layout nested PNGs under */figures/.
@@ -257,45 +232,13 @@ class FigureStore:
             Path("Mixscape") / "figures" / "target_in_de" / f"{name}.png",
             Path("mixscale") / "figures" / f"{name}.png",
             Path("wilcoxon") / "figures" / f"{name}.png",
-            Path("DGE") / "descriptive" / "figures" / f"{name}.png",
+            # Retired output roots (old descriptive / E-test steps).
+            Path("DGE") / f"{name}.png",
+            Path("DGE") / "figures" / f"{name}.png",
             Path("DGE") / "descriptive" / f"{name}.png",
+            Path("E-distance") / f"{name}.png",
             Path("E-distance") / "figures" / f"{name}.png",
         ]
-        if section and section not in {"", "plot"}:
-            relatives.extend(
-                [
-                    Path("DGE") / "figures" / section / f"{name}.png",
-                    Path("DGE") / "figures" / section / f"{name}.txt",
-                    Path("DGE") / "figures" / section / f"{name}.pdf",
-                ]
-            )
-        if bucket == "descriptive":
-            relatives.extend(
-                [
-                    Path("DGE") / "descriptive" / f"{name}.png",
-                    Path("DGE") / "descriptive" / "figures" / f"{name}.png",
-                    Path("DGE") / "descriptive" / "plot_data" / f"{name}.tsv",
-                    Path("DGE") / "descriptive" / "plot_data" / f"{name}.skipped.txt",
-                ]
-            )
-        if bucket == "mixscape":
-            relatives.extend(
-                [
-                    Path("DGE") / "Mixscape" / "figures" / f"{name}.png",
-                    Path("DGE") / "Mixscape" / "plot_data" / f"{name}.tsv",
-                    Path("DGE") / "mixscape" / "figures" / f"{name}.png",
-                    Path("DGE") / "mixscape" / "plot_data" / f"{name}.tsv",
-                    Path("DGE") / "mixscape" / "plot_data" / f"{name}.skipped.txt",
-                ]
-            )
-        if bucket == "mixscale":
-            relatives.extend(
-                [
-                    Path("DGE") / "mixscale" / "figures" / f"{name}.png",
-                    Path("DGE") / "mixscale" / "plot_data" / f"{name}.tsv",
-                    Path("DGE") / "mixscale" / "plot_data" / f"{name}.skipped.txt",
-                ]
-            )
         keep = {
             self.figure_dir(name, section) / f"{name}.png",
             self.data_dir(name, section) / f"{name}.tsv",
@@ -398,6 +341,26 @@ def retire_removed_umaps(output_dir: Path) -> None:
             stale.unlink()
 
 
+def retire_removed_mixscape_fraction(output_dir: Path) -> None:
+    """Remove retired mixscape_fraction_bar products if present under the output root."""
+    name = "mixscape_fraction_bar"
+    root = Path(output_dir)
+    for relative in (
+        Path("Mixscape") / f"{name}.png",
+        Path("Mixscape") / "figures" / f"{name}.png",
+        Path("Mixscape") / "plot_data" / f"{name}.tsv",
+        Path("Mixscape") / "plot_data" / f"{name}.skipped.txt",
+        Path("figures") / "mixscape" / f"{name}.png",
+        Path("figures") / "mixscape" / f"{name}.txt",
+        Path("figures") / "mixscape" / f"{name}.pdf",
+        Path("plot_data") / f"{name}.tsv",
+        Path("plot_data") / f"{name}.skipped.txt",
+    ):
+        stale = root / relative
+        if stale.is_file():
+            stale.unlink()
+
+
 def _label_count_bars(axis: Axes, counts, *, horizontal: bool = False) -> None:
     """Put integer counts on bars when there are few enough to read."""
     values = [int(value) for value in counts]
@@ -438,72 +401,6 @@ def _contrast_name(control: str) -> str:
 
 def _control_positions(status: np.ndarray) -> np.ndarray:
     return np.flatnonzero(np.isin(np.asarray(status).astype(str), ["nt", "zero_guide"]))
-
-
-def _main_branch(frame: pd.DataFrame) -> pd.DataFrame:
-    """Keep the main contrast when a table also carries the sensitivity branch."""
-    if "branch" not in frame.columns:
-        return frame
-    return frame[frame["branch"].astype(str).eq("main")].copy()
-
-
-def draw_descriptive_heatmap(store: FigureStore, effects: pd.DataFrame) -> None:
-    if effects.empty or "log2fc_descriptive" not in effects.columns:
-        store.skip("de_gene_heatmap", "missing_fields")
-        return
-    usable = effects[effects["effect_status"].astype(str) == "descriptive"].copy()
-    if usable.empty:
-        store.skip("de_gene_heatmap", "no_descriptive_effects")
-        return
-    values = pd.to_numeric(usable["log2fc_descriptive"], errors="coerce")
-    usable = usable.assign(abs_effect=values.abs())
-    if "gene_id" in usable.columns:
-        usable["gene_key"] = usable["gene_id"].astype(str)
-    else:
-        usable["gene_key"] = usable["gene_symbol"].astype(str)
-    label_by_key = (
-        usable.drop_duplicates("gene_key").set_index("gene_key")["gene_symbol"].astype(str)
-    )
-    scores = usable.groupby("gene_key")["abs_effect"].max().sort_values(ascending=False)
-    genes = list(scores.head(int(store.plotting["heatmap_max_genes"])).index)
-    pivot = usable.pivot_table(
-        index="gene_key", columns="target_gene", values="log2fc_descriptive", aggfunc="mean"
-    )
-    pivot = pivot.loc[[gene for gene in genes if gene in pivot.index]]
-    labels = label_by_key.reindex(pivot.index)
-    repeated = labels.value_counts()
-    pivot.index = pd.Index(
-        [
-            f"{name} ({key})" if int(repeated.get(name, 0)) > 1 else str(name)
-            for key, name in zip(pivot.index, labels, strict=True)
-        ],
-        name="gene",
-    )
-    if pivot.shape[0] < 2:
-        store.skip("de_gene_heatmap", "no_descriptive_effects")
-        return
-    matrix = pivot.to_numpy(dtype=float)
-    center = matrix - np.nanmean(matrix, axis=1, keepdims=True)
-    scale = np.nanstd(matrix, axis=1, keepdims=True)
-    constant = scale[:, 0] == 0
-    scale[scale == 0] = 1
-    zscore = center / scale
-    shown = pd.DataFrame(zscore, index=pivot.index, columns=pivot.columns)
-    figure, axis = plt.subplots(
-        figsize=(max(8, 0.2 * shown.shape[1]), max(6, 0.2 * shown.shape[0]))
-    )
-    sns.heatmap(
-        shown, cmap="vlag", center=0, xticklabels=shown.shape[1] <= 40, yticklabels=True, ax=axis
-    )
-    note = "constant rows kept" if constant.any() else "row z-score of descriptive log2FC"
-    phrase = _contrast_name(str(store.context.get("control_label", "")))
-    axis.set_title(f"descriptive log2FC vs {phrase}, not a replicate test")
-    axis.set_xlabel("target")
-    axis.set_ylabel("gene")
-    long = shown.reset_index(names="gene").melt(
-        id_vars="gene", var_name="target_gene", value_name="zscore"
-    )
-    store.save(figure, "de_gene_heatmap", "de", long, note)
 
 
 def guides_per_cell_bars(n_guides: pd.Series) -> tuple[Figure, pd.DataFrame]:
@@ -1958,133 +1855,6 @@ def draw_umap(
         "embedding",
         table,
         f"{space_note}; not used as a statistical distance",
-    )
-
-
-def draw_mixscape_fraction(store: FigureStore, fractions: pd.DataFrame) -> None:
-    if fractions.empty:
-        store.skip("mixscape_fraction_bar", "no_mixscape_cells")
-        return
-    melted = fractions.melt(
-        id_vars=["target_gene", "n_cells"],
-        value_vars=["fraction_perturbed", "fraction_non_perturbed", "fraction_ambiguous"],
-        var_name="mixscape_status",
-        value_name="fraction",
-    )
-    figure, axis = store._figure(width=max(8, min(24, 0.15 * fractions["target_gene"].nunique())))
-    sns.barplot(data=melted, x="target_gene", y="fraction", hue="mixscape_status", ax=axis)
-    if fractions["target_gene"].nunique() > 40:
-        axis.set_xticks([])
-    else:
-        axis.tick_params(axis="x", rotation=90)
-    store.save(
-        figure,
-        "mixscape_fraction_bar",
-        "mixscape",
-        melted,
-        "Mixscape class fractions; n_cells in plot data",
-    )
-
-
-def draw_target_expression(store: FigureStore, effects: pd.DataFrame) -> None:
-    """One point per target: descriptive CPM log2FC on the main contrast.
-
-    The value is the descriptive CPM log2FC already stored on the effect table.
-    The axis names the configured control and the table's pseudocount. It is not
-    a mean of log1p expression, and the sensitivity branch is not drawn here.
-    """
-    effect_column = (
-        "log2fc_descriptive" if "log2fc_descriptive" in effects.columns else "effect_log1p"
-    )
-    if effects.empty or effect_column not in effects.columns:
-        store.skip("target_expression_effect", "missing_fields")
-        return
-    shown = _main_branch(effects).dropna(subset=[effect_column]).sort_values(effect_column)
-    if shown.empty:
-        store.skip("target_expression_effect", "no_target_expression")
-        return
-    direction = ""
-    for column in ("direction_text", "direction_label"):
-        if column in shown.columns and shown[column].notna().any():
-            direction = str(shown[column].iloc[0])
-            break
-    figure, axis = store._figure(width=max(8, min(24, 0.12 * len(shown))))
-    axis.axhline(0, color="black", linewidth=0.8)
-    axis.scatter(
-        np.arange(len(shown)), shown[effect_column], s=12, color=store.palette("targeting")
-    )
-    if len(shown) <= 40:
-        axis.set_xticks(np.arange(len(shown)), shown["target_gene"].astype(str), rotation=90)
-    else:
-        axis.set_xticks([])
-    phrase = _contrast_name(str(store.context.get("control_label", "")))
-    alpha = 1.0
-    if "pseudocount_cpm" in shown.columns and shown["pseudocount_cpm"].notna().any():
-        alpha = float(shown["pseudocount_cpm"].iloc[0])
-    axis.set_ylabel(f"log2((CPM_target+{alpha:g})/(CPM of {phrase}+{alpha:g}))")
-    axis.set_title(f"target vs {phrase}, not a replicate test")
-    store.save(
-        figure,
-        "target_expression_effect",
-        "embedding",
-        shown,
-        (
-            f"descriptive CPM log2FC of the target gene versus {phrase} in this one sample; "
-            "cells and guides are not replicates; power and cross-sample reproducibility "
-            f"are not estimable; {direction}"
-        ),
-    )
-
-
-def draw_guide_consistency(store: FigureStore, consistency: pd.DataFrame) -> None:
-    """Per-guide CPM log2FC of the target gene on the main contrast.
-
-    ``target_gene_log2fc`` is log2((CPM_guide+1)/(CPM_NT+1)). A guide is not a
-    biological replicate, so the spread is not a reproducibility estimate.
-    """
-    effect_column = (
-        "target_gene_log2fc" if "target_gene_log2fc" in consistency.columns else "effect_log1p"
-    )
-    if consistency.empty or effect_column not in consistency.columns:
-        store.skip("guide_consistency", "missing_fields")
-        return
-    shown = _main_branch(consistency).dropna(subset=[effect_column])
-    if shown.empty:
-        store.skip("guide_consistency", "missing_fields")
-        return
-    figure, axis = store._figure(width=max(8, min(24, 0.12 * shown["target_gene"].nunique())))
-    order = (
-        shown.groupby("target_gene")[effect_column]
-        .median()
-        .sort_values()
-        .index.astype(str)
-        .tolist()
-    )
-    sns.stripplot(
-        data=shown,
-        x="target_gene",
-        y=effect_column,
-        order=order,
-        ax=axis,
-        color=store.palette("targeting"),
-        size=3,
-    )
-    axis.axhline(0, color="black", linewidth=0.8)
-    if len(order) > 40:
-        axis.set_xticks([])
-        axis.set_xlabel(f"{len(order)} targets; names are in the table")
-    else:
-        axis.tick_params(axis="x", rotation=90)
-    phrase = _contrast_name(str(store.context.get("control_label", "")))
-    axis.set_ylabel(f"target-gene CPM log2FC vs {phrase}")
-    axis.set_title(f"per guide vs {phrase}, not replicates")
-    store.save(
-        figure,
-        "guide_consistency",
-        "de",
-        shown,
-        f"per-guide target-gene CPM log2FC versus the same {phrase} pool; "
-        "guides are not biological replicates; this spread is not a reproducibility estimate",
     )
 
 

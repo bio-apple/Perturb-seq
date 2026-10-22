@@ -54,7 +54,7 @@ DEFAULT_SIGNATURE_NDIMS = DEFAULT_EMBEDDING_NDIMS
 TEMPORARY_CONTROL_WARNING = (
     "当前对照是临时 zero-guide cells，这不是设计好的非靶向对照。"
     "zero-guide 细胞可能在 UMI、基因数、线粒体比例、环境 RNA 和细胞状态上与靶向细胞不同。"
-    "后续 log2FC、Mixscape、Mixscale、E-distance 都是相对这组临时对照。"
+    "后续 Mixscape、Mixscale 都是相对这组临时对照。"
     "UMI、基因数和线粒体比例的对比只作描述，分布差异不会中止分析。"
 )
 TEMPORARY_CONTROL_NOTE = TEMPORARY_CONTROL_WARNING
@@ -257,32 +257,11 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "pval_cutoff": None,
         "max_de_genes": None,
     },
-    "statistics": {
-        "mode": None,
-        "aggregation": None,
-        "pseudocount_cpm": None,
-        "bootstrap_n": None,
-        "bootstrap_ci": None,
-        "min_nt_cells": None,
-        "fdr_threshold": None,
-        "allow_random_split_replicates": None,
-    },
     "perturb": {
         "mixscape_min_de_genes": None,
         "mixscape_logfc": None,
         "mixscape_pval": None,
         "cell_type_key": None,
-    },
-    # E-test on X_pca (see distance_tests). Defaults match the pertpy tutorial.
-    "edistance": {
-        "n_perms": None,
-        "padj_threshold": None,
-        "max_contrast_cells": None,
-    },
-    "target_expression": {
-        "min_nt_detection_fraction": None,
-        "min_nt_mean_cpm": None,
-        "direction_log2fc_tolerance": None,
     },
     "singler": {"enabled": None},
     "plotting": {
@@ -411,8 +390,6 @@ def validate_config(config: dict[str, Any]) -> None:
     _section(config, "mixscale")
     _validate_embedding_ndims(config)
     _validate_mixscape_fallback(config)
-    statistics = config.setdefault("statistics", {"mode": "descriptive"})
-    _validate_statistics(statistics)
     _section(config, "plotting")
     seed = config["runtime"].get("seed", 0)
     if not isinstance(seed, int) or isinstance(seed, bool):
@@ -894,29 +871,6 @@ def _validate_mixscape_fallback(config: dict[str, Any]) -> None:
             "请只改 mixscape.logfc_threshold，并把回退键改成相同数值"
             "（项目 |logFC| 默认均为 0.1）。"
         )
-
-
-def _validate_statistics(statistics: dict[str, Any]) -> None:
-    if not isinstance(statistics, dict):
-        raise ConfigError("statistics 必须是映射。")
-    mode = statistics.get("mode", "descriptive")
-    if mode == "guide_exploratory":
-        raise ConfigError("unsupported_inference_backend")
-    if mode != "descriptive":
-        raise ConfigError("statistics.mode 当前只定义了 descriptive。")
-    if statistics.get("allow_random_split_replicates") is True:
-        raise ConfigError("禁止用随机拆分细胞制造生物学重复。")
-    alpha = statistics.get("pseudocount_cpm", 1.0)
-    if isinstance(alpha, bool) or not isinstance(alpha, int | float) or float(alpha) <= 0:
-        raise ConfigError("statistics.pseudocount_cpm 必须是正数。")
-    n_boot = statistics.get("bootstrap_n", 200)
-    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
-        raise ConfigError("statistics.bootstrap_n 必须是正整数。")
-    statistics["bootstrap_n"] = n_boot
-    level = statistics.get("bootstrap_ci", 0.95)
-    if isinstance(level, bool) or not isinstance(level, int | float) or not (0 < float(level) < 1):
-        raise ConfigError("statistics.bootstrap_ci 必须是 (0, 1) 内的数。")
-    statistics["bootstrap_ci"] = float(level)
 
 
 def default_n_threads() -> int:

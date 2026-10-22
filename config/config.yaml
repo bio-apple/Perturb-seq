@@ -1,7 +1,8 @@
 # 分析软件默认参数。
-# 步骤：io → assign → preprocess → {mixscape ‖ mixscale} → perturb。
-# mixscape / mixscale 互不依赖（均只依赖 preprocess）；两者同跑时进程池并发。
-# 图目录：Mixscape/、mixscale/、DGE/、E-distance/、qc/、UMAP/。成功结束后磁盘只保留 PNG。
+# 步骤：io → assign → preprocess → 分析步。
+# --steps all 按 CRISPR 模式选型：KO → mixscape；i / a → mixscale；other → 仅 io,assign,preprocess（不做 Mixscape / Mixscale）。
+# other 模式下显式 --steps 含 mixscape / mixscale 会拒绝。KO/i/a 显式同写两者时可并发（均只依赖 preprocess）。
+# 图目录：Mixscape/、mixscale/、qc/、UMAP/。成功结束后磁盘只保留 PNG。
 # 参考：pertpy Mixscape / Mixscale；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
 # 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
@@ -59,35 +60,11 @@ mixscale:
   logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
-statistics:
-  mode: descriptive
-  aggregation:
-    - target
-    - guide
-  pseudocount_cpm: 1.0
-  # 样本内重抽样次数。百分位区间表示描述性 log2FC 的不确定性。
-  bootstrap_n: 200
-  # 百分位区间的水平，取 (0, 1) 内的数。
-  bootstrap_ci: 0.95
-  min_nt_cells: 20
-  # descriptive 模式下不用于效应表；校验识别该键。不要解读为组间 FDR。
-  fdr_threshold: 0.05
-  allow_random_split_replicates: false
 perturb:
   mixscape_min_de_genes: 5
   # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致（0.1）。Mixscale 不读此键。
   mixscape_logfc: 0.1
   mixscape_pval: 0.05
-# E-test（表达 X_pca 上相对对照）。默认 n_perms=1000 与 pertpy 教程一致。
-# 大临时对照（zero_guide）会下采样到 max_contrast_cells，避免 N×N 距离矩阵 OOM。
-edistance:
-  n_perms: 1000
-  padj_threshold: 0.0015
-  max_contrast_cells: 4000
-target_expression:
-  min_nt_detection_fraction: 0.05
-  min_nt_mean_cpm: 1.0
-  direction_log2fc_tolerance: 0.1
 # 簇注释调用 Rscript 里的 SingleR 与 celldex。false 时跳过，不要求安装 R。
 singler:
   enabled: true

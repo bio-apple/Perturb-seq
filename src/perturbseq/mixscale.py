@@ -140,6 +140,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
             for gene in ready
         }
         # scale=True: gene-scale signature, then z-score the projection vs control.
+        # test_method omitted: use pertpy Mixscale.mixscale default (pertpy 1.4.0: wilcoxon).
         mix_args: dict[str, Any] = {
             "pert_key": "target_gene",
             "control": control,
@@ -176,6 +177,8 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "split_by": "",
         "meaning": "perturbation_strength_not_editing_success",
         "scale": True,
+        # Call omits test_method so pertpy Mixscale.mixscale default applies.
+        "test_method": "pertpy_default",
         "independent_of_mixscape": True,
         "reference": "https://satijalab.github.io/Mixscale/",
         "control_relative": (
