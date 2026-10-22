@@ -9,7 +9,7 @@ import numpy as np
 from anndata import AnnData
 from scipy import sparse
 
-from perturbseq.assign import STATUS_NT, control_cell_mask
+from perturbseq.assign import STATUS_NT, control_cell_mask, perturbation_analysis_mask
 from perturbseq.config import DEFAULT_SIGNATURE_NDIMS, ZERO_GUIDE_LABEL, control_spec
 
 PERTURBED = "perturbed"
@@ -88,6 +88,8 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         return adata
     if spec["temporary"]:
         stamp_control_label(adata.obs, control_cells, "target_gene", control)
+    # Embedding may include all QC-pass cells; scoring stays on analysis_eligible ∪ control.
+    pert_mask = perturbation_analysis_mask(adata.obs, spec)
     mixscape_settings = config.get("mixscape", {})
     seed = int(config["runtime"]["seed"])
     if "highly_variable" not in adata.var:
@@ -96,8 +98,9 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     if int(np.sum(hvg)) < 2:
         raise ValueError("高变基因不足，无法计算 perturbation signature。")
     params = mixscape_gate_parameters(config)
+    gate_adata = adata[pert_mask] if not bool(np.all(pert_mask)) else adata
     gate, gene_table = differential_gene_gate(
-        adata,
+        gate_adata,
         control=control,
         min_de_genes=int(params["min_de_genes"]),
         logfc_threshold=float(params["logfc_threshold"]),
@@ -112,13 +115,13 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     adata.obs["mixscape_class_p"] = np.nan
     adata.obs["mixscape_status"] = NOT_EVALUATED
     skipped_genes = set(gate.loc[~gate["passed"].astype(bool), "target_gene"].astype(str))
-    skipped = labels.isin(skipped_genes)
+    skipped = labels.isin(skipped_genes).to_numpy() & pert_mask
     adata.obs.loc[skipped, "mixscape_class"] = SKIPPED_NO_DE
     adata.obs.loc[skipped, "mixscape_status"] = SKIPPED_NO_DE
     passed = set(gate.loc[gate["passed"].astype(bool), "target_gene"].astype(str))
     label = perturbation_type(config)
     if not passed:
-        nt = labels == control
+        nt = (labels == control).to_numpy() & pert_mask
         adata.obs.loc[nt, "mixscape_class"] = control
         adata.obs.loc[nt, "mixscape_status"] = (
             ZERO_GUIDE_LABEL if control == ZERO_GUIDE_LABEL else STATUS_NT
@@ -137,7 +140,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
             **params,
         }
         return adata
-    keep = labels.isin(passed | {control}).to_numpy()
+    keep = labels.isin(passed | {control}).to_numpy() & pert_mask
     work = adata[keep, hvg].copy()
     requested_dims = int(mixscape_settings.get("n_dims", DEFAULT_SIGNATURE_NDIMS))
     n_dims = prepare_signature_dims(work, requested_dims, seed)

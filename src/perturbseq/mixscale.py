@@ -16,7 +16,7 @@ import pandas as pd
 from anndata import AnnData
 from scipy import sparse
 
-from perturbseq.assign import control_cell_mask
+from perturbseq.assign import control_cell_mask, perturbation_analysis_mask
 from perturbseq.config import DEFAULT_SIGNATURE_NDIMS, control_spec
 from perturbseq.de_gate import _gene_lists, differential_gene_gate, stamp_control_label
 
@@ -68,6 +68,8 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         return adata
     if spec["temporary"]:
         stamp_control_label(adata.obs, control_cells, "target_gene", control)
+    # Embedding may include all QC-pass cells; scoring stays on analysis_eligible ∪ control.
+    pert_mask = perturbation_analysis_mask(adata.obs, spec)
     if "highly_variable" not in adata.var:
         raise ValueError("Mixscale 需要先完成高变基因选择。")
     hvg = adata.var["highly_variable"].to_numpy()
@@ -75,8 +77,9 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         raise ValueError("高变基因不足，无法计算 Mixscale perturbation signature。")
 
     params = de_gate_parameters(config)
+    gate_adata = adata[pert_mask] if not bool(np.all(pert_mask)) else adata
     gate, gene_table = differential_gene_gate(
-        adata,
+        gate_adata,
         control=control,
         min_de_genes=int(params["min_de_genes"]),
         logfc_threshold=float(params["logfc_threshold"]),
@@ -97,7 +100,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     mixscale_settings = config.get("mixscale", {})
 
     if ready:
-        keep = labels.isin(ready | {control}).to_numpy()
+        keep = labels.isin(ready | {control}).to_numpy() & pert_mask
         work = adata[keep, hvg].copy()
         requested_dims = int(
             mixscale_settings.get(

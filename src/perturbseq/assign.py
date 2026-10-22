@@ -302,6 +302,22 @@ def _multi_subtype(parts: list[str], nt_control: str, target_by_name: dict[str, 
     return MULTI_DIFFERENT_TARGETS
 
 
+def perturbation_analysis_mask(obs: pd.DataFrame, spec: dict[str, Any]) -> np.ndarray:
+    """Cells for Mixscape / Mixscale: ``analysis_eligible`` ∪ contrast controls.
+
+    Expression embedding (Leiden / UMAP / SingleR) keeps every QC-pass cell that
+    entered preprocess. Perturbation scoring stays on this stricter mask so
+    ``min_cells_per_target`` / guide-UMI exclusions are not weakened.
+    Objects without ``analysis_eligible`` (already subset historically) keep all
+    rows.
+    """
+    control = control_cell_mask(obs, spec)
+    eligible = _flag_column(obs, "analysis_eligible")
+    if eligible is None:
+        return np.ones(len(obs), dtype=bool)
+    return eligible | control
+
+
 def control_cell_mask(obs: pd.DataFrame, spec: dict[str, Any]) -> np.ndarray:
     """Cells used as the contrast. Designed NT and zero-guide cells stay separate.
 
@@ -768,22 +784,99 @@ def _analysis_rows(table: pd.DataFrame) -> pd.DataFrame:
     return table[table["perturbation_status"].isin([STATUS_TARGET, STATUS_NT])].copy()
 
 
-def cells_per_target(table: pd.DataFrame, min_cells_per_guide: int) -> pd.DataFrame:
-    used = _analysis_rows(table)
-    if used.empty:
-        return pd.DataFrame(
-            columns=[
-                "target_gene",
-                "n_cells",
-                "n_guides",
-                "n_guides_passing",
-                "perturbation_status",
-            ]
-        )
+def reference_target_genes(reference: pd.DataFrame, *, nt_control: str = "") -> list[str]:
+    """Unique target names from the feature reference, first-seen order.
+
+    Blank ``target_gene_name`` is kept only when the guide name equals the
+    configured NT label (then the label itself is the target).
+    """
+    catalog = build_guide_catalog(reference)
+    label = nt_control.strip() if isinstance(nt_control, str) else ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in catalog.itertuples(index=False):
+        target = str(row.target_gene_name).strip()
+        if not target:
+            if label and str(row.guide_name).strip() == label:
+                target = label
+            else:
+                continue
+        if target in seen:
+            continue
+        seen.add(target)
+        out.append(target)
+    return out
+
+
+def _assigned_target_rows(table: pd.DataFrame) -> pd.DataFrame:
+    """Rows with a non-empty assigned ``target_gene`` (no eligibility filter)."""
+    if table.empty or "target_gene" not in table.columns:
+        return table.iloc[0:0].copy()
+    gene = table["target_gene"]
+    text = gene.astype(str)
+    keep = gene.notna() & ~text.isin({"", "nan", "None", "<NA>", "NA"})
+    return table.loc[keep].copy()
+
+
+def cells_per_target(
+    table: pd.DataFrame,
+    min_cells_per_guide: int,
+    *,
+    all_targets: list[str] | None = None,
+) -> pd.DataFrame:
+    """Cell counts per target: full catalog, including zeros; no eligibility cut.
+
+    ``all_targets`` is usually ``reference_target_genes``. Assigned targets that
+    are missing from the catalog are appended. Counts use every ledger row with
+    that ``target_gene`` (not ``analysis_eligible`` / min-cell subsets).
+    """
+    columns = [
+        "target_gene",
+        "n_cells",
+        "n_guides",
+        "n_guides_passing",
+        "perturbation_status",
+    ]
+    used = _assigned_target_rows(table)
+    catalog: list[str] = []
+    seen: set[str] = set()
+    for raw in all_targets or []:
+        target = str(raw).strip()
+        if not target or target in seen or target in {"nan", "None", "<NA>", "NA"}:
+            continue
+        seen.add(target)
+        catalog.append(target)
+    if not used.empty:
+        for raw in used["target_gene"].astype(str):
+            target = str(raw).strip()
+            if not target or target in seen or target in {"nan", "None", "<NA>", "NA"}:
+                continue
+            seen.add(target)
+            catalog.append(target)
+    if not catalog:
+        return pd.DataFrame(columns=columns)
     rows = []
-    for target, group in used.groupby("target_gene", sort=False):
+    for target in catalog:
+        if used.empty:
+            group = used
+        else:
+            group = used.loc[used["target_gene"].astype(str) == target]
+        if group.empty:
+            rows.append(
+                {
+                    "target_gene": target,
+                    "n_cells": 0,
+                    "n_guides": 0,
+                    "n_guides_passing": 0,
+                    "perturbation_status": "",
+                }
+            )
+            continue
         guide_counts = group.groupby("guide_id").size()
-        status = group["perturbation_status"].iloc[0]
+        if "perturbation_status" in group.columns:
+            status = group["perturbation_status"].iloc[0]
+        else:
+            status = ""
         rows.append(
             {
                 "target_gene": target,
@@ -795,7 +888,7 @@ def cells_per_target(table: pd.DataFrame, min_cells_per_guide: int) -> pd.DataFr
                 "perturbation_status": status,
             }
         )
-    return pd.DataFrame(rows).sort_values("n_cells", ascending=False)
+    return pd.DataFrame(rows).sort_values("n_cells", ascending=False, kind="mergesort")
 
 
 def write_qc_figures(

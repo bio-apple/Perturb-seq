@@ -33,6 +33,7 @@ from perturbseq.assign import (
     derive_qc_thresholds,
     filter_stage_counts,
     multi_guide_composition,
+    reference_target_genes,
     validate_guide_targets,
     write_qc_figures,
 )
@@ -643,17 +644,32 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     if len(updated) != int(adata.uns.get("n_input_barcodes", len(updated))):
         pass
     ledger = _cell_status(updated)
-    targets = cells_per_target(updated, int(config["qc"]["min_cells_per_guide"]))
-    eligible = set(
-        updated.loc[updated["analysis_eligible"].astype(bool), "cell_barcode"].astype(str)
+    reference = read_reference(resolve_input_paths(config)["feature_reference"])
+    targets = cells_per_target(
+        updated,
+        int(config["qc"]["min_cells_per_guide"]),
+        all_targets=reference_target_genes(
+            reference, nt_control=str(config["labels"].get("nt_control", "") or "")
+        ),
     )
     control_ids = set(
         updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str)
     )
-    # Drop the full annotated ledger after eligibility is applied (no longer needed).
-    adata = adata[adata.obs_names.astype(str).isin(eligible | control_ids)].copy()
+    # Preprocess / Leiden / UMAP / SingleR: every QC-pass cell already in the
+    # AnnData (io candidates = single assignment ∪ zero-guide). Mixscape /
+    # Mixscale still restrict to analysis_eligible ∪ contrast via obs flags.
+    qc_ids = set(updated.loc[updated["qc_pass"].astype(bool), "cell_barcode"].astype(str))
+    adata = adata[adata.obs_names.astype(str).isin(qc_ids)].copy()
     if "cell_calls" in adata.uns:
         del adata.uns["cell_calls"]
+    by_barcode = updated.set_index(updated["cell_barcode"].astype(str))
+    aligned = by_barcode.reindex(adata.obs_names.astype(str))
+    adata.obs["qc_pass"] = aligned["qc_pass"].astype(bool).to_numpy()
+    adata.obs["analysis_eligible"] = aligned["analysis_eligible"].astype(bool).to_numpy()
+    adata.obs["exclusion_reason_primary"] = (
+        aligned["exclusion_reason_primary"].astype(str).to_numpy()
+    )
+    adata.obs["temporary_control"] = aligned["temporary_control"].astype(bool).to_numpy()
     if control_ids:
         hit = np.isin(adata.obs_names.astype(str), list(control_ids))
         for column in ("target_gene", "perturbation_status"):
@@ -661,6 +677,9 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
             values[hit] = spec["control_label"]
             adata.obs[column] = values
     adata.uns["analysis_scope"] = "single_sample_exploratory"
+    adata.uns["embedding_cell_scope"] = "qc_pass"
+    adata.uns["n_embedding_cells"] = int(adata.n_obs)
+    adata.uns["n_analysis_eligible"] = analysis_n
     adata.uns["config"] = config
     adata.uns["control_source"] = spec["control_source"]
     adata.uns["control_label"] = spec["control_label"]
@@ -686,7 +705,11 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         )
     _write_resolved(folder, config)
     write_qc_figures(folder, config, adata, cell_status=ledger, targets=targets)
-    print(f"  analysis cells: {adata.n_obs:,}", flush=True)
+    print(
+        f"  embedding cells (QC pass): {adata.n_obs:,}; "
+        f"analysis_eligible (perturbation): {analysis_n:,}",
+        flush=True,
+    )
     return adata
 
 

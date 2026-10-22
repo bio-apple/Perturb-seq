@@ -86,8 +86,9 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "note": (
             "Library-size normalization and log1p use all genes; "
             "PCA, neighbors, Leiden and UMAP use the top highly variable genes. "
-            "HVG scale is gene-wise across all analysis cells, not relative to "
-            "NT/zero_guide. Perturbation assessment uses Mixscape X_pert instead."
+            "HVG scale is gene-wise across all QC-pass embedding cells (preprocess "
+            "entry), not relative to NT/zero_guide. Mixscape/Mixscale may use a "
+            "stricter analysis_eligible subset."
         ),
     }
     assign_cell_type(adata, config)

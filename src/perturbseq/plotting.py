@@ -443,9 +443,9 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
     if targets.empty:
         store.skip("cells_per_target_bar", "no_targets")
         return
-    shown = targets.sort_values("n_cells", ascending=False)
-    figure, axis = store._figure(width=max(8, min(24, 0.12 * len(shown))))
-    axis.bar(np.arange(len(shown)), shown["n_cells"], color=store.palette("targeting"))
+    shown = targets.sort_values("n_cells", ascending=False, kind="mergesort")
+    figure, axis = store._figure(width=max(8, min(24, 0.18 * len(shown))))
+    axis.bar(np.arange(len(shown)), shown["n_cells"].astype(float), color=store.palette("targeting"))
     axis.axhline(min_cells, color=store.palette("low_power"), linestyle="--")
     axis.set_ylabel("cells")
     if len(shown) <= 40:
@@ -453,13 +453,14 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
         _label_count_bars(axis, shown["n_cells"])
     else:
         axis.set_xticks([])
-        axis.set_xlabel(f"{len(shown)} targets; names and counts are in the table")
+        axis.set_xlabel(f"{len(shown)} targets (incl. zeros); names and counts are in the table")
     store.save(
         figure,
         "cells_per_target_bar",
         "qc",
         targets,
-        "cells per target; line is min_cells_per_target",
+        "cells per target for every reference/assigned target (incl. zeros; "
+        "no analysis_eligible / min-cell filter); line is min_cells_per_target",
     )
 
 
@@ -1460,8 +1461,11 @@ def draw_annotation_cell_cycle_panel(
     )
     figure.subplots_adjust(left=0.05, right=0.98, bottom=0.05, top=0.93, hspace=0.30)
     figure.perturbseq_skip_tight_layout = True
+    n_cells = int(adata.n_obs)
+    scope = str(adata.uns.get("embedding_cell_scope", "preprocess_entry"))
     method = (
-        f"2-row UMAP panel; top=Leiden+SingleR (resolution={resolution_text}; "
+        f"2-row UMAP panel on {n_cells} {scope} cells (QC-pass preprocess entry; "
+        f"not analysis_eligible-only); top=Leiden+SingleR (resolution={resolution_text}; "
         f"{summary['annotation_method'].iloc[0]}); "
         f"bottom=perturbed / {control_title} / cell-cycle phase; "
         "obs['cell_type'] unchanged"

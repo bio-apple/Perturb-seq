@@ -288,12 +288,12 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 
 ## 相对对照的标准化
 
-评估单基因扰动时，勿把「全细胞 HVG z-score」与「相对对照的扰动签名」混为一谈。本流水线按路径分开：表达嵌入用全分析细胞 scale；扰动分类与 Mixscale 用相对对照的签名层。
+评估单基因扰动时，勿把「全细胞 HVG z-score」与「相对对照的扰动签名」混为一谈。本流水线按路径分开：表达嵌入用 **QC 通过后进入 preprocess 的全部细胞** scale（含未过 `min_cells_per_target` / guide-UMI 门槛者）；扰动分类与 Mixscale 仍用更严的 `analysis_eligible` ∪ 对照。
 
 | 步骤 | 输入 | 相对对照？ | 口径 |
 | --- | --- | --- | --- |
 | 预处理 `X` | counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
-| 表达 PCA / 邻居 / Leiden / UMAP | HVG 上 `sc.pp.scale`（全分析细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
+| 表达 PCA / 邻居 / Leiden / UMAP / SingleR | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
 | Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide` |
 | Mixscape `X_pert` | pertpy `perturbation_signature`：减 k 个最近对照邻域均值（线性空间取均值再 `log1p`） | 是 | 对齐 Seurat `CalcPerturbSig`；在未 scale 的 log1p 上算 |
 | Mixscape 分类 GMM | `X_pert` 上 DE 基因，`scale=True` | 是（签名内再基因 scale） | 对齐 `RunMixscape` 的 `scale.data` |
@@ -307,15 +307,15 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 
 ## 预处理与簇注释
 
-PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**）HVG 上。
+PCA、邻居、Leiden、UMAP、SingleR 建立在 top `preprocess.n_hvg`（默认 **2000**）HVG 上；细胞集合 = assign 后 **QC 通过** 且已进入 AnnData 的 io 候选（single assignment ∪ zero-guide），**不是**仅 `analysis_eligible`（NT+靶向且过 `min_cells_per_target`）。`umap_annotation_cell_cycle_panel` 上下两行同一范围。
 
 1. 从 `layers['counts']` 对**全部基因**做文库大小归一化（默认 10000）→ `log1p`；`layers['counts']` 仍是原始计数。
 2. HVG：Seurat flavor，top 2000；去掉本物种线粒体前缀后用非线粒体基因补满。
-3. 只在这 2000 HVG 上 z-score（相对**全部分析细胞**），再 PCA（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致）；`X` 保持全基因 log 归一化稀疏矩阵。
+3. 只在这 2000 HVG 上 z-score（相对**全部 QC-pass 嵌入细胞**），再 PCA（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致）；`X` 保持全基因 log 归一化稀疏矩阵。
 4. 邻居、UMAP、Leiden（igraph，`leiden_resolution` 默认 **0.5**）用这份 HVG-PCA（有 Harmony 则用 `X_pca_harmony`）。
 5. `--batch-key` 空 → 不跑 Harmony；有键且水平 < 2 → `not_run_fewer_than_two_batch_levels`。
 
-参数记在 `adata.uns['preprocess']`。
+参数记在 `adata.uns['preprocess']`；范围记在 `embedding_cell_scope=qc_pass`。
 
 ### 细胞周期
 
@@ -329,6 +329,6 @@ PCA、邻居、Leiden、UMAP 建立在 top `preprocess.n_hvg`（默认 **2000**�
 
 ### 簇注释
 
-对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
+对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）；与 Leiden 相同，覆盖全部 QC-pass 嵌入细胞。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
 
 路径与图见 [outputs.md](outputs.md)。
