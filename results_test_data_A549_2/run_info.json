@@ -1,0 +1,225 @@
+{
+  "version": "1.0.0",
+  "sample_id": "A549_2",
+  "python": "3.12.15",
+  "packages": {
+    "perturbseq": "1.0.0",
+    "scanpy": "1.12.4",
+    "anndata": "0.13.4",
+    "pertpy": "1.4.0",
+    "pandas": "3.0.6",
+    "numpy": "2.5.3",
+    "scipy": "1.18.1",
+    "pydeseq2": "0.5.4",
+    "scikit-learn": "1.9.1",
+    "matplotlib": "3.11.2",
+    "seaborn": "0.13.2",
+    "statsmodels": "0.15.0",
+    "PyYAML": "6.0.3"
+  },
+  "config": {
+    "input": {
+      "barcode_policy": "strict",
+      "input_dir": "/Users/yfan/Desktop/test_data",
+      "guide_separator": "|"
+    },
+    "labels": {
+      "feature_type_crispr": "CRISPR Direct Capture",
+      "feature_type_gex": "Gene Expression",
+      "multi_guide_policy": "drop",
+      "targets_per_cell": 1,
+      "nt_control": "Non-Targeting_Control"
+    },
+    "qc": {
+      "min_genes": 200.0,
+      "max_genes": 6000.0,
+      "max_mito_frac": 0.2,
+      "min_cells_per_target": 20,
+      "min_cells_per_guide": 10,
+      "min_guide_umi": null,
+      "mito_gene_prefix": "MT-"
+    },
+    "preprocess": {
+      "normalize_target_sum": 10000,
+      "n_hvg": 2000,
+      "n_pcs": 30,
+      "n_neighbors": 15,
+      "leiden_resolution": 0.5,
+      "cell_type_key": null,
+      "batch_key": null
+    },
+    "mixscape": {
+      "enabled": true,
+      "min_de_genes": 5,
+      "logfc_threshold": 0.1,
+      "pval_cutoff": 0.05,
+      "max_de_genes": 100,
+      "n_dims": 30,
+      "n_control_neighbors": 20,
+      "iter_num": 10
+    },
+    "mixscale": {
+      "min_de_genes": 5,
+      "logfc_threshold": 0.1,
+      "pval_cutoff": 0.05,
+      "max_de_genes": 100
+    },
+    "statistics": {
+      "mode": "descriptive",
+      "aggregation": [
+        "target",
+        "guide"
+      ],
+      "pseudocount_cpm": 1.0,
+      "bootstrap_n": 200,
+      "bootstrap_ci": 0.95,
+      "min_nt_cells": 20,
+      "fdr_threshold": 0.05,
+      "allow_random_split_replicates": false
+    },
+    "perturb": {
+      "mixscape_min_de_genes": 5,
+      "mixscape_logfc": 0.1,
+      "mixscape_pval": 0.05,
+      "cell_type_key": null
+    },
+    "edistance": {
+      "n_perms": 1000,
+      "padj_threshold": 0.0015,
+      "max_contrast_cells": 4000
+    },
+    "target_expression": {
+      "min_nt_detection_fraction": 0.05,
+      "min_nt_mean_cpm": 1.0,
+      "direction_log2fc_tolerance": 0.1
+    },
+    "singler": {
+      "enabled": true
+    },
+    "plotting": {
+      "formats": [
+        "png"
+      ],
+      "mixscape_heatmap_max_genes": 20,
+      "mixscape_heatmap_max_cells": 300,
+      "dpi": 300,
+      "width": 8,
+      "height": 6,
+      "theme": "white",
+      "hist_bins": 50,
+      "markers": null,
+      "max_legend_categories": 20,
+      "scatter_max_points": 50000,
+      "volcano_lfc": 1.0,
+      "heatmap_max_genes": 50,
+      "save_plot_data": false,
+      "palette": {
+        "nt": "#7F7F7F",
+        "targeting": "#1F77B4",
+        "single_targeting": "#1F77B4",
+        "single_nt": "#7F7F7F",
+        "low_cells_target": "#FF7F0E",
+        "qc_failed": "#D62728",
+        "multi_guide": "#9467BD",
+        "no_guide": "#BDBDBD",
+        "retained": "#2CA02C"
+      }
+    },
+    "run": {
+      "random_seed": 0
+    },
+    "runtime": {
+      "seed": 0,
+      "n_threads": 3
+    },
+    "_config_path": "/Users/yfan/Desktop/bio-apple/Perturb-seq/config/config.yaml",
+    "experiment": {
+      "sample_id": "A549_2",
+      "organism": "human",
+      "crispr_mode": "CRISPR_KO",
+      "crispr_mode_description": null,
+      "expected_target_direction": null,
+      "resolved_expected_direction": "not_required",
+      "biological_sample_count": 1,
+      "resolved_organism": "human",
+      "resolved_mito_prefix": "MT-",
+      "organism_evidence": [
+        "\u8f93\u5165\u7269\u79cd human",
+        "\u7ebf\u7c92\u4f53\u524d\u7f00 MT-",
+        "\u57fa\u56e0\u53f7 ENSG 62700 \u4e2a\uff0c\u4f8b\u5982 ENSG00000290825.1\u3001ENSG00000223972.6\u3001ENSG00000227232.5",
+        "\u57fa\u56e0\u53f7 ENSMUSG 0 \u4e2a",
+        "\u57fa\u56e0\u7b26\u53f7 MT- 37 \u4e2a\uff0c\u4f8b\u5982 MT-TF\u3001MT-RNR1\u3001MT-TV",
+        "\u57fa\u56e0\u7b26\u53f7 mt- 0 \u4e2a"
+      ],
+      "other_organelle_prefixes": [],
+      "species_check": "passed"
+    },
+    "output": {
+      "output_dir": "/Users/yfan/Desktop/bio-apple/Perturb-seq/results_test_data_A549_2"
+    },
+    "control": {
+      "control_source": "designed_nt",
+      "control_label": "Non-Targeting_Control",
+      "temporary": false,
+      "control_phrase": "Non-Targeting_Control",
+      "note": "",
+      "fallback_from": ""
+    }
+  },
+  "seed": 0,
+  "biological_sample_count": 1,
+  "analysis_scope": "single_sample_exploratory",
+  "document_version": null,
+  "resolved_organism": "human",
+  "resolved_mito_prefix": "MT-",
+  "species_check": "passed",
+  "organism_evidence": [
+    "\u8f93\u5165\u7269\u79cd human",
+    "\u7ebf\u7c92\u4f53\u524d\u7f00 MT-",
+    "\u57fa\u56e0\u53f7 ENSG 62700 \u4e2a\uff0c\u4f8b\u5982 ENSG00000290825.1\u3001ENSG00000223972.6\u3001ENSG00000227232.5",
+    "\u57fa\u56e0\u53f7 ENSMUSG 0 \u4e2a",
+    "\u57fa\u56e0\u7b26\u53f7 MT- 37 \u4e2a\uff0c\u4f8b\u5982 MT-TF\u3001MT-RNR1\u3001MT-TV",
+    "\u57fa\u56e0\u7b26\u53f7 mt- 0 \u4e2a"
+  ],
+  "other_organelle_prefixes": [],
+  "control_source": "designed_nt",
+  "control_label": "Non-Targeting_Control",
+  "control_temporary": false,
+  "control_phrase": "Non-Targeting_Control",
+  "control_note": "",
+  "control_fallback_from": "",
+  "temporary_control_warning": "",
+  "elapsed_seconds": 517.49,
+  "input_validation": {
+    "barcode_policy": "strict",
+    "status": "passed",
+    "n_matrix": 103436,
+    "n_assignment": 92039,
+    "n_only_matrix": 11397,
+    "n_only_assignment": 0,
+    "n_matrix_only_as_no_guide": 11397,
+    "guide_separator": "|",
+    "biological_sample_count": 1,
+    "control_source": "designed_nt",
+    "control_label": "Non-Targeting_Control",
+    "control_temporary": false,
+    "control_phrase": "Non-Targeting_Control",
+    "control_note": "",
+    "control_fallback_from": ""
+  },
+  "n_matrix_only_as_no_guide": 11397,
+  "steps": {
+    "io": {
+      "seconds": 447.963
+    },
+    "assign": {
+      "seconds": 3.957
+    },
+    "preprocess": {
+      "seconds": 65.554
+    }
+  },
+  "n_temporary_control_cells": 0,
+  "cell_cycle_status": "scored_after_log1p",
+  "cell_cycle_note": "scib Tirosh/Regev \u57fa\u56e0\u96c6\uff1b\u5199\u5165 phase\u3001S_score\u3001G2M_score\u3002"
+}

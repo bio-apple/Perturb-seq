@@ -70,11 +70,9 @@ _MIXSCAPE_FIGURES = frozenset(
     }
 )
 _MIXSCALE_FIGURES = frozenset({"mixscale_score_ridge", "mixscale_scatter"})
-# Descriptive CPM log2FC and related non-Mixscape/Mixscale DE products.
+# Descriptive CPM log2FC figures written under DGE/ (perturb step).
 _DESCRIPTIVE_FIGURES = frozenset(
     {
-        "volcano",
-        "target_effect_forest",
         "de_gene_heatmap",
         "target_expression_effect",
         "guide_consistency",
@@ -99,8 +97,6 @@ def _output_bucket(name: str, section: str) -> str:
         or name.endswith("_mixscape_2x2")
     ):
         return "mixscape"
-    if section == "wilcoxon" or name.startswith("wilcoxon_"):
-        return "wilcoxon"
     if section in {"de", "dge"} or name in _DESCRIPTIVE_FIGURES:
         return "descriptive"
     if name in _QC_FIGURES:
@@ -108,14 +104,12 @@ def _output_bucket(name: str, section: str) -> str:
     return "main"
 
 
-def _dge_bucket_root(output_dir: Path, bucket: str) -> Path:
-    # Mixscape / Mixscale / Wilcoxon roots; descriptive PNGs live directly under DGE/.
+def _analysis_output_root(output_dir: Path, bucket: str) -> Path:
+    # Mixscape / Mixscale roots; descriptive perturb PNGs live directly under DGE/.
     if bucket == "mixscape":
         return output_dir / "Mixscape"
     if bucket == "mixscale":
         return output_dir / "mixscale"
-    if bucket == "wilcoxon":
-        return output_dir / "wilcoxon"
     if bucket == "descriptive":
         return output_dir / "DGE"
     raise ValueError(f"不是分析输出桶: {bucket}")
@@ -129,7 +123,6 @@ class FigureStore:
         self.context = context
         self.plot_data = output_dir / "plot_data"
         self.plot_data.mkdir(parents=True, exist_ok=True)
-        self.manifest: list[dict[str, str]] = []
         theme = str(self.plotting.get("theme", "white"))
         sns.set_theme(style=theme if theme in {"white", "whitegrid", "ticks"} else "white")
         matplotlib.rcParams.update(
@@ -162,8 +155,8 @@ class FigureStore:
             return self.output_dir / "UMAP"
         if bucket == "qc":
             return self.output_dir / "qc"
-        if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
-            root = _dge_bucket_root(self.output_dir, bucket)
+        if bucket in {"mixscape", "mixscale", "descriptive"}:
+            root = _analysis_output_root(self.output_dir, bucket)
             if bucket == "mixscape" and section == "target_in_de":
                 return root / "target_in_de"
             if bucket == "mixscale" and section == "mixscale_target_in_de":
@@ -177,8 +170,8 @@ class FigureStore:
             return self.output_dir / "UMAP" / "tables"
         if bucket == "qc":
             return self.output_dir / "qc" / "tables"
-        if bucket in {"mixscape", "mixscale", "wilcoxon", "descriptive"}:
-            return _dge_bucket_root(self.output_dir, bucket) / "plot_data"
+        if bucket in {"mixscape", "mixscale", "descriptive"}:
+            return _analysis_output_root(self.output_dir, bucket) / "plot_data"
         return self.plot_data
 
     def save(
@@ -206,33 +199,18 @@ class FigureStore:
         legacy = self.plot_data / f"{name}.skipped.txt"
         if legacy != stale and legacy.exists():
             legacy.unlink()
-        data_path = ""
         if self.plotting.get("save_plot_data", False):
             data_folder.mkdir(parents=True, exist_ok=True)
-            data_path = str(data_folder / f"{name}.tsv")
-            data.to_csv(data_path, sep="\t", index=False)
+            data.to_csv(data_folder / f"{name}.tsv", sep="\t", index=False)
         else:
             stale_tsv = data_folder / f"{name}.tsv"
             if stale_tsv.exists():
                 stale_tsv.unlink()
         bucket = _output_bucket(name, section)
         self._retire_legacy_plot(name, section, bucket)
-        self.manifest.append(
-            {
-                "plot_name": name,
-                "branch": "UMAP" if bucket == "umap" else section,
-                "status": "written",
-                "reason": "",
-                "method": method,
-                "data_path": data_path,
-                "png_path": str(path),
-                "pdf_path": "",
-            }
-        )
 
     def skip(self, name: str, reason: str, section: str = "") -> None:
-        # Lean outputs: record skip in the in-memory manifest only; do not leave
-        # *.skipped.txt on disk (cleanup would remove them anyway).
+        # Lean outputs: do not leave *.skipped.txt on disk (cleanup would remove them anyway).
         data_folder = self.data_dir(name, section)
         for stale in (
             data_folder / f"{name}.skipped.txt",
@@ -243,17 +221,6 @@ class FigureStore:
                 stale.unlink()
         bucket = _output_bucket(name, section)
         self._retire_legacy_plot(name, section, bucket)
-        self.manifest.append(
-            {
-                "plot_name": name,
-                "branch": "UMAP" if bucket == "umap" else section,
-                "status": "skipped",
-                "reason": reason.strip(),
-                "data_path": "",
-                "png_path": "",
-                "pdf_path": "",
-            }
-        )
 
     def _retire_legacy_plot(self, name: str, section: str, bucket: str) -> None:
         """Remove products left under pre-bucket figure or table paths."""
@@ -329,13 +296,6 @@ class FigureStore:
                     Path("DGE") / "mixscale" / "plot_data" / f"{name}.skipped.txt",
                 ]
             )
-        if bucket == "wilcoxon":
-            relatives.extend(
-                [
-                    Path("DGE") / "wilcoxon" / "tables" / f"{name}.tsv",
-                    Path("DGE") / "wilcoxon" / "figures" / f"{name}.png",
-                ]
-            )
         keep = {
             self.figure_dir(name, section) / f"{name}.png",
             self.data_dir(name, section) / f"{name}.tsv",
@@ -359,26 +319,6 @@ class FigureStore:
 
     def palette(self, key: str, fallback: str = "#4C78A8") -> str:
         return str(self.plotting.get("palette", {}).get(key, fallback))
-
-    def write_manifest(self, path: Path) -> None:
-        """Write or merge this store's rows into ``plot_manifest.tsv``.
-
-        Re-running one analysis step replaces that step's plot_name rows and
-        keeps rows written by other steps.
-        """
-        frame = pd.DataFrame(self.manifest)
-        path = Path(path)
-        if path.exists():
-            previous = pd.read_csv(path, sep="\t")
-            if frame.empty:
-                frame = previous
-            elif not previous.empty and "plot_name" in previous.columns:
-                owned = set(frame["plot_name"].astype(str))
-                previous = previous[~previous["plot_name"].astype(str).isin(owned)]
-                frame = pd.concat([previous, frame], ignore_index=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(path, sep="\t", index=False)
-
 
 def figure_context(
     output_dir: Path, config: dict[str, Any], adata: AnnData | None
@@ -3136,8 +3076,8 @@ def draw_mixscape_target_panels(
 ) -> None:
     """One 2x2 PNG per target: posterior, perturbation score, cell-level volcano, Top 20 heatmap.
 
-    ``lfc_line`` is MixscapeHeatmap / RunMixscape logfc.threshold (project 0.1).
-    It is not ``plotting.volcano_lfc``. The heatmap stays in the bottom-right panel.
+    ``lfc_line`` is Mixscape ``logfc_threshold`` (project default 0.1). The heatmap stays
+    in the bottom-right panel.
     """
     if "mixscape_status" not in adata.obs or "mixscape_class_p" not in adata.obs:
         store.skip("mixscape_target_panels", "mixscape_not_run")

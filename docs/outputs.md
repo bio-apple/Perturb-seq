@@ -30,7 +30,7 @@
 | `DGE/` | 描述性效应图 |
 | `E-distance/` | E-test 散点 |
 
-`dge` / `mixscape` / `mixscale` 互不依赖；Wilcoxon（`dge`）无独立 PNG。并行步之间用**临时目录**交换 AnnData，跑完即删，不落盘到输出目录。
+`mixscape` / `mixscale` 互不依赖；并行步之间用**临时目录**交换 AnnData，跑完即删，不落盘到输出目录。
 
 ---
 

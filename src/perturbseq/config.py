@@ -295,7 +295,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "theme": None,
         "max_legend_categories": None,
         "scatter_max_points": None,
-        "volcano_lfc": None,
         "heatmap_max_genes": None,
         "save_plot_data": None,
         "hist_bins": None,

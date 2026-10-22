@@ -1,8 +1,8 @@
 # 分析软件默认参数。
-# 步骤：io → assign → preprocess → {dge ‖ mixscape ‖ mixscale} → perturb。
-# dge / mixscape / mixscale 互不依赖（均只依赖 preprocess）；≥2 步时进程池并发。
+# 步骤：io → assign → preprocess → {mixscape ‖ mixscale} → perturb。
+# mixscape / mixscale 互不依赖（均只依赖 preprocess）；两者同跑时进程池并发。
 # 图目录：Mixscape/、mixscale/、DGE/、E-distance/、qc/、UMAP/。成功结束后磁盘只保留 PNG。
-# 参考：pertpy WilcoxonTest；Seurat Mixscape vignette；satijalab Mixscale。
+# 参考：pertpy Mixscape / Mixscale；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
 # 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
 # 未给 --nt-control，或给了但数据中无可用 NT 细胞时，assign 解析为临时 zero_guide 对照
@@ -107,7 +107,6 @@ plotting:
   markers: null
   max_legend_categories: 20
   scatter_max_points: 50000
-  volcano_lfc: 1.0
   heatmap_max_genes: 50
   # false：不写图旁 plot_data/*.tsv；流水线结束还会清理非 PNG 产物。
   save_plot_data: false

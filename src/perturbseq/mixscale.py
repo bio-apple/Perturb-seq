@@ -50,7 +50,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     Computes ``layers['X_pert_mixscale']`` here (tutorial CalcPerturbSig), then
     RunMixscale. Does not read Mixscape classes or ``layers['X_pert']``.
     """
-    from pertpy.tools import Mixscale, Mixscape
+    from pertpy.tools import Mixscale
 
     from perturbseq.mixscape import prepare_signature_dims, real_cell_type_split
 
@@ -126,7 +126,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         if split_by:
             signature_args["split_by"] = split_by
         # Tutorial: CalcPerturbSig → PRTB assay; here write Mixscale-owned layer.
-        Mixscape().perturbation_signature(work, **signature_args)
+        Mixscale().perturbation_signature(work, **signature_args)
         work.layers[MIXSCALE_LAYER] = work.layers["X_pert"]
         if "X_pert" in work.layers:
             del work.layers["X_pert"]

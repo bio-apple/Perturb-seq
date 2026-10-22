@@ -2,7 +2,7 @@
 
 从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤、描述性 CPM log2FC、Mixscape / Mixscale 与扰动距离。一次运行一个生物学样本；`statistics.mode=descriptive`，效应表不含组间推断 p/FDR。
 
-步骤：`io` → `assign` → `preprocess` → `{dge ‖ mixscape ‖ mixscale}` → `perturb`。后三者只依赖 preprocess、互不依赖；默认全量跑时在 preprocess 之后**进程池并发**，再跑 perturb。图分目录 `Mixscape/`、`mixscale/` 等。各分析步结束时写出对应 PNG。成功跑完后磁盘**只保留 PNG**（不写 `checkpoints/`，不支持 `--resume`；须从 `io` 连续跑）。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
+步骤：`io` → `assign` → `preprocess` → `{mixscape ‖ mixscale}` → `perturb`。后两者只依赖 preprocess、互不依赖；默认全量跑时在 preprocess 之后**进程池并发**，再跑 perturb。图分目录 `Mixscape/`、`mixscale/` 等。各分析步结束时写出对应 PNG。成功跑完后磁盘**只保留 PNG**（不写 `checkpoints/`，不支持 `--resume`；须从 `io` 连续跑）。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
 
 线程默认：`runtime.n_threads = max(1, CPU数//3)`，用于 OpenMP / BLAS / `scanpy.n_jobs` 与并行步进程数上限。
 
@@ -40,7 +40,7 @@ python -m perturbseq \
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
-| `--steps` | 默认 `all`（须从 `io` 起；preprocess 后三步并行） |
+| `--steps` | 默认 `all`（须从 `io` 起；preprocess 后 mixscape 与 mixscale 可并行） |
 | 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
 | QC 指标 | `nCount` / `nFeature` / `percent.mt`（`nCount` 只作图，不按 UMI 绝对阈值过滤细胞） |
 
@@ -57,4 +57,4 @@ python -m perturbseq \
 | `DGE/` | 描述性 CPM log2FC 相关图 |
 | `E-distance/` | 细胞级 E-test |
 
-Wilcoxon（`dge`）无独立 PNG。图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。
+图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。

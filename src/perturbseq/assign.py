@@ -850,7 +850,6 @@ def write_qc_figures(
         draw_temporary_control_qc(store, cell_status)
     else:
         remove_temporary_control_qc(output_dir)
-    # plot_manifest is ephemeral; lean cleanup removes it after the run.
 
 
 def _qc_population(cell_status: pd.DataFrame, adata: AnnData | None) -> tuple[pd.DataFrame, str]:

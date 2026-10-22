@@ -53,7 +53,6 @@ from perturbseq.config import (
     validate_config,
     verify_species_consistency,
 )
-from perturbseq.differential_expression import compact_wilcoxon_frame, run_wilcoxon_de
 from perturbseq.distance_tests import write_edistance_results
 from perturbseq.io import (
     InputMismatch,
@@ -76,13 +75,12 @@ STEPS = [
     "io",
     "assign",
     "preprocess",
-    "dge",
     "mixscape",
     "mixscale",
     "perturb",
 ]
-# After preprocess these three only read preprocess AnnData and write disjoint PNG dirs.
-PARALLEL_ANALYSIS_STEPS = ("dge", "mixscape", "mixscale")
+# After preprocess these two only read preprocess AnnData and write disjoint PNG dirs.
+PARALLEL_ANALYSIS_STEPS = ("mixscape", "mixscale")
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -91,7 +89,6 @@ PACKAGES = [
     "pandas",
     "numpy",
     "scipy",
-    "pydeseq2",
     "scikit-learn",
     "matplotlib",
     "seaborn",
@@ -334,7 +331,7 @@ def _run_parallel_analysis(
     batch: list[str],
     preprocess_adata,
 ) -> tuple[dict[str, float], Any]:
-    """Run dge / mixscape / mixscale; IPC via a temporary directory (not output checkpoints)."""
+    """Run mixscape / mixscale; IPC via a temporary directory (not output checkpoints)."""
     public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
     with tempfile.TemporaryDirectory(prefix="perturbseq_parallel_") as tmp:
         tmp_dir = Path(tmp)
@@ -408,10 +405,7 @@ def _parallel_step_worker(
     started = time.time()
     adata = sc.read_h5ad(preprocess_path)
     restore_control_spec(config, adata)
-    if step == "dge":
-        adata = _step_dge(folder, config, adata)
-        _write_lean_dge_product(adata, Path(product_path))
-    elif step == "mixscape":
+    if step == "mixscape":
         adata = _step_mixscape(folder, config, adata)
         _write_h5ad(adata, Path(product_path))
     elif step == "mixscale":
@@ -425,11 +419,8 @@ def _parallel_step_worker(
 
 
 def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, Path]):
-    """Build perturb input: preprocess + Mixscape/Mixscale products + Wilcoxon status."""
+    """Build perturb input: preprocess + Mixscape/Mixscale products."""
     import gc
-
-    import h5py
-    from anndata.io import read_elem
 
     adata = preprocess_adata.copy()
     mixscape_path = Path(product_paths["mixscape"]) if "mixscape" in product_paths else None
@@ -470,15 +461,6 @@ def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, P
                 adata.uns[key] = scale.uns[key]
         scale.file.close()
         del scale
-        gc.collect()
-    dge_path = Path(product_paths["dge"]) if "dge" in product_paths else None
-    if dge_path is not None and dge_path.exists():
-        with h5py.File(dge_path, "r") as handle:
-            uns = handle["uns"] if "uns" in handle else None
-            if uns is not None:
-                for key in ("wilcoxon_de_status", "wilcoxon_de"):
-                    if key in uns:
-                        adata.uns[key] = read_elem(uns[key])
         gc.collect()
     return adata
 
@@ -708,93 +690,6 @@ def _resolve_species(config: dict[str, Any]) -> None:
     )
 
 
-def _step_dge(folder: Path, config: dict[str, Any], adata):
-    """Independent WilcoxonTest DE (pertpy Simple statistical tests); not Mixscape/Mixscale."""
-    spec = control_spec(config)
-    if spec["temporary"]:
-        print(f"  temporary control warning: {spec['note']}", flush=True)
-    results, status = run_wilcoxon_de(adata, config)
-    # Never park the gene×target table on adata — it is tens of millions of rows.
-    adata.uns.pop("wilcoxon_de_results", None)
-    adata.uns["wilcoxon_de_status"] = status
-    for stale in (
-        folder / "wilcoxon" / "tables" / "de_wilcoxon.tsv",
-        folder / "wilcoxon" / "tables" / "de_wilcoxon_status.tsv",
-        folder / "DGE" / "descriptive" / "tables" / "de_edger_main.tsv",
-        folder / "DGE" / "descriptive" / "tables" / "de_edger_sensitivity.tsv",
-        folder / "DGE" / "descriptive" / "tables" / "de_pydeseq2_main.tsv",
-        folder / "DGE" / "descriptive" / "tables" / "de_pydeseq2_sensitivity.tsv",
-        folder / "DGE" / "tables" / "de_edger_main.tsv",
-        folder / "DGE" / "tables" / "de_pydeseq2_main.tsv",
-        folder / "DGE" / "wilcoxon" / "tables" / "de_wilcoxon.tsv",
-    ):
-        if stale.is_file():
-            stale.unlink()
-    n_ok = int(status["status"].eq("estimated").sum()) if not status.empty else 0
-    meta = adata.uns.get("wilcoxon_de", {})
-    if not isinstance(meta, dict):
-        meta = {}
-    n_na = int(meta.get("n_log_fc_nonfinite_set_na", 0))
-    n_rows = int(len(results)) if results is not None and not results.empty else 0
-    meta = {
-        **meta,
-        "results_table_persisted": False,
-        "results_table_note": (
-            "Full wilcoxon_de_results kept out of memory merge products; "
-            "status + meta only for perturb."
-        ),
-        "n_log_fc_rows": n_rows,
-    }
-    adata.uns["wilcoxon_de"] = meta
-    print(f"  WilcoxonTest contrasts estimated: {n_ok}", flush=True)
-    if n_na:
-        print(
-            f"  WilcoxonTest log_fc non-finite→NA: {n_na} "
-            "(pertpy log2(mean) on log1p without pseudocount)",
-            flush=True,
-        )
-    if n_rows and isinstance(results, pd.DataFrame):
-        preview_cols = [
-            c
-            for c in (
-                "target_gene",
-                "variable",
-                "log_fc",
-                "p_value",
-                "adj_p_value",
-                "cell_type",
-            )
-            if c in results.columns
-        ]
-        adata.uns["wilcoxon_de_preview"] = compact_wilcoxon_frame(
-            results.loc[:, preview_cols].head(50).copy()
-        )
-    del results
-    return adata
-
-
-def _write_lean_dge_product(adata, path: Path) -> None:
-    """Temporary IPC product for parallel merge: status + meta only."""
-    from anndata import AnnData
-    from scipy import sparse
-
-    lean = AnnData(X=sparse.csr_matrix((0, 0), dtype=np.float32))
-    for key in ("wilcoxon_de_status", "wilcoxon_de", "wilcoxon_de_preview"):
-        if key in adata.uns:
-            lean.uns[key] = adata.uns[key]
-    for key in (
-        "control_label",
-        "control_source",
-        "control_temporary",
-        "control_phrase",
-        "control_note",
-        "control_fallback_from",
-    ):
-        if key in adata.uns:
-            lean.uns[key] = adata.uns[key]
-    _write_h5ad(lean, path)
-
-
 def _step_mixscape(folder: Path, config: dict[str, Any], adata):
     """Independent Mixscape step: DE gate, X_pert signature, classification."""
     mixscape_on = config.get("mixscape", {}).get("enabled", True)
@@ -881,9 +776,6 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         [main_status, sens_status, pd.DataFrame(comparisons)],
         ignore_index=True,
     )
-    wilcoxon_status = adata.uns.get("wilcoxon_de_status")
-    if isinstance(wilcoxon_status, pd.DataFrame) and not wilcoxon_status.empty:
-        comparisons_table = pd.concat([comparisons_table, wilcoxon_status], ignore_index=True)
     adata.uns["comparison_status"] = comparisons_table
     write_descriptive_figures(
         folder,
@@ -892,7 +784,6 @@ def _step_perturb(folder: Path, config: dict[str, Any], adata):
         direction=direction,
         guides=guides,
     )
-    adata.uns.pop("wilcoxon_de_results", None)
     return adata
 
 
