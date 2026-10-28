@@ -222,6 +222,7 @@ def write_preprocess_figures(
         open_figure_store,
         retire_removed_umaps,
     )
+    from perturbseq.sctype import SCTYPE_OBS_COLUMN, annotate_sctype
 
     output_dir = Path(output_dir)
     store = open_figure_store(output_dir, config, adata)
@@ -244,6 +245,18 @@ def write_preprocess_figures(
     draw_annotation_cell_cycle_panel(
         store, adata, control_values=control_values, control_title=control_title
     )
+    sctype_name = "umap_sctype"
+    sctype_cfg = config.get("sctype", {})
+    if sctype_cfg.get("enabled", True) is False:
+        store.skip(sctype_name, "sctype_disabled")
+    elif "X_umap" not in adata.obsm or "leiden" not in adata.obs:
+        store.skip(sctype_name, "missing_fields")
+    else:
+        try:
+            annotate_sctype(adata, config)
+            draw_umap(store, adata, SCTYPE_OBS_COLUMN, sctype_name)
+        except ValueError as exc:
+            store.skip(sctype_name, str(exc))
     markers = default_markers(config)
     draw_marker_detection_heatmap(store, adata, markers)
     draw_dotplot_markers(store, adata, markers)

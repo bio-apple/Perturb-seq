@@ -264,6 +264,12 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "cell_type_key": None,
     },
     "singler": {"enabled": None},
+    "sctype": {
+        "enabled": None,
+        "tissue": None,
+        "db_path": None,
+        "low_score_fraction": None,
+    },
     "plotting": {
         "formats": None,
         "mixscape_heatmap_max_genes": None,

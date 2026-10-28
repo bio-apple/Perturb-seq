@@ -68,6 +68,16 @@ perturb:
 # 簇注释调用 Rscript 里的 SingleR 与 celldex。false 时跳过，不要求安装 R。
 singler:
   enabled: true
+# ScType marker 打分注释（纯 Python；与 SingleR 并存）。tissue 必填才跑，例如 Immune system。
+# 可选 tissue：Adrenal, Brain, Eye, Heart, Hippocampus, Immune system, Intestine,
+# Kidney, Liver, Lung, Muscle, Pancreas, Placenta, Spleen, Stomach, Thymus。
+# db_path 默认仓库 data/sctype/ScTypeDB_full.tsv（离线）；可换成同格式 tsv/csv/xlsx。
+# 簇顶分 < n_cells * low_score_fraction → Unknown（官方默认约 0.25）。
+sctype:
+  enabled: true
+  tissue: null
+  db_path: null
+  low_score_fraction: 0.25
 plotting:
   # 实现只写 PNG；formats 键可存在（默认 [png]），不切换格式。
   # 图风格对齐 Library-D（白底、浅灰网格、全边框、navy 直方图）。

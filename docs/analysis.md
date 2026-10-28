@@ -68,12 +68,12 @@ flowchart TD
 | 步骤 | 作用 | 输出目录 |
 | --- | --- | --- |
 | `io` | 读入矩阵 / 参考 / 分配（账本在内存） | — |
-| `assign` | QC、资格过滤、对照标签；写出 `qc/` 图 | `qc/` |
-| `preprocess` | 归一化、HVG、PCA（30）、UMAP 等；写出 HVG/PCA/簇注释/细胞周期图 | `qc/`、`UMAP/` |
-| `mixscape` | 默认用于 **KO**；pertpy `Mixscape`：DE 门 → 签名 → 分类 | **`Mixscape/`**、`UMAP/` |
-| `mixscale` | 默认用于 **CRISPRi / CRISPRa**；pertpy `Mixscale`：独立 DE 门 → `mixscale_score` | **`mixscale/`** |
+| `assign` | QC、资格过滤、对照解析；AnnData 子集为 **QC-pass**（供嵌入）；`analysis_eligible` 写入 obs；写出 `qc/` 图 | `qc/` |
+| `preprocess` | 归一化、HVG、PCA（30）、UMAP / Leiden / SingleR / ScType（均在 QC-pass 上） | `qc/`、`UMAP/` |
+| `mixscape` | 默认用于 **KO**；在 `analysis_eligible` ∪ 对照上：DE 门 → 签名 → 分类 | **`Mixscape/`**、`UMAP/` |
+| `mixscale` | 默认用于 **CRISPRi / CRISPRa**；同范围独立 DE 门 → `mixscale_score` | **`mixscale/`** |
 
-图在**对应分析步骤结束时**写出。跑完做 lean cleanup：磁盘只留 `**/*.png`（细节见 [outputs.md](outputs.md)）。
+图在**对应分析步骤结束时**写出。跑完做 lean cleanup：默认只留 `**/*.png`；同目录输入输出时另保护 `{sample}.scRNA.*` 与已解析 DRAGEN 输入（细节见 [outputs.md](outputs.md)）。无独立 Wilcoxon DGE / E-distance / perturb 流水线步骤。
 
 ### 并行触发与限制
 
@@ -103,11 +103,28 @@ flowchart TD
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`，默认 `KO` |
-| `--steps` | 默认 `all` 按 `crispr_mode` 选型（KO→mixscape；i/a→mixscale；other→仅至 preprocess）；须从 `io` 起；KO/i/a 显式同写两者时可并发 |
+| `--steps` | 默认 `all` 按 `crispr_mode` 选型（KO→mixscape；i/a→mixscale；other→仅至 preprocess）；须从 `io` 起；KO/i/a 显式同写两者时可并发；合法步名仅 `io,assign,preprocess,mixscape,mixscale` |
 | `--validate-only` | 只检查参考表和 barcode |
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
 | `--max-mito-frac` | 覆盖默认 `0.2` |
+| `--nt-control` | 设计 NT 名；空或数据中无可用 NT → 临时 `zero_guide` |
+| `--config` | 软件默认 YAML；缺省 `config/config.yaml` |
+
+常用 YAML 键（完整默认见 `config/config.yaml`）：
+
+| 键 | 作用 |
+| --- | --- |
+| `qc.min_genes` / `max_genes` / `max_mito_frac` | QC 过滤（CLI 可覆盖） |
+| `qc.min_cells_per_target` | 靶向细胞数 **<** 该值 → `low_cells_target`（默认 20）；决定 `analysis_eligible` |
+| `qc.min_cells_per_guide` | 仅用于 `cells_per_target` 表的 `n_guides_passing` 统计（默认 10）；**不**直接排除细胞 |
+| `qc.min_guide_umi` | 单条 guide UMI 门槛；`null` 表示不启用 |
+| `preprocess.n_hvg` / `n_pcs` / `leiden_resolution` | HVG / PCA / Leiden（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致） |
+| `mixscape.*` / `mixscale.*` | 各自 DE 门与算法参数（`logfc_threshold` 默认 0.1 等） |
+| `singler.enabled` | `false` 跳过 SingleR 与组合注释图 |
+| `sctype.enabled` / `tissue` / `db_path` / `low_score_fraction` | ScType；**须设 `tissue`** 才跑；`db_path` 默认仓库 `data/sctype/ScTypeDB_full.tsv` |
+| `runtime.n_threads` | 可选；默认 `max(1, CPU//3)` |
+| `plotting.dpi` / `save_plot_data` | 图 DPI；`save_plot_data` 默认 `false` |
 
 输入文件由 `--sample-id` 与 `--input-dir` 拼出：
 
@@ -196,7 +213,9 @@ QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount �
 
 ### 表达基因数
 
-默认剔除 `n_genes ≤ 200` 或 `≥ 6000`：`qc.min_genes` / `qc.max_genes`。保留开区间 `(min_genes, max_genes)`。`--min-genes` / `--max-genes` 可覆盖。原因码：`high_genes` / `low_genes`。靶基因 / guide 细胞数门槛默认 `min_cells_per_target=20`、`min_cells_per_guide=10`。
+默认剔除 `n_genes ≤ 200` 或 `≥ 6000`：`qc.min_genes` / `qc.max_genes`。保留开区间 `(min_genes, max_genes)`。`--min-genes` / `--max-genes` 可覆盖。原因码：`high_genes` / `low_genes`。
+
+靶基因细胞数：`qc.min_cells_per_target`（默认 20）——靶向细胞数 **<** 该值 → `low_cells_target`，不进 `analysis_eligible`。`qc/cells_per_target_bar` 另报全靶含 0 的 **total cells**（`n_cells` 总和），以及「过门槛靶数」与其 **sum n_cells**（用 **≥**，与资格一致）。`qc.min_cells_per_guide`（默认 10）只计入每靶 `n_guides_passing`（该 guide 细胞数 ≥ 门槛的 guide 条数），**不**作为细胞排除门槛。
 
 ### 线粒体
 
@@ -210,7 +229,7 @@ QC **过滤**只用基因数与线粒体比例；**不做**文库 UMI / nCount �
 
 ### GEX marker 图
 
-`preprocess` 后写出 `marker_detection_heatmap` 与 `dotplot_markers`（白底 Library-D / Seurat 点图风格）。基因列表优先读 `plotting.markers`；未配置时按 `experiment.organism` 使用默认 housekeeping（人类：`ACTB,GAPDH,B2M,MALAT1,NEAT1,UBC,PPIA,EEF1A1`；小鼠对应首字母小写形式）。仅使用矩阵中存在的基因；全缺失则 skip。行标签优先 `singler_label`（否则 `cell_type`）拼成 `leiden: annotation`；无注释时退回裸 Leiden id。点图：点大小 = Percent Expressed，颜色 = Average Expression（右侧双图例）。
+`preprocess` 后写出 `marker_detection_heatmap` 与 `dotplot_markers`（白底 Library-D / Seurat 点图风格）。基因列表优先读 `plotting.markers`；未配置时按 `experiment.organism` 使用默认 housekeeping（人类：`ACTB,GAPDH,B2M,MALAT1,NEAT1,UBC,PPIA,EEF1A1`；小鼠对应首字母小写形式）。仅使用矩阵中存在的基因；全缺失则 skip。行标签优先 `singler_label`，其次 `sctype_classification`，再否则 `cell_type`，拼成 `leiden: annotation`；无注释时退回裸 Leiden id。点图：点大小 = Percent Expressed，颜色 = Average Expression（右侧双图例）。
 
 ### gRNA 捕获
 
@@ -262,7 +281,9 @@ low_library_no_guide → no_guide → multi_guide → low_guide_umi → qc_faile
 
 ## Mixscape 与 Mixscale
 
-两个**互不依赖**的步骤（`perturbseq.mixscape` / `perturbseq.mixscale`），均只依赖 `preprocess`。`--steps all` 按 CRISPR 模式只跑其一（KO→Mixscape；i/a→Mixscale）；`other` 不跑这两步。KO/i/a 显式同写两者时才并发（见上文「并行触发与限制」）。实现对齐 pertpy 1.x API：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert` 或分类标签。
+两个**互不依赖**的步骤（`perturbseq.mixscape` / `perturbseq.mixscale`），均只依赖 `preprocess`。细胞范围：更严的 `analysis_eligible` ∪ 对照（见 `perturbation_analysis_mask`）；表达嵌入仍用全部 QC-pass 细胞。`--steps all` 按 CRISPR 模式只跑其一（KO→Mixscape；i/a→Mixscale）；`other` 不跑这两步。KO/i/a 显式同写两者时才并发（见上文「并行触发与限制」）。
+
+各自内部先跑 Wilcoxon **DE gate**（`perturbseq.de_gate`；`|logFC|` / adj-p / `min_de_genes`），不是独立流水线步骤。实现对齐 pertpy 1.x API：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert` 或分类标签。
 
 | | Mixscape | Mixscale |
 | --- | --- | --- |
@@ -293,7 +314,7 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 | 步骤 | 输入 | 相对对照？ | 口径 |
 | --- | --- | --- | --- |
 | 预处理 `X` | counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
-| 表达 PCA / 邻居 / Leiden / UMAP / SingleR | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
+| 表达 PCA / 邻居 / Leiden / UMAP / SingleR / ScType | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
 | Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide` |
 | Mixscape `X_pert` | pertpy `perturbation_signature`：减 k 个最近对照邻域均值（线性空间取均值再 `log1p`） | 是 | 对齐 Seurat `CalcPerturbSig`；在未 scale 的 log1p 上算 |
 | Mixscape 分类 GMM | `X_pert` 上 DE 基因，`scale=True` | 是（签名内再基因 scale） | 对齐 `RunMixscape` 的 `scale.data` |
@@ -307,7 +328,7 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 
 ## 预处理与簇注释
 
-PCA、邻居、Leiden、UMAP、SingleR 建立在 top `preprocess.n_hvg`（默认 **2000**）HVG 上；细胞集合 = assign 后 **QC 通过** 且已进入 AnnData 的 io 候选（single assignment ∪ zero-guide），**不是**仅 `analysis_eligible`（NT+靶向且过 `min_cells_per_target`）。`umap_annotation_cell_cycle_panel` 上下两行同一范围。
+PCA、邻居、Leiden、UMAP、SingleR / ScType 建立在 top `preprocess.n_hvg`（默认 **2000**）HVG 上；细胞集合 = assign 后 **QC 通过** 且已进入 AnnData 的 io 候选（single assignment ∪ zero-guide），**不是**仅 `analysis_eligible`（NT+靶向且过 `min_cells_per_target`）。`umap_annotation_cell_cycle_panel` 上下两行同一范围。
 
 1. 从 `layers['counts']` 对**全部基因**做文库大小归一化（默认 10000）→ `log1p`；`layers['counts']` 仍是原始计数。
 2. HVG：Seurat flavor，top 2000；去掉本物种线粒体前缀后用非线粒体基因补满。
@@ -330,5 +351,7 @@ PCA、邻居、Leiden、UMAP、SingleR 建立在 top `preprocess.n_hvg`（默认
 ### 簇注释
 
 对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）；与 Leiden 相同，覆盖全部 QC-pass 嵌入细胞。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
+
+另可并存纯 Python **ScType**（Ianevski marker 打分；`perturbseq.sctype`）：按 `sctype.tissue` 从离线 DB（默认 `data/sctype/ScTypeDB_full.tsv`；可用 `sctype.db_path` 换同格式 tsv/csv/xlsx）取正/负 marker，对 QC-pass 细胞打分后按 Leiden 簇汇总；标签 → `obs['sctype_classification']`（簇顶分 `< n_cells * low_score_fraction`，默认 0.25 → `Unknown`）；`cell_type` 不改。`sctype.enabled: false` 或未设 `tissue`（默认 `null`）→ 跳过 `UMAP/umap_sctype.png`。可选 tissue 见配置注释 / [data/sctype/README.txt](../data/sctype/README.txt)。基因符号按大写匹配（小鼠符号可与人类 marker DB 对齐）。
 
 路径与图见 [outputs.md](outputs.md)。

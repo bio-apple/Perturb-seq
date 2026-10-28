@@ -2,7 +2,7 @@
 
 从一份 DRAGEN scRNA CRISPR 二级结果出发，完成 guide 分配、细胞过滤，并按 CRISPR 模式跑 Mixscape 或 Mixscale。一次运行一个生物学样本。
 
-步骤：`io` → `assign` → `preprocess` → 分析步。`--steps all` 时：**KO → Mixscape**；**CRISPRi / CRISPRa → Mixscale**；**`other` → 仅 `io,assign,preprocess`**（不做 Mixscape / Mixscale；显式写这两步会拒绝）。KO/i/a 若命令行同时指定两者，仍可并发。图分目录 `Mixscape/`、`mixscale/` 等。成功跑完后磁盘**只保留 PNG**（不写 `checkpoints/`，不支持 `--resume`；须从 `io` 连续跑）。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)。
+步骤：`io` → `assign` → `preprocess` → 分析步。`--steps all` 时：**KO → Mixscape**；**CRISPRi / CRISPRa → Mixscale**；**`other` → 仅 `io,assign,preprocess`**（不做 Mixscape / Mixscale；显式写这两步会拒绝）。KO/i/a 若命令行同时指定两者，仍可并发。图分目录 `Mixscape/`、`mixscale/` 等。无独立 Wilcoxon DGE / E-distance / perturb 步。成功跑完后 lean cleanup：**主要保留 PNG**；`--output-dir` 与 `--input-dir` 相同时额外保护 `{sample}.scRNA.*` 与已解析的 DRAGEN 输入，避免删掉原数据（不写 `checkpoints/`，不支持 `--resume`；须从 `io` 连续跑）。细则见 [docs/](docs/README.md)、[docs/analysis.md](docs/analysis.md)、[docs/outputs.md](docs/outputs.md)。
 
 线程默认：`runtime.n_threads = max(1, CPU数//3)`，用于 OpenMP / BLAS / `scanpy.n_jobs` 与并行步进程数上限。
 
@@ -19,7 +19,7 @@ conda install -y -c conda-forge r-base=4.4.3
 Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org"); BiocManager::install(version = "3.20", ask = FALSE, update = FALSE); BiocManager::install(c("SingleR", "celldex"), version = "3.20", ask = FALSE, update = FALSE)'
 ```
 
-簇注释用 R 4.4.3 + Bioconductor 3.20 的 SingleR / celldex；`singler.enabled: false` 可跳过。celldex 首次下载参考需联网。
+簇注释：**SingleR**（R 4.4.3 + Bioconductor 3.20 / celldex；`singler.enabled: false` 可跳过；首次下载参考需联网）与纯 Python **ScType** 并存。ScType 需在 `config/config.yaml` 设 `sctype.tissue`（如 `Immune system`；`sctype.enabled` 默认 true）；离线 marker DB 默认 `data/sctype/ScTypeDB_full.tsv`；标签列 `obs['sctype_classification']`，图 `UMAP/umap_sctype.png`。未设 `tissue` 则跳过 ScType。
 
 ## 最小运行示例
 
@@ -46,13 +46,13 @@ python -m perturbseq \
 
 ## 输出概览
 
-成功结束后只保留各步 PNG：
+成功结束后磁盘以各步 PNG 为主（中间 TSV/JSON/YAML 会被 lean cleanup 删除）：
 
 | 目录 | 内容 |
 | --- | --- |
 | `qc/` | mRNA / gRNA / QC 统计图 |
-| `UMAP/` | 表达 UMAP、簇注释、细胞周期、Mixscape signature |
-| `Mixscape/` | Mixscape class / 2x2 等 |
-| `mixscale/` | Mixscale ridge / scatter |
+| `UMAP/` | 表达 UMAP、SingleR / ScType 注释、细胞周期、Mixscape signature |
+| `Mixscape/` | Mixscape class / 2x2 等（仅跑 mixscape 时） |
+| `mixscale/` | Mixscale ridge / scatter 等（仅跑 mixscale 时） |
 
-图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。
+图只写 PNG（`plotting.dpi` 默认 300）。`plotting.save_plot_data` 默认 `false`。嵌入用 **QC-pass** 细胞；Mixscape / Mixscale 用更严的 `analysis_eligible` ∪ 对照。配置与规则见 [docs/analysis.md](docs/analysis.md)，产物清单见 [docs/outputs.md](docs/outputs.md)。

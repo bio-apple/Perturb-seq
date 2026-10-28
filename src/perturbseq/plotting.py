@@ -444,9 +444,47 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
         store.skip("cells_per_target_bar", "no_targets")
         return
     shown = targets.sort_values("n_cells", ascending=False, kind="mergesort")
+    n_cells = shown["n_cells"].astype(float)
+    values = n_cells.to_numpy()
+    min_obs = float(np.min(values))
+    median_cells = float(np.median(values))
+    max_obs = float(np.max(values))
+    # Match assign: low_cells_target when n_cells < min_cells_per_target → keep ≥.
+    ge_mask = values >= float(min_cells)
+    n_ge_threshold = int(np.sum(ge_mask))
+    n_cells_ge = int(np.sum(values[ge_mask]))
+    total_cells = int(np.sum(values))
+    n_targets = int(len(shown))
     figure, axis = store._figure(width=max(8, min(24, 0.18 * len(shown))))
-    axis.bar(np.arange(len(shown)), shown["n_cells"].astype(float), color=store.palette("targeting"))
-    axis.axhline(min_cells, color=store.palette("low_power"), linestyle="--")
+    axis.bar(np.arange(len(shown)), n_cells, color=store.palette("targeting"))
+    axis.axhline(
+        min_cells,
+        color=store.palette("low_power"),
+        linestyle="--",
+        linewidth=1.0,
+        label=f"min_cells_per_target = {min_cells} (eligibility keeps n_cells ≥ {min_cells})",
+    )
+    axis.axhline(
+        min_obs,
+        color=store.palette("nt", "#7F7F7F"),
+        linestyle=":",
+        linewidth=1.0,
+        label=f"min = {min_obs:g}",
+    )
+    axis.axhline(
+        median_cells,
+        color="black",
+        linestyle="-",
+        linewidth=1.0,
+        label=f"median = {median_cells:g}",
+    )
+    axis.axhline(
+        max_obs,
+        color=store.palette("qc_failed", "#D62728"),
+        linestyle="-.",
+        linewidth=1.0,
+        label=f"max = {max_obs:g}",
+    )
     axis.set_ylabel("cells")
     if len(shown) <= 40:
         axis.set_xticks(np.arange(len(shown)), shown["target_gene"].astype(str), rotation=90)
@@ -454,13 +492,26 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
     else:
         axis.set_xticks([])
         axis.set_xlabel(f"{len(shown)} targets (incl. zeros); names and counts are in the table")
+    handles, labels = axis.get_legend_handles_labels()
+    handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
+    labels.append(f"total cells = {total_cells}")
+    handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
+    labels.append(f"targets with n_cells ≥ {min_cells}: {n_ge_threshold} / {n_targets}")
+    handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
+    labels.append(f"sum n_cells (those targets): {n_cells_ge}")
+    axis.legend(handles, labels, frameon=False, fontsize=8, loc="upper right")
     store.save(
         figure,
         "cells_per_target_bar",
         "qc",
         targets,
         "cells per target for every reference/assigned target (incl. zeros; "
-        "no analysis_eligible / min-cell filter); line is min_cells_per_target",
+        "no analysis_eligible / min-cell filter); dashed = min_cells_per_target "
+        f"(eligibility ≥ {min_cells}); "
+        f"dotted/solid/dashdot = min/median/max ({min_obs:g}/{median_cells:g}/{max_obs:g}); "
+        f"total cells = {total_cells}; "
+        f"n_cells ≥ {min_cells}: {n_ge_threshold}/{n_targets}; "
+        f"sum n_cells on those targets: {n_cells_ge}",
     )
 
 
@@ -1558,9 +1609,9 @@ def _resolve_marker_indices(
 
 
 def _cluster_annotation_column(adata: AnnData) -> str | None:
-    """Prefer SingleR labels, then cell_type, for ``cluster: annotation`` row names."""
-    skip = {"ALL", "nan", "None", "<NA>", ""}
-    for column in ("singler_label", "cell_type"):
+    """Prefer SingleR, then ScType, then cell_type, for ``cluster: annotation`` rows."""
+    skip = {"ALL", "nan", "None", "<NA>", "", "Unknown"}
+    for column in ("singler_label", "sctype_classification", "cell_type"):
         if column not in adata.obs.columns:
             continue
         values = adata.obs[column].astype(str)
@@ -1570,7 +1621,7 @@ def _cluster_annotation_column(adata: AnnData) -> str | None:
 
 
 def _cluster_display_labels(adata: AnnData) -> pd.Series:
-    """Leiden id, optionally ``{leiden}: {annotation}`` (SingleR / cell_type)."""
+    """Leiden id, optionally ``{leiden}: {annotation}`` (SingleR / ScType / cell_type)."""
     clusters = adata.obs["leiden"].astype(str)
     column = _cluster_annotation_column(adata)
     if column is None:
@@ -1710,7 +1761,7 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
     """Seurat-style marker dotplot: white panel; size=% expressed; color=average expression.
 
     Cluster rows use the same ``leiden: annotation`` labels as
-    ``marker_detection_heatmap`` (SingleR / cell_type when available).
+    ``marker_detection_heatmap`` (SingleR / ScType / cell_type when available).
     """
     name = "dotplot_markers"
     if "leiden" not in adata.obs:
