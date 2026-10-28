@@ -95,7 +95,7 @@ flowchart TD
 
 ## 命令行与配置
 
-`config/config.yaml` 只放软件默认参数。样本名、物种、目录、guide 分隔符、非靶向对照和 CRISPR 模式由命令行传入。不传 `--config` 时读默认文件；命令行覆盖同名字段。
+`config/config.yaml` 只放软件默认参数。样本名、物种、目录、guide 分隔符、非靶向对照、CRISPR 模式和 ScType 由命令行传入。不传 `--config` 时读默认文件；命令行覆盖同名字段。ScType **不在** YAML 中配置。
 
 出现代码不读取的配置键会失败（`未识别的配置键` + 路径）。`labels.flag_guides_above` 写出即拒绝；`labels.guides_per_cell` 须改为 `labels.targets_per_cell`。
 
@@ -109,6 +109,9 @@ flowchart TD
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
 | `--max-mito-frac` | 覆盖默认 `0.2` |
 | `--nt-control` | 设计 NT 名；空或数据中无可用 NT → 临时 `zero_guide` |
+| `--sctype-tissue` | 启用 ScType；argparse choices 来自离线 DB（如 `Adrenal`、`Immune system`、`Lung`…）；未传则跳过 |
+| `--sctype-db-path` | 可选 marker DB 路径（tsv/csv/xlsx）；默认 `data/sctype/ScTypeDB_full.tsv` |
+| `--sctype-low-score-fraction` | 可选；簇顶分 `< n_cells * fraction` → `Unknown`（默认 0.25） |
 | `--config` | 软件默认 YAML；缺省 `config/config.yaml` |
 
 常用 YAML 键（完整默认见 `config/config.yaml`）：
@@ -122,7 +125,6 @@ flowchart TD
 | `preprocess.n_hvg` / `n_pcs` / `leiden_resolution` | HVG / PCA / Leiden（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致） |
 | `mixscape.*` / `mixscale.*` | 各自 DE 门与算法参数（`logfc_threshold` 默认 0.1 等） |
 | `singler.enabled` | `false` 跳过 SingleR 与组合注释图 |
-| `sctype.enabled` / `tissue` / `db_path` / `low_score_fraction` | ScType；**须设 `tissue`** 才跑；`db_path` 默认仓库 `data/sctype/ScTypeDB_full.tsv` |
 | `runtime.n_threads` | 可选；默认 `max(1, CPU//3)` |
 | `plotting.dpi` / `save_plot_data` | 图 DPI；`save_plot_data` 默认 `false` |
 
@@ -352,6 +354,6 @@ PCA、邻居、Leiden、UMAP、SingleR / ScType 建立在 top `preprocess.n_hvg`
 
 对 Leiden 簇均值表达跑 R SingleR + celldex（小鼠 `MouseRNAseqData`，人类 `HumanPrimaryCellAtlasData`，`label.main`）；与 Leiden 相同，覆盖全部 QC-pass 嵌入细胞。标签 → `obs['singler_label']`；`cell_type` 不改。`singler.enabled: false` → 跳过组合图 `umap_annotation_cell_cycle_panel`（原因 `singler_disabled`）。
 
-另可并存纯 Python **ScType**（Ianevski marker 打分；`perturbseq.sctype`）：按 `sctype.tissue` 从离线 DB（默认 `data/sctype/ScTypeDB_full.tsv`；可用 `sctype.db_path` 换同格式 tsv/csv/xlsx）取正/负 marker，对 QC-pass 细胞打分后按 Leiden 簇汇总；标签 → `obs['sctype_classification']`（簇顶分 `< n_cells * low_score_fraction`，默认 0.25 → `Unknown`）；`cell_type` 不改。`sctype.enabled: false` 或未设 `tissue`（默认 `null`）→ 跳过 `UMAP/umap_sctype.png`。可选 tissue 见配置注释 / [data/sctype/README.txt](../data/sctype/README.txt)。基因符号按大写匹配（小鼠符号可与人类 marker DB 对齐）。
+另可并存纯 Python **ScType**（Ianevski marker 打分；`perturbseq.sctype`）：由命令行 `--sctype-tissue` 启用（choices 来自离线 DB）；可选 `--sctype-db-path`（默认 `data/sctype/ScTypeDB_full.tsv`；同格式 tsv/csv/xlsx）、`--sctype-low-score-fraction`（默认 0.25）。按 tissue 取正/负 marker，对 QC-pass 细胞打分后按 Leiden 簇汇总；标签 → `obs['sctype_classification']`（簇顶分 `< n_cells * fraction` → `Unknown`）；`cell_type` 不改。未传 `--sctype-tissue` → 跳过 `UMAP/umap_sctype.png`。可选 tissue、自定义 DB 列要求与来源说明见根目录 [README.md](../README.md)。基因符号按大写匹配（小鼠符号可与人类 marker DB 对齐）。
 
 路径与图见 [outputs.md](outputs.md)。

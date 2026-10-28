@@ -246,9 +246,13 @@ def write_preprocess_figures(
         store, adata, control_values=control_values, control_title=control_title
     )
     sctype_name = "umap_sctype"
-    sctype_cfg = config.get("sctype", {})
-    if sctype_cfg.get("enabled", True) is False:
-        store.skip(sctype_name, "sctype_disabled")
+    sctype_cfg = config.get("sctype") if isinstance(config.get("sctype"), dict) else {}
+    sctype_tissue = sctype_cfg.get("tissue")
+    sctype_requested = bool(
+        sctype_cfg.get("enabled") and isinstance(sctype_tissue, str) and sctype_tissue.strip()
+    )
+    if not sctype_requested:
+        store.skip(sctype_name, "sctype_not_requested")
     elif "X_umap" not in adata.obsm or "leiden" not in adata.obs:
         store.skip(sctype_name, "missing_fields")
     else:

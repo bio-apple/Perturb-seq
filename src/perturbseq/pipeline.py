@@ -65,6 +65,7 @@ from perturbseq.mixscale import run_mixscale, write_mixscale_figures
 from perturbseq.mixscape import run_mixscape, write_mixscape_figures
 from perturbseq.outputs import cleanup_lean_outputs
 from perturbseq.preprocess import preprocess, write_preprocess_figures
+from perturbseq.sctype import sctype_tissue_choices
 
 STEPS = [
     "io",
@@ -162,6 +163,32 @@ def main(argv: list[str] | None = None) -> None:
             "或从 io 起的逗号分隔步骤（other 不可含 mixscape/mixscale；无 checkpoints / --resume）"
         ),
     )
+    tissue_choices = sctype_tissue_choices()
+    parser.add_argument(
+        "--sctype-tissue",
+        default=None,
+        choices=tissue_choices,
+        metavar="TISSUE",
+        help=(
+            "启用 ScType 并指定组织（choices 来自离线 ScTypeDB）。"
+            "未传则跳过 ScType。含空格时请加引号，例如 --sctype-tissue 'Immune system'。"
+            f"可选: {', '.join(tissue_choices)}"
+        ),
+    )
+    parser.add_argument(
+        "--sctype-db-path",
+        default=None,
+        help="ScType marker DB 路径（tsv/csv/xlsx）。默认仓库 data/sctype/ScTypeDB_full.tsv。",
+    )
+    parser.add_argument(
+        "--sctype-low-score-fraction",
+        type=float,
+        default=None,
+        help=(
+            "ScType 低分簇阈值：顶分 < n_cells * fraction → Unknown。"
+            "仅在指定 --sctype-tissue 时生效；默认 0.25。"
+        ),
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     config_path = args.config or software_config_path()
@@ -183,6 +210,9 @@ def main(argv: list[str] | None = None) -> None:
             "max_mito_frac": args.max_mito_frac,
             "min_genes": args.min_genes,
             "max_genes": args.max_genes,
+            "sctype_tissue": args.sctype_tissue,
+            "sctype_db_path": args.sctype_db_path,
+            "sctype_low_score_fraction": args.sctype_low_score_fraction,
         },
     )
     validate_config(config)

@@ -161,6 +161,20 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
     perturb = config.setdefault("perturb", {})
     if isinstance(perturb, dict):
         perturb["cell_type_key"] = cell_type_key
+
+    # ScType is CLI-only; discard any YAML sctype block.
+    config.pop("sctype", None)
+    sctype_tissue = _blank_to_none(customer.get("sctype_tissue"))
+    if sctype_tissue:
+        fraction = customer.get("sctype_low_score_fraction")
+        if fraction is None:
+            fraction = 0.25
+        config["sctype"] = {
+            "enabled": True,
+            "tissue": sctype_tissue,
+            "db_path": _blank_to_none(customer.get("sctype_db_path")),
+            "low_score_fraction": fraction,
+        }
     return config
 
 

@@ -60,7 +60,7 @@
 | `qc/variable_features.png`、`pca_elbow.png`、`pca_scatter.png` | HVG / PCA |
 | `qc/marker_detection_heatmap.png`、`dotplot_markers.png` | marker；白底；行=注释簇名；dotplot 为 Seurat 式 Percent/Average 双图例 |
 | `UMAP/umap_cell_type.png` | 真实细胞类型（有注释时） |
-| `UMAP/umap_sctype.png` | ScType 注释（`obs['sctype_classification']`；需 `sctype.enabled` 且设置 `tissue`） |
+| `UMAP/umap_sctype.png` | ScType 注释（`obs['sctype_classification']`；需命令行 `--sctype-tissue`） |
 | `UMAP/umap_annotation_cell_cycle_panel.png` | 2 行组合（QC-pass 嵌入全细胞，非仅 analysis_eligible）：上行 Leiden + SingleR；下行 Perturbed / 对照 / Cell Cycle；`singler.enabled: false` 时跳过 |
 
 ### mixscape → `Mixscape/` + `UMAP/`

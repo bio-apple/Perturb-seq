@@ -19,7 +19,9 @@ conda install -y -c conda-forge r-base=4.4.3
 Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cloud.r-project.org"); BiocManager::install(version = "3.20", ask = FALSE, update = FALSE); BiocManager::install(c("SingleR", "celldex"), version = "3.20", ask = FALSE, update = FALSE)'
 ```
 
-簇注释：**SingleR**（R 4.4.3 + Bioconductor 3.20 / celldex；`singler.enabled: false` 可跳过；首次下载参考需联网）与纯 Python **ScType** 并存。ScType 需在 `config/config.yaml` 设 `sctype.tissue`（如 `Immune system`；`sctype.enabled` 默认 true）；离线 marker DB 默认 `data/sctype/ScTypeDB_full.tsv`；标签列 `obs['sctype_classification']`，图 `UMAP/umap_sctype.png`。未设 `tissue` 则跳过 ScType。
+簇注释：**SingleR**（R 4.4.3 + Bioconductor 3.20 / celldex；`singler.enabled: false` 可跳过；首次下载参考需联网）与纯 Python **ScType** 并存。ScType 仅 CLI（不在 `config.yaml`）：传 `--sctype-tissue` 启用（argparse choices 来自离线 DB）；可选 `--sctype-db-path`、`--sctype-low-score-fraction`（默认 0.25，簇顶分过低 → `Unknown`）。默认 DB：`data/sctype/ScTypeDB_full.tsv`（官方 ScTypeDB，GPL-3.0；[上游](https://github.com/IanevskiAleksandr/sc-type) xlsx 转 tsv，免 Excel 依赖）；产物 `obs['sctype_classification']`、`UMAP/umap_sctype.png`（preprocess）。未传 `--sctype-tissue` 则跳过。
+
+可选 tissue：`Adrenal`、`Brain`、`Eye`、`Heart`、`Hippocampus`、`Immune system`、`Intestine`、`Kidney`、`Liver`、`Lung`、`Muscle`、`Pancreas`、`Placenta`、`Spleen`、`Stomach`、`Thymus`。自定义 DB 须含列 `tissueType`、`cellName`、`geneSymbolmore1`、`geneSymbolmore2`（tsv/csv/xlsx，经 `--sctype-db-path`）。例如：`--sctype-tissue 'Immune system'` 或 `--sctype-tissue Lung --sctype-low-score-fraction 0.25`。
 
 ## 最小运行示例
 
@@ -41,6 +43,9 @@ python -m perturbseq \
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a` / `other`（默认 `KO`） |
 | `--steps` | 默认 `all`：KO→mixscape；i/a→mixscale；other→仅至 preprocess（须从 `io` 起；KO/i/a 显式同写两者时可并行） |
+| `--sctype-tissue` | 启用 ScType；choices 来自 `data/sctype/ScTypeDB_full.tsv`（如 `'Immune system'`）；未传则跳过 |
+| `--sctype-db-path` | 可选自定义 marker DB（tsv/csv/xlsx） |
+| `--sctype-low-score-fraction` | 可选；低分簇 → `Unknown`（默认 0.25） |
 | 基因数 / mito | 默认 200–6000、mito≥20% 剔除；可用 `--min-genes` / `--max-genes` / `--max-mito-frac` 覆盖 |
 | QC 指标 | `nCount` / `nFeature` / `percent.mt`（`nCount` 只作图，不按 UMI 绝对阈值过滤细胞） |
 

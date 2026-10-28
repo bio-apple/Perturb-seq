@@ -20,6 +20,25 @@ SCTYPE_OBS_COLUMN = "sctype_classification"
 SCTYPE_IMPLEMENTATION = "python ScType (Ianevski scoring)"
 _DB_COLUMNS = ("tissueType", "cellName", "geneSymbolmore1", "geneSymbolmore2")
 _UNKNOWN = "Unknown"
+# Fallback when the bundled DB cannot be read at CLI startup (must match ScTypeDB_full.tsv).
+SCTYPE_TISSUE_FALLBACK = (
+    "Adrenal",
+    "Brain",
+    "Eye",
+    "Heart",
+    "Hippocampus",
+    "Immune system",
+    "Intestine",
+    "Kidney",
+    "Liver",
+    "Lung",
+    "Muscle",
+    "Pancreas",
+    "Placenta",
+    "Spleen",
+    "Stomach",
+    "Thymus",
+)
 
 
 def default_sctype_db_path() -> Path:
@@ -41,6 +60,15 @@ def list_sctype_tissues(db_path: Path | None = None) -> list[str]:
     return sorted(table["tissueType"].astype(str).unique().tolist())
 
 
+def sctype_tissue_choices(db_path: Path | None = None) -> tuple[str, ...]:
+    """Tissue choices for argparse; prefer live DB, else bundled fallback list."""
+    try:
+        tissues = list_sctype_tissues(db_path)
+    except Exception:
+        return SCTYPE_TISSUE_FALLBACK
+    return tuple(tissues) if tissues else SCTYPE_TISSUE_FALLBACK
+
+
 def annotate_sctype(adata: AnnData, config: dict[str, Any]) -> pd.DataFrame:
     """Assign ScType labels to Leiden clusters; store ``obs['sctype_classification']``.
 
@@ -50,7 +78,9 @@ def annotate_sctype(adata: AnnData, config: dict[str, Any]) -> pd.DataFrame:
     settings = config.get("sctype", {})
     tissue = settings.get("tissue")
     if tissue is None or not str(tissue).strip():
-        raise ValueError("sctype.tissue 未设置（例如 Immune system、Lung、Brain）。")
+        raise ValueError(
+            "ScType tissue 未设置（请传 --sctype-tissue，例如 Immune system、Lung、Brain）。"
+        )
     tissue = str(tissue).strip()
     fraction = settings.get("low_score_fraction", 0.25)
     if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not (
