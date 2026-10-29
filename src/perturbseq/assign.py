@@ -50,43 +50,51 @@ class GuideReferenceError(ValueError):
         super().__init__(reason + ": " + ", ".join(self.guide_ids))
 
 
-def name_token_width(reference: pd.DataFrame) -> int:
-    widths = reference["name"].astype(str).map(lambda value: value.count("|") + 1)
+def name_token_width(reference: pd.DataFrame, separator: str) -> int:
+    """Longest guide name measured in ``separator`` tokens."""
+    widths = reference["name"].astype(str).map(lambda value: value.count(separator) + 1)
     return int(widths.max()) if len(widths) else 1
 
 
-def segment_feature_call(feature_call: str, names: set[str], max_tokens: int) -> list[str]:
-    """Split a DRAGEN feature_call on the guide separator.
+def segment_feature_call(
+    feature_call: str, names: set[str], max_tokens: int, separator: str
+) -> list[str]:
+    """Split a DRAGEN feature_call on ``separator``.
 
-    Guide names may themselves contain '|'. The longest reference name that
-    consumes the next tokens is taken, so a name is not cut at its internal pipe.
+    Guide names may themselves contain ``separator``. The longest reference name
+    that consumes the next tokens is taken, so a name is not cut at an internal
+    separator.
     """
+    if separator == "":
+        raise ValueError("guide 分隔符不能为空。")
     if feature_call == "":
         return []
-    tokens = feature_call.split("|")
+    tokens = feature_call.split(separator)
     parts: list[str] = []
     index = 0
     while index < len(tokens):
         matched: str | None = None
         upper = min(max_tokens, len(tokens) - index)
         for width in range(upper, 0, -1):
-            candidate = "|".join(tokens[index : index + width])
+            candidate = separator.join(tokens[index : index + width])
             if candidate in names:
                 matched = candidate
                 index += width
                 break
         if matched is None:
-            parts.append("|".join(tokens[index:]))
+            parts.append(separator.join(tokens[index:]))
             break
         parts.append(matched)
     return parts
 
 
-def parse_transcripts(raw: str) -> list[float]:
+def parse_transcripts(raw: str, separator: str) -> list[float]:
+    if separator == "":
+        raise ValueError("guide 分隔符不能为空。")
     if raw == "":
         return []
     values = []
-    for field in raw.split("|"):
+    for field in raw.split(separator):
         if field == "":
             raise ValueError("num_transcripts 含空字段。")
         try:
@@ -311,6 +319,7 @@ def annotate_assignments(
     nt_control: str,
     multi_guide_policy: str,
     matrix_barcodes: set[str],
+    guide_separator: str,
     targets_per_cell: int = 1,
     nt_labels: Collection[str] | None = None,
 ) -> pd.DataFrame:
@@ -329,7 +338,7 @@ def annotate_assignments(
     labels = _normalize_nt_labels(nt_labels) or _normalize_nt_labels(nt_control)
     catalog = validate_guide_targets(reference, nt_control=nt_control, nt_labels=labels)
     names = set(catalog["guide_name"])
-    max_tokens = name_token_width(reference)
+    max_tokens = name_token_width(reference, guide_separator)
     shared_names = set(catalog.loc[catalog["guide_name"].duplicated(keep=False), "guide_name"])
     target_by_name = target_by_guide_name(catalog)
     id_by_unique_name = {}
@@ -340,8 +349,8 @@ def annotate_assignments(
     rows: list[dict[str, Any]] = []
     for record in assignments.itertuples(index=False):
         call = str(record.feature_call)
-        parts = segment_feature_call(call, names, max_tokens)
-        transcripts = parse_transcripts(str(record.num_transcripts))
+        parts = segment_feature_call(call, names, max_tokens, guide_separator)
+        transcripts = parse_transcripts(str(record.num_transcripts), guide_separator)
         known = all(part in names for part in parts)
         aligned = len(parts) == int(record.num_features) and len(transcripts) == len(parts)
         barcode = str(record.cell_barcode)
@@ -556,6 +565,7 @@ def multi_guide_composition(
     *,
     nt_control: str,
     reference: pd.DataFrame,
+    guide_separator: str,
     nt_labels: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Classify true multi-target calls before they are dropped.
@@ -566,11 +576,11 @@ def multi_guide_composition(
     catalog = validate_guide_targets(reference, nt_control=nt_control, nt_labels=labels)
     target_by_name = target_by_guide_name(catalog)
     names = set(catalog["guide_name"])
-    max_tokens = name_token_width(reference)
+    max_tokens = name_token_width(reference, guide_separator)
     counts = {MULTI_ALL_NT: 0, MULTI_SAME_TARGET: 0, MULTI_MIXED_NT: 0, MULTI_DIFFERENT_TARGETS: 0}
     multi = annotated[annotated["assignment_status"].astype(str).eq(STATUS_MULTI)]
     for record in multi.itertuples(index=False):
-        parts = segment_feature_call(str(record.feature_call), names, max_tokens)
+        parts = segment_feature_call(str(record.feature_call), names, max_tokens, guide_separator)
         if len(parts) < 2 or any(part not in names for part in parts):
             continue
         targets = []

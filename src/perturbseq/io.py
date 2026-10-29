@@ -124,6 +124,7 @@ def load_sample(
     multi_guide_policy: str,
     targets_per_cell: int = 1,
     mito_prefix: str,
+    guide_separator: str,
     nt_labels: set[str] | None = None,
 ) -> tuple[AnnData, pd.DataFrame, dict[str, object]]:
     """Stream gene and CRISPR counts for cells that can enter QC.
@@ -181,6 +182,7 @@ def load_sample(
         nt_labels=nt_labels,
         multi_guide_policy=multi_guide_policy,
         targets_per_cell=targets_per_cell,
+        guide_separator=guide_separator,
         matrix_barcodes=set(barcodes.astype(str)),
     )
     if only_matrix:

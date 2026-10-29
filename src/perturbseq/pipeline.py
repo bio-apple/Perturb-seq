@@ -511,6 +511,7 @@ def _step_io(folder: Path, config: dict[str, Any]):
             multi_guide_policy=config["labels"]["multi_guide_policy"],
             targets_per_cell=int(config["labels"].get("targets_per_cell", 1)),
             mito_prefix=mito_prefix(config),
+            guide_separator=str(config["input"]["guide_separator"]),
         )
     except InputMismatch as exc:
         _write_barcode_differences(folder, exc.only_matrix, exc.only_assignment)
@@ -547,6 +548,7 @@ def _step_io(folder: Path, config: dict[str, Any]):
         nt_control=config["labels"]["nt_control"],
         nt_labels=nt_labels_from_config(config),
         reference=reference,
+        guide_separator=str(config["input"]["guide_separator"]),
     )
     return adata
 
