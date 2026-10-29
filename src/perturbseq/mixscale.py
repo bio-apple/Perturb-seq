@@ -18,7 +18,7 @@ from scipy import sparse
 
 from perturbseq.assign import control_cell_mask, perturbation_analysis_mask
 from perturbseq.config import DEFAULT_SIGNATURE_NDIMS, control_spec
-from perturbseq.de_gate import _gene_lists, differential_gene_gate, stamp_control_label
+from perturbseq.de_gate import differential_gene_gate, stamp_control_label
 
 # Mixscale tutorial CalcPerturbSig uses ndims=40 / num.neighbors=20; this pipeline
 # keeps signature width aligned with preprocess PCA (DEFAULT_SIGNATURE_NDIMS=30).
@@ -52,7 +52,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     """
     from pertpy.tools import Mixscale
 
-    from perturbseq.mixscape import prepare_signature_dims, real_cell_type_split
+    from perturbseq.mixscape import neighbor_n_dims, real_cell_type_split, require_unscaled_log1p
 
     spec = control_spec(config)
     control = spec["control_label"]
@@ -70,11 +70,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         stamp_control_label(adata.obs, control_cells, "target_gene", control)
     # Embedding may include all QC-pass cells; scoring stays on analysis_eligible ∪ control.
     pert_mask = perturbation_analysis_mask(adata.obs, spec)
-    if "highly_variable" not in adata.var:
-        raise ValueError("Mixscale 需要先完成高变基因选择。")
-    hvg = adata.var["highly_variable"].to_numpy()
-    if int(np.sum(hvg)) < 2:
-        raise ValueError("高变基因不足，无法计算 Mixscale perturbation signature。")
+    require_unscaled_log1p(adata, "Mixscale")
 
     params = de_gate_parameters(config)
     gate_adata = adata[pert_mask] if not bool(np.all(pert_mask)) else adata
@@ -88,7 +84,6 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     )
     adata.uns["mixscale_de_gate"] = gate
     adata.uns["mixscale_de_genes"] = gene_table
-    gene_lists = _gene_lists(gene_table)
     passed = set(gate.loc[gate["passed"].astype(bool), "target_gene"].astype(str))
     passed.discard(control)
     ready = set(passed)
@@ -98,17 +93,19 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     min_de_genes = int(params["min_de_genes"])
     seed = int(config["runtime"]["seed"])
     mixscale_settings = config.get("mixscale", {})
+    split_by_used = ""
 
     if ready:
         keep = labels.isin(ready | {control}).to_numpy() & pert_mask
-        work = adata[keep, hvg].copy()
+        # Same input contract as Mixscape: unscaled log1p X, all genes.
+        work = adata[keep].copy()
         requested_dims = int(
             mixscale_settings.get(
                 "n_dims",
                 config.get("mixscape", {}).get("n_dims", DEFAULT_SIGNATURE_NDIMS),
             )
         )
-        n_dims = prepare_signature_dims(work, requested_dims, seed)
+        n_dims = neighbor_n_dims(work, requested_dims)
         n_nt = int((work.obs["target_gene"].astype(str) == control).sum())
         if n_nt < 1:
             raise ValueError("没有对照细胞，无法计算 Mixscale perturbation signature。")
@@ -120,6 +117,7 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         )
         n_neighbors = min(requested_neighbors, n_nt, max(work.n_obs - 1, 1))
         split_by = real_cell_type_split(work, config)
+        split_by_used = split_by or ""
         signature_args: dict[str, Any] = {
             "pert_key": "target_gene",
             "control": control,
@@ -128,26 +126,16 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
         }
         if split_by:
             signature_args["split_by"] = split_by
-        # Tutorial: CalcPerturbSig → PRTB assay; here write Mixscale-owned layer.
+        # perturbation_signature writes X_pert from unscaled X. mixscale scores
+        # that layer and finds DE genes on X (de_layer=None). de_genes_by_target
+        # is omitted so the DE test is not skipped.
+        # https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html
         Mixscale().perturbation_signature(work, **signature_args)
-        work.layers[MIXSCALE_LAYER] = work.layers["X_pert"]
-        if "X_pert" in work.layers:
-            del work.layers["X_pert"]
-        _write_mixscale_signature_rows(adata, work)
-
-        available = set(work.var_names.astype(str))
-        supplied = {
-            gene: [name for name in gene_lists.get(gene, []) if name in available][
-                : int(params["max_de_genes"])
-            ]
-            for gene in ready
-        }
-        # scale=True: gene-scale signature, then z-score the projection vs control.
-        # test_method omitted: use pertpy Mixscale.mixscale default (pertpy 1.4.0: wilcoxon).
         mix_args: dict[str, Any] = {
             "pert_key": "target_gene",
             "control": control,
-            "layer": MIXSCALE_LAYER,
+            "layer": "X_pert",
+            "de_layer": None,
             "min_de_genes": min_de_genes,
             "max_de_genes": int(params["max_de_genes"]),
             "logfc_threshold": float(params["logfc_threshold"]),
@@ -156,9 +144,13 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
             "random_state": seed,
             "scale": True,
         }
-        if supplied and all(len(genes) >= min_de_genes for genes in supplied.values()):
-            mix_args["de_genes_by_target"] = supplied
+        if split_by:
+            mix_args["split_by"] = split_by
         Mixscale().mixscale(work, **mix_args)
+        if "X_pert" not in work.layers:
+            raise ValueError("Mixscale perturbation_signature 没有写入 X_pert。")
+        work.layers[MIXSCALE_LAYER] = work.layers.pop("X_pert")
+        _write_mixscale_signature_rows(adata, work)
         written = pd.Series(work.obs["mixscale_score"].to_numpy(dtype=float), index=work.obs_names)
         scored_targets = {str(gene) for gene in work.uns.get("mixscale", {})}
         used = work.uns.get("mixscale_de_genes", {})
@@ -177,16 +169,16 @@ def run_mixscale(adata: AnnData, config: dict[str, Any]) -> AnnData:
     adata.uns["mixscale_parameters"] = {
         "layer": MIXSCALE_LAYER,
         "control": control,
-        "split_by": "",
+        "split_by": split_by_used,
         "meaning": "perturbation_strength_not_editing_success",
         "scale": True,
-        # Call omits test_method so pertpy Mixscale.mixscale default applies.
-        "test_method": "pertpy_default",
+        "test_method": "wilcoxon",
         "independent_of_mixscape": True,
-        "reference": "https://satijalab.github.io/Mixscale/",
+        "reference": "https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html",
         "control_relative": (
-            f"scores on {MIXSCALE_LAYER} (Mixscale-owned CalcPerturbSig); "
-            "projection z-scored to the control distribution; control cells get score 0"
+            "perturbation_signature on unscaled log1p X (all genes) writes X_pert; "
+            "mixscale(layer='X_pert', de_layer=None) scores that signature and "
+            f"detects DE on X; stored as {MIXSCALE_LAYER}"
         ),
         **params,
     }

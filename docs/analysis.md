@@ -296,12 +296,12 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 | 步骤 | 输入 | 相对对照？ | 口径 |
 | --- | --- | --- | --- |
 | 预处理 `X` | counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
-| 表达 PCA / 邻居 / Leiden / UMAP / SingleR / ScType | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间；**不用于**扰动分类 |
-| Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide` |
-| Mixscape `X_pert` | pertpy `perturbation_signature`：减 k 个最近对照邻域均值（线性空间取均值再 `log1p`） | 是 | 对齐 Seurat `CalcPerturbSig`；在未 scale 的 log1p 上算 |
-| Mixscape 分类 GMM | `X_pert` 上 DE 基因，`scale=True` | 是（签名内再基因 scale） | 对齐 `RunMixscape` 的 `scale.data` |
+| 表达 PCA / 邻居 / Leiden / UMAP / SingleR / ScType | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间。UMAP/Leiden 不是扰动分类坐标。已有 `X_pca` 会被 pertpy 用作近邻搜索（`use_rep=None`） |
+| Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide`。只决定哪些靶进入 pertpy |
+| Mixscape `X_pert` | pertpy `perturbation_signature` 读**全部基因**的未 scale `log1p`（`.X`） | 是 | 不先切 HVG，也不在调用前 z-score `X`。近邻用已有 `X_pca`，否则由 pertpy 按默认参数计算 |
+| Mixscape 分类 | `mixscape(layer="X_pert", de_layer=None)` | 是 | DE 在 `.X`；GMM 在 `X_pert`，`scale=True` 只作用在签名里的 DE 基因 |
 | Mixscape signature UMAP | `X_pert` → PCA（`zero_center=True`，不基因 scale）→ UMAP | 是 | 坐标在 `X_umap_mixscape` |
-| Mixscale | 自算 `X_pert_mixscale`，`scale=True`；对照细胞分数为 0 | 是 | 与 Mixscape 步骤独立；连续扰动强度 |
+| Mixscale | 先 `perturbation_signature` 写 `X_pert`，再 `mixscale(layer="X_pert", de_layer=None)` | 是 | DE 在 `.X`，不传 `de_genes_by_target`。分数层随后存成 `X_pert_mixscale` |
 | Mixscape 2×2 热图 | `X`（RNA log1p）行 z-score；基因选法对齐 Seurat MixscapeHeatmap | 仅作图 | 不用 `X_pert`；块内按后验排序 |
 | 其他热图着色 | 展示时行 z-score | 仅作图 | 不改 `X` / `X_pert` |
 

@@ -53,8 +53,35 @@ def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def signature_n_dims(n_obs: int, n_vars: int, requested: int = DEFAULT_SIGNATURE_NDIMS) -> int:
-    """CalcPerturbSig ndims. Cap only when the matrix is smaller than the request."""
-    return max(1, min(int(requested), int(n_obs) - 1, int(n_vars)))
+    """Cap ``n_dims`` by the representation width and the number of cells."""
+    return max(1, min(int(requested), max(int(n_obs) - 1, 1), int(n_vars)))
+
+
+def neighbor_n_dims(work: AnnData, requested: int) -> int:
+    """``n_dims`` for ``perturbation_signature``.
+
+    Does not scale ``X`` and does not replace ``X_pca``. pertpy uses an existing
+    ``X_pca`` for neighbors (``use_rep=None``) and otherwise computes PCA with
+    its default parameters. The signature itself is unscaled ``X``.
+    """
+    if "X_pca" in work.obsm:
+        width = int(work.obsm["X_pca"].shape[1])
+    else:
+        width = int(work.n_vars)
+    return signature_n_dims(work.n_obs, width, requested)
+
+
+def require_unscaled_log1p(adata: AnnData, step: str) -> None:
+    """pertpy subtracts ``expm1(X)``; scaled or raw counts are the wrong input."""
+    if "log1p" not in adata.uns:
+        raise ValueError(f"{step} 需要未 scale 的 log1p 矩阵（adata.X）。")
+    matrix = adata.X
+    if sparse.issparse(matrix):
+        values = matrix.data
+    else:
+        values = np.asarray(matrix).ravel()
+    if values.size and float(np.min(values)) < 0:
+        raise ValueError(f"{step} 的 adata.X 含负值，不能把 scale 后的矩阵交给 perturbation_signature。")
 
 
 def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
@@ -92,11 +119,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     pert_mask = perturbation_analysis_mask(adata.obs, spec)
     mixscape_settings = config.get("mixscape", {})
     seed = int(config["runtime"]["seed"])
-    if "highly_variable" not in adata.var:
-        raise ValueError("Mixscape 需要先完成高变基因选择。")
-    hvg = adata.var["highly_variable"].to_numpy()
-    if int(np.sum(hvg)) < 2:
-        raise ValueError("高变基因不足，无法计算 perturbation signature。")
+    require_unscaled_log1p(adata, "Mixscape")
     params = mixscape_gate_parameters(config)
     gate_adata = adata[pert_mask] if not bool(np.all(pert_mask)) else adata
     gate, gene_table = differential_gene_gate(
@@ -141,9 +164,11 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         }
         return adata
     keep = labels.isin(passed | {control}).to_numpy() & pert_mask
-    work = adata[keep, hvg].copy()
+    # Full unscaled log1p matrix. pertpy reads X for the signature and for DE,
+    # and X_pert for the GMM. Do not subset to HVGs or scale X first.
+    work = adata[keep].copy()
     requested_dims = int(mixscape_settings.get("n_dims", DEFAULT_SIGNATURE_NDIMS))
-    n_dims = prepare_signature_dims(work, requested_dims, seed)
+    n_dims = neighbor_n_dims(work, requested_dims)
     n_nt = int((work.obs["target_gene"].astype(str) == control).sum())
     if n_nt < 1:
         raise ValueError(f"没有对照细胞（{control}），无法计算 perturbation signature。")
@@ -167,9 +192,8 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
     model = Mixscape()
     model.perturbation_signature(work, **signature_args)
     embedding, umap_status = _signature_umap(work, seed, n_dims)
-    # scale=True matches Seurat RunMixscape's scale.data on the PRTB assay for GMM.
-    # Do not add a second gene-level Z-score versus pooled NT/zero_guide means on X.
-    # test_method omitted: use pertpy Mixscape.mixscape default (pertpy 1.4.0: wilcoxon).
+    # layer="X_pert" scores the signature; de_layer=None runs DE on unscaled X.
+    # https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html
     mix_args: dict[str, Any] = {
         "pert_key": "target_gene",
         "control": control,
@@ -227,9 +251,9 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "fine_mode": False,
         "scale": True,
         "control_relative": (
-            "X_pert = log1p(mean of k control neighbors in linear space) - cell log1p; "
-            "GMM runs on gene-scaled X_pert DE genes (pertpy scale=True); "
-            "signature UMAP PCA zero-centers X_pert without a pooled-NT Z-score layer"
+            "perturbation_signature on unscaled log1p X (all genes); "
+            "neighbors from existing X_pca when present (use_rep=None); "
+            "mixscape layer=X_pert, de_layer=None (DE on X), scale=True"
         ),
         **params,
     }
@@ -256,34 +280,6 @@ def real_cell_type_split(adata: AnnData, config: dict[str, Any]) -> str | None:
     if len(labels - {"ALL", "nan", "None", "", "<NA>"}) < 2:
         return None
     return key
-
-
-def prepare_signature_dims(work: AnnData, requested: int, seed: int) -> int:
-    """Width of the PCA used to find NT neighbors.
-
-    Pertpy uses ``X_pca`` when the gene count exceeds Scanpy's PC threshold.
-    A shorter preprocess PCA is rebuilt on a z-scored copy so the search can use
-    the requested width (aligned with ``preprocess.n_pcs``, default 30).
-    ``work.X`` stays log-normalized: the signature itself is the difference of
-    unscaled expression. The cap applies only when the matrix itself is smaller.
-    """
-    import scanpy as sc
-
-    n_dims = signature_n_dims(work.n_obs, work.n_vars, requested)
-    if work.n_vars <= int(sc.settings.N_PCS):
-        return n_dims
-    pca_limit = min(work.n_obs - 1, work.n_vars - 1)
-    target = min(n_dims, pca_limit)
-    if target < 2:
-        return n_dims
-    have = int(work.obsm["X_pca"].shape[1]) if "X_pca" in work.obsm else 0
-    if have < target:
-        scaled = work.copy()
-        sc.pp.scale(scaled)
-        sc.pp.pca(scaled, n_comps=target, random_state=seed)
-        work.obsm["X_pca"] = np.asarray(scaled.obsm["X_pca"])
-        have = int(work.obsm["X_pca"].shape[1])
-    return min(n_dims, have)
 
 
 def _signature_umap(work: AnnData, seed: int, n_dims: int) -> tuple[np.ndarray | None, str]:
