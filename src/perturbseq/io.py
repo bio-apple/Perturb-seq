@@ -123,8 +123,8 @@ def load_sample(
     feature_type_crispr: str,
     multi_guide_policy: str,
     targets_per_cell: int = 1,
-    min_guide_umi: float | None,
     mito_prefix: str,
+    nt_labels: set[str] | None = None,
 ) -> tuple[AnnData, pd.DataFrame, dict[str, object]]:
     """Stream gene and CRISPR counts for cells that can enter QC.
 
@@ -178,9 +178,9 @@ def load_sample(
         assignments,
         reference,
         nt_control=nt_control,
+        nt_labels=nt_labels,
         multi_guide_policy=multi_guide_policy,
         targets_per_cell=targets_per_cell,
-        min_guide_umi=min_guide_umi,
         matrix_barcodes=set(barcodes.astype(str)),
     )
     if only_matrix:
@@ -306,7 +306,6 @@ def _no_guide_rows(barcodes: list[str]) -> pd.DataFrame:
                 "target_gene": pd.NA,
                 "assignment_status": STATUS_NO_GUIDE,
                 "multi_guide_subtype": pd.NA,
-                "guide_umi_pass": True,
                 "perturbation_status": STATUS_NO_GUIDE,
                 "shared_guide_name": False,
                 "in_matrix": True,

@@ -216,7 +216,6 @@ def write_preprocess_figures(
         draw_dotplot_markers,
         draw_marker_detection_heatmap,
         draw_pca_elbow,
-        draw_pca_scatter,
         draw_umap,
         draw_variable_features,
         open_figure_store,
@@ -229,7 +228,6 @@ def write_preprocess_figures(
     retire_removed_umaps(output_dir)
     draw_variable_features(store, adata)
     draw_pca_elbow(store, adata)
-    draw_pca_scatter(store, adata)
     spec = control_spec(config)
     control_label = str(spec["control_label"])
     if spec["temporary"]:

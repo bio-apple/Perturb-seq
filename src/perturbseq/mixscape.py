@@ -28,7 +28,7 @@ VIGNETTE_CONTROL_NEIGHBORS = 20
 
 def perturbation_type(config: dict[str, Any]) -> str:
     mode = config["experiment"]["crispr_mode"]
-    return {"CRISPR_KO": "KO", "CRISPRi": "KD", "CRISPRa": "OE"}.get(mode, "PT")
+    return {"CRISPR_KO": "KO", "CRISPRi": "KD", "CRISPRa": "OE"}[mode]
 
 
 def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:

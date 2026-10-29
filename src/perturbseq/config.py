@@ -15,11 +15,9 @@ CRISPR_ALIASES = {
     "CRISPRi": "CRISPRi",
     "a": "CRISPRa",
     "CRISPRa": "CRISPRa",
-    "other": "other",
 }
 ORGANISMS = ("human", "mouse")
 _ORGANISM_ERROR = "experiment.organism 只能填 human 或 mouse。"
-DIRECTIONS = ("down", "up", "bidirectional", "unknown")
 POLICIES = ("drop",)
 MITO_PREFIX_BY_ORGANISM = {"human": "MT-", "mouse": "mt-"}
 ZERO_GUIDE_LABEL = "zero_guide"
@@ -101,7 +99,7 @@ def read_config(path: str | Path) -> dict[str, Any]:
 def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -> dict[str, Any]:
     """Replace project fields with the values the customer passed on the command line.
 
-    Paths, sample name, organism, guide separator, and the designed NT name in
+    Paths, sample name, organism, guide separator, and ``--nt-control`` in
     the YAML file are not used.
     """
     config["experiment"] = {
@@ -129,7 +127,20 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
     if not isinstance(labels, dict):
         labels = {}
         config["labels"] = labels
-    labels["nt_control"] = _optional_text(customer.get("nt_control"))
+    from perturbseq.assign import DEFAULT_NT_CONTROL_ARG, parse_nt_control_arg
+
+    raw_nt = _optional_text(customer.get("nt_control"))
+    mode, keywords = parse_nt_control_arg(raw_nt)
+    labels["nt_control_arg"] = raw_nt or DEFAULT_NT_CONTROL_ARG
+    labels["nt_mode"] = mode
+    labels["nt_keywords"] = list(keywords)
+    if mode == "zero_guide":
+        labels["nt_control"] = ""
+        labels["nt_labels"] = []
+    else:
+        # Provisional until bind_nt_control_from_reference expands against the CSV.
+        labels["nt_control"] = keywords[0]
+        labels["nt_labels"] = list(keywords)
 
     qc = config.setdefault("qc", {})
     if not isinstance(qc, dict):
@@ -144,6 +155,7 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
         "max_umi",
         "min_counts",
         "max_counts",
+        "min_guide_umi",
     ):
         qc.pop(key, None)
     for key in _GENE_CUTOFFS:
@@ -218,6 +230,11 @@ _ALLOWED_KEYS: dict[str, Any] = {
         # Rejected in validate_config with a rename message.
         "guides_per_cell": None,
         "nt_control": None,
+        "nt_control_arg": None,
+        "nt_mode": None,
+        "nt_keywords": None,
+        "nt_labels": None,
+        "nt_unmatched_fallback": None,
         "flag_guides_above": None,
     },
     # Filled by assign via resolve_control_spec; single source of truth for contrasts.
@@ -232,7 +249,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
     "qc": {
         "min_cells_per_target": None,
         "min_cells_per_guide": None,
-        "min_guide_umi": None,
         "min_genes": None,
         "max_genes": None,
         "max_mito_frac": None,
@@ -242,6 +258,7 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "max_umi": None,
         "min_counts": None,
         "max_counts": None,
+        "min_guide_umi": None,
         "mito_gene_prefix": None,
         "mito_prefix": None,
     },
@@ -343,26 +360,22 @@ def validate_config(config: dict[str, Any]) -> None:
 
     _organism(experiment)
     mode = _crispr_mode(experiment)
-    description = experiment.get("crispr_mode_description")
     direction = experiment.get("expected_target_direction")
-    experiment["resolved_expected_direction"] = _resolve_direction(mode, direction, description)
+    experiment["resolved_expected_direction"] = _resolve_direction(mode, direction)
     experiment["biological_sample_count"] = 1
 
     labels = _section(config, "labels")
     _nt_control(labels)
     policy = labels.get("multi_guide_policy", "drop")
     if policy == "keep_first":
-        raise ConfigError("labels.multi_guide_policy=keep_first 已不再支持，必须改为 drop。")
+        raise ConfigError("labels.multi_guide_policy 只能是 drop。")
     if policy not in POLICIES:
         raise ConfigError("labels.multi_guide_policy 只能是 drop。")
     if labels.get("flag_guides_above") is not None:
-        raise ConfigError(
-            "labels.flag_guides_above 已停用，不能作为剔除阈值。请使用 labels.targets_per_cell。"
-        )
+        raise ConfigError("labels.flag_guides_above 无效。请使用 labels.targets_per_cell。")
     if "guides_per_cell" in labels:
         raise ConfigError(
-            "labels.guides_per_cell 已改为 labels.targets_per_cell："
-            "按每个细胞的唯一靶基因数判定，不再按 guide 条数。"
+            "请使用 labels.targets_per_cell（按每个细胞的唯一靶基因数判定，不是 guide 条数）。"
         )
     targets_per_cell = labels.get("targets_per_cell", 1)
     if (
@@ -389,6 +402,11 @@ def validate_config(config: dict[str, Any]) -> None:
                 "请删除该键。QC 过滤只用 qc.min_genes / qc.max_genes / qc.max_mito_frac；"
                 "nCount（total_counts）仍计算并画在 QC 图上。"
             )
+    if "min_guide_umi" in qc:
+        raise ConfigError(
+            "不支持 qc.min_guide_umi：已取消单条 guide UMI 门槛。"
+            "请删除该键。资格判定不再使用 guide_umi_pass / low_guide_umi。"
+        )
     for key in ("min_cells_per_target", "min_cells_per_guide"):
         value = qc.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -458,11 +476,25 @@ def resolve_input_paths(config: dict[str, Any]) -> dict[str, Path]:
 
 
 def nt_control_name(config: dict[str, Any]) -> str:
-    """Configured non-targeting label. Empty means this run has no designed NT."""
+    """Canonical designed NT label. Empty means this run uses temporary zero_guide."""
     labels = config.get("labels")
     if not isinstance(labels, dict):
         return ""
+    if str(labels.get("nt_mode", "")).strip() == "zero_guide":
+        return ""
     return _optional_text(labels.get("nt_control"))
+
+
+def nt_labels_from_config(config: dict[str, Any]) -> set[str]:
+    """Resolved NT strings for guide/target matching."""
+    labels = config.get("labels")
+    if not isinstance(labels, dict):
+        return set()
+    raw = labels.get("nt_labels")
+    if isinstance(raw, (list, tuple, set)):
+        return {str(item).strip() for item in raw if str(item).strip()}
+    name = nt_control_name(config)
+    return {name} if name else set()
 
 
 def _designed_control_spec(designed: str) -> dict[str, Any]:
@@ -481,7 +513,7 @@ def _temporary_control_spec(*, fallback_from: str = "") -> dict[str, Any]:
     if fallback_from:
         note = (
             f"{TEMPORARY_CONTROL_NOTE} "
-            f"已配置 labels.nt_control={fallback_from!r}，但数据中无可用设计 NT 细胞，"
+            f"已配置 --nt-control={fallback_from!r}，但数据中无可用设计 NT 细胞，"
             "已回退到临时 zero_guide。"
         )
     return {
@@ -554,7 +586,9 @@ def resolve_control_spec(config: dict[str, Any], obs) -> dict[str, Any]:
             mask = mask & np.asarray(qc_ok, dtype=bool)
         if int(mask.sum()) > 0:
             return bind_control_spec(config, designed_spec)
-        return bind_control_spec(config, _temporary_control_spec(fallback_from=designed))
+        labels = config.get("labels") if isinstance(config.get("labels"), dict) else {}
+        fallback = _optional_text(labels.get("nt_control_arg")) or designed
+        return bind_control_spec(config, _temporary_control_spec(fallback_from=fallback))
     return bind_control_spec(config, _temporary_control_spec())
 
 
@@ -699,15 +733,7 @@ def expected_expression(config: dict[str, Any]) -> tuple[str, str]:
         return "up", "a 预期靶基因表达升高。"
     if mode == "CRISPR_KO":
         return "not_required", "KO 不以 RNA 表达下降作为唯一成功标准。"
-    direction = str(config["experiment"]["expected_target_direction"])
-    description = str(config["experiment"]["crispr_mode_description"]).strip()
-    sentence = {
-        "down": "客户预期靶基因表达下降。",
-        "up": "客户预期靶基因表达升高。",
-        "bidirectional": "客户预期靶基因表达双向变化。",
-        "unknown": "客户未指定靶基因表达方向。",
-    }[direction]
-    return direction, f"{description} {sentence}"
+    raise ConfigError("experiment.crispr_mode 必须是 KO、i 或 a。")
 
 
 def output_dir(config: dict[str, Any]) -> Path:
@@ -767,23 +793,33 @@ def _crispr_mode(experiment: dict[str, Any]) -> str:
     elif isinstance(raw, str) and raw.strip() in CRISPR_ALIASES:
         mode = CRISPR_ALIASES[raw.strip()]
     else:
-        raise ConfigError("experiment.crispr_mode 必须是 KO、i、a 或 other。")
+        raise ConfigError("experiment.crispr_mode 必须是 KO、i 或 a。")
     experiment["crispr_mode"] = mode
     return mode
 
 
 def _nt_control(labels: dict[str, Any]) -> str:
+    raw_arg = labels.get("nt_control_arg")
+    if raw_arg is not None and not isinstance(raw_arg, str):
+        raise ConfigError("labels.nt_control_arg 必须是字符串。")
+    if isinstance(raw_arg, str):
+        labels["nt_control_arg"] = raw_arg.strip()
+    mode = labels.get("nt_mode")
+    if mode is not None and mode not in ("designed", "zero_guide"):
+        raise ConfigError("labels.nt_mode 必须是 designed 或 zero_guide。")
     if "nt_control" not in labels or labels.get("nt_control") is None:
         labels["nt_control"] = ""
-        return ""
     value = labels.get("nt_control")
     if not isinstance(value, str):
         raise ConfigError("labels.nt_control 必须是字符串或留空。")
     labels["nt_control"] = value.strip()
+    if mode == "zero_guide":
+        labels["nt_control"] = ""
+        labels["nt_labels"] = []
     return labels["nt_control"]
 
 
-def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
+def _resolve_direction(mode: str, direction: Any, _description: Any = None) -> str:
     if mode == "CRISPRi":
         if direction not in (None, "down"):
             raise ConfigError(
@@ -802,14 +838,7 @@ def _resolve_direction(mode: str, direction: Any, description: Any) -> str:
                 "experiment.crispr_mode=KO 时 expected_target_direction 只能是 null 或 not_required。"
             )
         return "not_required"
-    if not isinstance(description, str) or not description.strip():
-        raise ConfigError("experiment.crispr_mode 为 other 时必须填写 crispr_mode_description。")
-    if direction not in DIRECTIONS:
-        raise ConfigError(
-            "experiment.crispr_mode 为 other 时 expected_target_direction 必须是 "
-            "down、up、bidirectional 或 unknown。"
-        )
-    return str(direction)
+    raise ConfigError("experiment.crispr_mode 必须是 KO、i 或 a。")
 
 
 def _require_confirmed_qc(qc: dict[str, Any]) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,11 @@ import numpy as np
 import pandas as pd
 from anndata import AnnData
 from scipy import sparse
+
+# Default --nt-control keywords (exact, case-insensitive) matched on reference columns.
+DEFAULT_NT_KEYWORDS = ("NEG_CONTROL", "Non-Targeting", "NegCtrl")
+DEFAULT_NT_CONTROL_ARG = "/".join(DEFAULT_NT_KEYWORDS)
+NT_REFERENCE_COLUMNS = ("id", "name", "target_gene_name", "target_gene_id")
 
 STATUS_NO_GUIDE = "no_guide"
 STATUS_SINGLE_TARGET = "single_targeting"
@@ -24,7 +31,6 @@ EXCLUSION_PRIORITY = (
     LOW_LIBRARY_NO_GUIDE,
     "no_guide",
     "multi_guide",
-    "low_guide_umi",
     "qc_failed",
     "low_cells_target",
 )
@@ -112,11 +118,142 @@ def build_guide_catalog(reference: pd.DataFrame) -> pd.DataFrame:
     return catalog.reset_index(drop=True)
 
 
-def validate_guide_targets(reference: pd.DataFrame, *, nt_control: str) -> pd.DataFrame:
+def parse_nt_control_arg(value: str | None) -> tuple[str, tuple[str, ...]]:
+    """Parse ``--nt-control``.
+
+    Empty / omitted → default keywords ``NEG_CONTROL/Non-Targeting/NegCtrl``.
+    ``zero_guide`` → temporary control. Otherwise keywords split on ``/`` or ``,``.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        return "designed", DEFAULT_NT_KEYWORDS
+    if text.casefold() == "zero_guide":
+        return "zero_guide", ()
+    keywords = tuple(part.strip() for part in re.split(r"[/,]", text) if part.strip())
+    if not keywords:
+        return "designed", DEFAULT_NT_KEYWORDS
+    return "designed", keywords
+
+
+def _normalize_nt_labels(nt_labels: Collection[str] | str | None) -> set[str]:
+    if nt_labels is None:
+        return set()
+    if isinstance(nt_labels, str):
+        text = nt_labels.strip()
+        return {text} if text else set()
+    return {str(item).strip() for item in nt_labels if str(item).strip()}
+
+
+def _field_matches_nt_keyword(field: str, keyword: str) -> bool:
+    left = field.strip().casefold()
+    right = keyword.strip().casefold()
+    return bool(left) and bool(right) and left == right
+
+
+def match_nt_reference_rows(
+    reference: pd.DataFrame, keywords: Iterable[str]
+) -> pd.DataFrame:
+    """Rows whose id/name/target_gene_name/target_gene_id equals a keyword."""
+    keys = tuple(str(item).strip() for item in keywords if str(item).strip())
+    if not keys or reference.empty:
+        return reference.iloc[0:0].copy()
+    mask = np.zeros(len(reference), dtype=bool)
+    for column in NT_REFERENCE_COLUMNS:
+        if column not in reference.columns:
+            continue
+        values = reference[column].astype(str)
+        for index, raw in enumerate(values):
+            text = raw.strip()
+            if not text or text.casefold() in {"nan", "none", "<na>"}:
+                continue
+            if any(_field_matches_nt_keyword(text, key) for key in keys):
+                mask[index] = True
+    return reference.loc[mask].copy()
+
+
+def resolve_nt_labels_from_reference(
+    reference: pd.DataFrame, keywords: Iterable[str]
+) -> tuple[str, set[str]] | None:
+    """Map NT keywords to a canonical control label and the full NT label set.
+
+    Returns ``None`` when no reference row matches (caller falls back to zero_guide).
+    """
+    keys = tuple(str(item).strip() for item in keywords if str(item).strip())
+    matched = match_nt_reference_rows(reference, keys)
+    if matched.empty:
+        return None
+    labels: set[str] = set()
+    for column in NT_REFERENCE_COLUMNS:
+        if column not in matched.columns:
+            continue
+        for raw in matched[column].astype(str):
+            text = raw.strip()
+            if text and text.casefold() not in {"nan", "none", "<na>"}:
+                labels.add(text)
+    canonical = ""
+    if "target_gene_name" in matched.columns:
+        targets = [
+            str(value).strip()
+            for value in matched["target_gene_name"]
+            if str(value).strip() and str(value).strip().casefold() not in {"nan", "none", "<na>"}
+        ]
+        for key in keys:
+            for target in targets:
+                if _field_matches_nt_keyword(target, key):
+                    canonical = target
+                    break
+            if canonical:
+                break
+        if not canonical and targets:
+            canonical = targets[0]
+    if not canonical:
+        canonical = str(matched["name"].iloc[0]).strip()
+    labels.add(canonical)
+    return canonical, labels
+
+
+def bind_nt_control_from_reference(config: dict[str, Any], reference: pd.DataFrame) -> dict[str, Any]:
+    """Resolve ``--nt-control`` against the feature barcode reference in-place.
+
+    Unmatched keywords (default or custom) fall back to temporary ``zero_guide``.
+    """
+    labels = config.setdefault("labels", {})
+    if not isinstance(labels, dict):
+        labels = {}
+        config["labels"] = labels
+    raw = str(labels.get("nt_control_arg") or labels.get("nt_control") or "")
+    mode, keywords = parse_nt_control_arg(raw)
+    labels["nt_control_arg"] = raw.strip() or DEFAULT_NT_CONTROL_ARG
+    labels["nt_mode"] = mode
+    labels["nt_keywords"] = list(keywords)
+    labels.pop("nt_unmatched_fallback", None)
+    if mode == "zero_guide":
+        labels["nt_control"] = ""
+        labels["nt_labels"] = []
+        return labels
+    resolved = resolve_nt_labels_from_reference(reference, keywords)
+    if resolved is None:
+        labels["nt_mode"] = "zero_guide"
+        labels["nt_control"] = ""
+        labels["nt_labels"] = []
+        labels["nt_unmatched_fallback"] = True
+        return labels
+    canonical, nt_labels = resolved
+    labels["nt_control"] = canonical
+    labels["nt_labels"] = sorted(nt_labels)
+    return labels
+
+
+def validate_guide_targets(
+    reference: pd.DataFrame,
+    *,
+    nt_control: str = "",
+    nt_labels: Collection[str] | None = None,
+) -> pd.DataFrame:
     """Use target_gene_name as the only target when that column exists.
 
-    A blank target is an error. The one exception is a guide whose name equals
-    the configured NT label: that guide is the designed control even when
+    A blank target is an error. The one exception is a guide whose name or id is
+    in the resolved NT label set: that guide is the designed control even when
     target_gene_name is blank. A blank is never treated as non-targeting for
     any other guide.
     References without the column keep that name-based control path.
@@ -124,6 +261,9 @@ def validate_guide_targets(reference: pd.DataFrame, *, nt_control: str) -> pd.Da
     catalog = build_guide_catalog(reference)
     if "target_gene_name" not in reference.columns:
         return catalog
+    allowed = _normalize_nt_labels(nt_labels)
+    if not allowed:
+        allowed = _normalize_nt_labels(nt_control)
     conflicts = sorted(
         {
             str(guide_id)
@@ -137,7 +277,9 @@ def validate_guide_targets(reference: pd.DataFrame, *, nt_control: str) -> pd.Da
         {
             str(row.guide_id)
             for row in catalog.itertuples(index=False)
-            if row.target_gene_name == "" and row.guide_name != nt_control
+            if row.target_gene_name == ""
+            and str(row.guide_name) not in allowed
+            and str(row.guide_id) not in allowed
         }
     )
     if empty_ids:
@@ -168,9 +310,9 @@ def annotate_assignments(
     *,
     nt_control: str,
     multi_guide_policy: str,
-    min_guide_umi: float | None,
     matrix_barcodes: set[str],
     targets_per_cell: int = 1,
+    nt_labels: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Classify every assignment row into four exclusive categories.
 
@@ -184,7 +326,8 @@ def annotate_assignments(
         raise ValueError("本版只支持 multi_guide_policy=drop。")
     if targets_per_cell < 1:
         raise ValueError("targets_per_cell 必须是正整数。")
-    catalog = validate_guide_targets(reference, nt_control=nt_control)
+    labels = _normalize_nt_labels(nt_labels) or _normalize_nt_labels(nt_control)
+    catalog = validate_guide_targets(reference, nt_control=nt_control, nt_labels=labels)
     names = set(catalog["guide_name"])
     max_tokens = name_token_width(reference)
     shared_names = set(catalog.loc[catalog["guide_name"].duplicated(keep=False), "guide_name"])
@@ -209,16 +352,14 @@ def annotate_assignments(
         status, guide_name, target, targets = _assignment_for_call(
             parts=parts,
             nt_control=nt_control,
+            nt_labels=labels,
             target_by_name=target_by_name,
         )
         guide_id = id_by_unique_name.get(guide_name, "")
         if guide_name in shared_names:
             guide_id = ""
-        guide_umi_pass = min_guide_umi is None or all(
-            weight >= float(min_guide_umi) for weight in transcripts
-        )
         subtype = (
-            _multi_subtype(parts, nt_control, target_by_name) if status == STATUS_MULTI else pd.NA
+            _multi_subtype(parts, labels, target_by_name) if status == STATUS_MULTI else pd.NA
         )
         analysis_status = {
             STATUS_SINGLE_TARGET: STATUS_TARGET,
@@ -244,7 +385,6 @@ def annotate_assignments(
                 else pd.NA,
                 "assignment_status": status,
                 "multi_guide_subtype": subtype,
-                "guide_umi_pass": guide_umi_pass or not parts,
                 "perturbation_status": analysis_status,
                 "shared_guide_name": guide_name in shared_names,
                 "in_matrix": True,
@@ -257,12 +397,15 @@ def _assignment_for_call(
     *,
     parts: list[str],
     nt_control: str,
+    nt_labels: Collection[str],
     target_by_name: dict[str, str],
 ) -> tuple[str, str, str, list[str]]:
     """Assign by unique target genes. Same-gene dual guides stay single-target."""
     if not parts:
         return STATUS_NO_GUIDE, "", "", []
-    targets = [_target_of(part, nt_control, target_by_name) for part in parts]
+    labels = _normalize_nt_labels(nt_labels)
+    canonical = nt_control.strip() if isinstance(nt_control, str) else ""
+    targets = [_target_of(part, canonical, labels, target_by_name) for part in parts]
     for guide_name, target in zip(parts, targets, strict=True):
         if target == "":
             raise ValueError(f"guide 没有靶基因: {guide_name}")
@@ -271,25 +414,34 @@ def _assignment_for_call(
         return STATUS_MULTI, "", "", targets
     target = unique[0]
     guide_name = parts[0]
-    label = nt_control.strip() if isinstance(nt_control, str) else ""
-    if label and target == label:
-        return STATUS_SINGLE_NT, guide_name, label, targets
+    if canonical and target == canonical:
+        return STATUS_SINGLE_NT, guide_name, canonical, targets
+    if target in labels:
+        return STATUS_SINGLE_NT, guide_name, canonical or target, targets
     return STATUS_SINGLE_TARGET, guide_name, target, targets
 
 
-def _target_of(guide_name: str, nt_control: str, target_by_name: dict[str, str]) -> str:
+def _target_of(
+    guide_name: str,
+    nt_control: str,
+    nt_labels: Collection[str],
+    target_by_name: dict[str, str],
+) -> str:
     target = target_by_name.get(guide_name, "").strip()
-    if _is_nt(guide_name, target, nt_control):
-        return nt_control
+    if _is_nt(guide_name, target, nt_labels):
+        return nt_control.strip() if nt_control.strip() else target
     return target
 
 
-def _multi_subtype(parts: list[str], nt_control: str, target_by_name: dict[str, str]) -> str:
+def _multi_subtype(
+    parts: list[str], nt_labels: Collection[str], target_by_name: dict[str, str]
+) -> str:
+    labels = _normalize_nt_labels(nt_labels)
     nt_flags = []
     targets = []
     for part in parts:
         target = target_by_name.get(part, "")
-        is_nt = _is_nt(part, target, nt_control)
+        is_nt = _is_nt(part, target, labels)
         nt_flags.append(is_nt)
         if not is_nt and target:
             targets.append(target)
@@ -392,11 +544,11 @@ def _obs_eq(obs: pd.DataFrame, column: str, value: str) -> np.ndarray:
     return _writable_bool(obs[column].astype(str).eq(value).to_numpy())
 
 
-def _is_nt(guide_name: str, target_gene_name: str, nt_control: str) -> bool:
-    label = nt_control.strip() if isinstance(nt_control, str) else ""
-    if not label:
+def _is_nt(guide_name: str, target_gene_name: str, nt_labels: Collection[str] | str) -> bool:
+    labels = _normalize_nt_labels(nt_labels)
+    if not labels:
         return False
-    return guide_name == label or target_gene_name == label
+    return guide_name in labels or target_gene_name in labels
 
 
 def multi_guide_composition(
@@ -404,12 +556,14 @@ def multi_guide_composition(
     *,
     nt_control: str,
     reference: pd.DataFrame,
+    nt_labels: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Classify true multi-target calls before they are dropped.
 
     Same-gene dual guides are ``single_targeting`` and are not counted here.
     """
-    catalog = validate_guide_targets(reference, nt_control=nt_control)
+    labels = _normalize_nt_labels(nt_labels) or _normalize_nt_labels(nt_control)
+    catalog = validate_guide_targets(reference, nt_control=nt_control, nt_labels=labels)
     target_by_name = target_by_guide_name(catalog)
     names = set(catalog["guide_name"])
     max_tokens = name_token_width(reference)
@@ -423,7 +577,7 @@ def multi_guide_composition(
         nt_flags = []
         for part in parts:
             target = target_by_name.get(part, "")
-            is_nt = _is_nt(part, target, nt_control)
+            is_nt = _is_nt(part, target, labels)
             nt_flags.append(is_nt)
             if not is_nt and target:
                 targets.append(target)
@@ -599,7 +753,7 @@ def apply_eligibility(
         raise ValueError("缺少 n_targets，不能按靶基因数判定资格。")
     single = table["assignment_status"].isin([STATUS_SINGLE_TARGET, STATUS_SINGLE_NT])
     allowed_count = table["n_targets"].astype(int) == int(targets_per_cell)
-    base = single & allowed_count & table["guide_umi_pass"].astype(bool) & table["qc_pass"]
+    base = single & allowed_count & table["qc_pass"]
     table["base_eligible"] = base.to_numpy()
     targeting_base = base & (table["assignment_status"] == STATUS_SINGLE_TARGET)
     grouped = table.loc[targeting_base].groupby(["target_gene", "cell_type"], dropna=False).size()
@@ -620,8 +774,6 @@ def apply_eligibility(
             targets_per_cell
         ):
             reasons.append("multi_guide")
-        if not bool(record.guide_umi_pass):
-            reasons.append("low_guide_umi")
         if not bool(record.qc_pass):
             reasons.append("qc_failed")
         if low_cells[index]:
@@ -784,21 +936,29 @@ def _analysis_rows(table: pd.DataFrame) -> pd.DataFrame:
     return table[table["perturbation_status"].isin([STATUS_TARGET, STATUS_NT])].copy()
 
 
-def reference_target_genes(reference: pd.DataFrame, *, nt_control: str = "") -> list[str]:
+def reference_target_genes(
+    reference: pd.DataFrame,
+    *,
+    nt_control: str = "",
+    nt_labels: Collection[str] | None = None,
+) -> list[str]:
     """Unique target names from the feature reference, first-seen order.
 
-    Blank ``target_gene_name`` is kept only when the guide name equals the
-    configured NT label (then the label itself is the target).
+    Blank ``target_gene_name`` is kept only when the guide is in the NT label
+    set (then the canonical NT label itself is the target).
     """
     catalog = build_guide_catalog(reference)
-    label = nt_control.strip() if isinstance(nt_control, str) else ""
+    labels = _normalize_nt_labels(nt_labels) or _normalize_nt_labels(nt_control)
+    canonical = nt_control.strip() if isinstance(nt_control, str) else ""
     out: list[str] = []
     seen: set[str] = set()
     for row in catalog.itertuples(index=False):
         target = str(row.target_gene_name).strip()
         if not target:
-            if label and str(row.guide_name).strip() == label:
-                target = label
+            guide_name = str(row.guide_name).strip()
+            guide_id = str(row.guide_id).strip()
+            if guide_name in labels or guide_id in labels:
+                target = canonical or guide_name
             else:
                 continue
         if target in seen:
@@ -806,6 +966,83 @@ def reference_target_genes(reference: pd.DataFrame, *, nt_control: str = "") -> 
         seen.add(target)
         out.append(target)
     return out
+
+
+def reference_guide_names(reference: pd.DataFrame) -> list[str]:
+    """Unique guide ``name`` values from the feature reference, first-seen order."""
+    catalog = build_guide_catalog(reference)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in catalog["guide_name"].astype(str):
+        name = str(raw).strip()
+        if not name or name in seen or name in {"nan", "None", "<NA>", "NA"}:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def cells_per_guide_name(
+    table: pd.DataFrame,
+    *,
+    all_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """Cell counts per guide ``name``: full catalog, including zeros; no eligibility cut.
+
+    Counts use every ledger row with a non-empty assigned ``target_gene`` whose
+    ``guide_name`` matches (same cell universe as ``cells_per_target``).
+    """
+    columns = ["guide_name", "n_cells", "target_gene", "perturbation_status"]
+    used = _assigned_target_rows(table)
+    catalog: list[str] = []
+    seen: set[str] = set()
+    for raw in all_names or []:
+        name = str(raw).strip()
+        if not name or name in seen or name in {"nan", "None", "<NA>", "NA"}:
+            continue
+        seen.add(name)
+        catalog.append(name)
+    if not used.empty and "guide_name" in used.columns:
+        for raw in used["guide_name"].astype(str):
+            name = str(raw).strip()
+            if not name or name in seen or name in {"nan", "None", "<NA>", "NA"}:
+                continue
+            seen.add(name)
+            catalog.append(name)
+    if not catalog:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for name in catalog:
+        if used.empty or "guide_name" not in used.columns:
+            group = used.iloc[0:0]
+        else:
+            group = used.loc[used["guide_name"].astype(str) == name]
+        if group.empty:
+            rows.append(
+                {
+                    "guide_name": name,
+                    "n_cells": 0,
+                    "target_gene": "",
+                    "perturbation_status": "",
+                }
+            )
+            continue
+        if "perturbation_status" in group.columns:
+            status = group["perturbation_status"].iloc[0]
+        else:
+            status = ""
+        target = ""
+        if "target_gene" in group.columns:
+            target = str(group["target_gene"].iloc[0])
+        rows.append(
+            {
+                "guide_name": name,
+                "n_cells": int(len(group)),
+                "target_gene": target,
+                "perturbation_status": status,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("n_cells", ascending=False, kind="mergesort")
 
 
 def _assigned_target_rows(table: pd.DataFrame) -> pd.DataFrame:
@@ -898,10 +1135,12 @@ def write_qc_figures(
     *,
     cell_status: pd.DataFrame | None = None,
     targets: pd.DataFrame | None = None,
+    guide_names: pd.DataFrame | None = None,
 ) -> None:
     """Write QC / assignment PNGs at the end of the assign step."""
     from perturbseq.config import control_spec
     from perturbseq.plotting import (
+        draw_cells_per_guide_name,
         draw_cells_per_target,
         draw_guides_per_cell,
         draw_qc_metrics_panel,
@@ -930,6 +1169,19 @@ def write_qc_figures(
             pd.read_csv(targets_path, sep="\t") if targets_path.exists() else pd.DataFrame()
         )
     draw_cells_per_target(store, targets, int(config["qc"]["min_cells_per_target"]))
+    if guide_names is None:
+        if adata is not None and isinstance(
+            adata.uns.get("cells_per_guide_name"), pd.DataFrame
+        ):
+            guide_names = adata.uns["cells_per_guide_name"]
+        else:
+            guide_path = output_dir / "qc" / "tables" / "cells_per_guide_name.tsv"
+            guide_names = (
+                pd.read_csv(guide_path, sep="\t") if guide_path.exists() else pd.DataFrame()
+            )
+    draw_cells_per_guide_name(
+        store, guide_names, int(config["qc"]["min_cells_per_guide"])
+    )
     qc_table, qc_note = _qc_population(cell_status, adata)
     if qc_table.empty:
         for name in ("qc_metrics_panel", "qc_scatter_panel"):

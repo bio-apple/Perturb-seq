@@ -20,6 +20,7 @@ import yaml
 
 from perturbseq import __version__
 from perturbseq.assign import (
+    DEFAULT_NT_CONTROL_ARG,
     LOW_LIBRARY_NO_GUIDE,
     STATUS_NO_GUIDE,
     STATUS_NT,
@@ -27,12 +28,15 @@ from perturbseq.assign import (
     STATUS_TARGET,
     GuideReferenceError,
     apply_eligibility,
+    bind_nt_control_from_reference,
     capture_library_correlation,
     cells_per_guide,
+    cells_per_guide_name,
     cells_per_target,
     derive_qc_thresholds,
     filter_stage_counts,
     multi_guide_composition,
+    reference_guide_names,
     reference_target_genes,
     validate_guide_targets,
     write_qc_figures,
@@ -44,6 +48,7 @@ from perturbseq.config import (
     apply_thread_budget,
     control_spec,
     mito_prefix,
+    nt_labels_from_config,
     output_dir,
     read_config,
     resolve_control_spec,
@@ -76,13 +81,8 @@ STEPS = [
 ]
 # After preprocess these only read preprocess AnnData and write disjoint PNG dirs.
 PARALLEL_ANALYSIS_STEPS = ("mixscape", "mixscale")
-# ``--steps all`` picks analysis by CRISPR mode (KO→Mixscape; i/a→Mixscale; other→none).
-MODE_ANALYSIS_STEPS = {
-    "CRISPR_KO": ("mixscape",),
-    "CRISPRi": ("mixscale",),
-    "CRISPRa": ("mixscale",),
-    "other": (),
-}
+# Fixed run order: always Mixscape + Mixscale after preprocess (KO / i / a).
+DEFAULT_STEPS = ["io", "assign", "preprocess", "mixscape", "mixscale"]
 PACKAGES = [
     "perturbseq",
     "scanpy",
@@ -115,23 +115,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--guide-separator", required=True, help="多条 guide 之间的分隔符，例如 |")
     parser.add_argument(
         "--nt-control",
-        default="",
-        help="设计好的非靶向对照名。不填，或填了但数据中无可用 NT 细胞时，用 zero-guide 临时对照",
+        default=DEFAULT_NT_CONTROL_ARG,
+        help=(
+            "在 *.scRNA.feature_barcode_reference.csv 的 "
+            "id/name/target_gene_name/target_gene_id 上按关键词精确匹配设计 NT"
+            f"（默认 {DEFAULT_NT_CONTROL_ARG}，忽略大小写；可用 / 或 , 自定义）。"
+            "默认或自定义关键词均未匹配到时自动用 zero_guide；也可显式填 zero_guide"
+        ),
     )
     parser.add_argument(
         "--crispr-mode",
         default="KO",
-        help="KO、i、a 或 other，缺省 KO（内部映射为 CRISPR_KO / CRISPRi / CRISPRa / other）",
-    )
-    parser.add_argument(
-        "--crispr-description",
-        default=None,
-        help="--crispr-mode 为 other 时的文字说明",
-    )
-    parser.add_argument(
-        "--expected-direction",
-        default=None,
-        help="other 模式的预期方向：down、up、bidirectional 或 unknown",
+        choices=("KO", "i", "a"),
+        help="KO、i 或 a，缺省 KO（映射 CRISPR_KO / CRISPRi / CRISPRa；预期方向 not_required / down / up；图标签 KO / KD / OE）",
     )
     parser.add_argument("--batch-key", default=None, help="obs 里的批次列。不填则不做 Harmony")
     parser.add_argument(
@@ -154,14 +150,6 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=None,
         help="表达基因数上限。细胞 n_genes ≥ 该值时剔除。默认读配置（6000）。",
-    )
-    parser.add_argument(
-        "--steps",
-        default="all",
-        help=(
-            "all（按 CRISPR 模式选分析：KO→mixscape；i/a→mixscale；other→仅 io,assign,preprocess），"
-            "或从 io 起的逗号分隔步骤（other 不可含 mixscape/mixscale；无 checkpoints / --resume）"
-        ),
     )
     tissue_choices = sctype_tissue_choices()
     parser.add_argument(
@@ -203,8 +191,8 @@ def main(argv: list[str] | None = None) -> None:
             "guide_separator": args.guide_separator,
             "nt_control": args.nt_control,
             "crispr_mode": args.crispr_mode,
-            "crispr_mode_description": args.crispr_description,
-            "expected_target_direction": args.expected_direction,
+            "crispr_mode_description": None,
+            "expected_target_direction": None,
             "batch_key": args.batch_key,
             "cell_type_key": args.cell_type_key,
             "max_mito_frac": args.max_mito_frac,
@@ -224,44 +212,13 @@ def main(argv: list[str] | None = None) -> None:
         _validate_barcodes(folder, config)
         print(f"Validated {folder}", flush=True)
         return
-    steps = _resolve_steps(config, args.steps)
-    run(config, steps)
-
-
-def _resolve_steps(config: dict[str, Any], raw: str) -> list[str]:
-    """Expand ``all`` by CRISPR mode, or parse an explicit comma-separated list."""
-    text = str(raw).strip()
+    steps = list(DEFAULT_STEPS)
     mode = str(config["experiment"]["crispr_mode"])
-    if text == "all":
-        analysis = MODE_ANALYSIS_STEPS.get(mode)
-        if analysis is None:
-            raise SystemExit(f"未知 CRISPR 模式 {mode!r}，无法展开 --steps all。")
-        steps = ["io", "assign", "preprocess", *analysis]
-        if mode == "other":
-            print(
-                f"  steps=all → {', '.join(steps)} "
-                f"(crispr_mode=other；other 不做 Mixscape / Mixscale，仅跑至 preprocess)",
-                flush=True,
-            )
-        else:
-            print(
-                f"  steps=all → {', '.join(steps)} (crispr_mode={mode}; KO→mixscape, i/a→mixscale)",
-                flush=True,
-            )
-        return steps
-    steps = [step.strip() for step in text.split(",") if step.strip()]
-    unknown = [step for step in steps if step not in STEPS]
-    if unknown:
-        raise SystemExit(f"未知步骤: {', '.join(unknown)}")
-    if mode == "other":
-        forbidden = [step for step in steps if step in PARALLEL_ANALYSIS_STEPS]
-        if forbidden:
-            raise SystemExit(
-                "experiment.crispr_mode=other 时不做 Mixscape / Mixscale："
-                f"请勿在 --steps 中指定 {', '.join(forbidden)}。"
-                "可用 --steps all 或 io,assign,preprocess。"
-            )
-    return steps
+    print(
+        f"  steps → {', '.join(steps)} (crispr_mode={mode}; always mixscape ‖ mixscale)",
+        flush=True,
+    )
+    run(config, steps)
 
 
 def run(config: dict[str, Any], steps: list[str]) -> None:
@@ -269,8 +226,8 @@ def run(config: dict[str, Any], steps: list[str]) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     if steps and steps[0] != "io":
         raise SystemExit(
-            "已不再写出 checkpoints / 不支持 --resume："
-            f"请从 io 起连续运行（当前首步为 {steps[0]}；可用 --steps all）。"
+            "不支持 checkpoints / --resume："
+            f"请从 io 起连续运行（当前首步为 {steps[0]}）。"
         )
     n_threads = apply_thread_budget(config)
     print(f"  runtime.n_threads={n_threads} (host/3 default; BLAS/OpenMP/scanpy)", flush=True)
@@ -524,17 +481,35 @@ def _merge_post_preprocess_products(preprocess_adata, product_paths: dict[str, P
 
 def _step_io(folder: Path, config: dict[str, Any]):
     paths = resolve_input_paths(config)
+    reference = read_reference(paths["feature_reference"])
+    bind_nt_control_from_reference(config, reference)
+    if str(config["labels"].get("nt_mode", "")) == "zero_guide":
+        if config["labels"].get("nt_unmatched_fallback"):
+            keys = config["labels"].get("nt_keywords") or []
+            print(
+                "  NT control: zero_guide (temporary; no reference match for "
+                f"keywords {list(keys)})",
+                flush=True,
+            )
+        else:
+            print("  NT control: zero_guide (temporary)", flush=True)
+    else:
+        print(
+            "  NT control: designed "
+            f"{config['labels']['nt_control']!r} "
+            f"({len(config['labels'].get('nt_labels') or [])} matched labels)",
+            flush=True,
+        )
     _validate_guide_reference(folder, config)
-    min_guide_umi = config["qc"].get("min_guide_umi")
     try:
         adata, annotated, checks = load_sample(
             paths,
             nt_control=config["labels"]["nt_control"],
+            nt_labels=nt_labels_from_config(config),
             feature_type_gex=config["labels"].get("feature_type_gex", "Gene Expression"),
             feature_type_crispr=config["labels"]["feature_type_crispr"],
             multi_guide_policy=config["labels"]["multi_guide_policy"],
             targets_per_cell=int(config["labels"].get("targets_per_cell", 1)),
-            min_guide_umi=None if min_guide_umi is None else float(min_guide_umi),
             mito_prefix=mito_prefix(config),
         )
     except InputMismatch as exc:
@@ -567,10 +542,10 @@ def _step_io(folder: Path, config: dict[str, Any]):
     # Keep the annotated ledger on the in-memory AnnData for assign in the same run.
     adata.uns["cell_calls"] = calls
     adata.uns["io_checks"] = checks
-    reference = read_reference(paths["feature_reference"])
     adata.uns["multi_guide_composition"] = multi_guide_composition(
         annotated,
         nt_control=config["labels"]["nt_control"],
+        nt_labels=nt_labels_from_config(config),
         reference=reference,
     )
     return adata
@@ -581,7 +556,6 @@ def _load_cell_calls(adata) -> pd.DataFrame:
     if not isinstance(stored, pd.DataFrame) or stored.empty:
         raise SystemExit("缺少 cell_calls：请从 io 起连续运行（账本在内存 AnnData.uns 中传递）。")
     calls = stored.copy()
-    calls["guide_umi_pass"] = _as_bool(calls["guide_umi_pass"])
     for column in (
         "total_counts",
         "n_genes_by_counts",
@@ -640,7 +614,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     spec = resolve_control_spec(config, updated)
     if spec["temporary"] and spec.get("fallback_from"):
         print(
-            f"  control fallback: labels.nt_control={spec['fallback_from']!r} "
+            f"  control fallback: --nt-control={spec['fallback_from']!r} "
             "has no usable NT cells → temporary zero_guide",
             flush=True,
         )
@@ -679,8 +653,14 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
         updated,
         int(config["qc"]["min_cells_per_guide"]),
         all_targets=reference_target_genes(
-            reference, nt_control=str(config["labels"].get("nt_control", "") or "")
+            reference,
+            nt_control=str(config["labels"].get("nt_control", "") or ""),
+            nt_labels=nt_labels_from_config(config),
         ),
+    )
+    guide_name_counts = cells_per_guide_name(
+        updated,
+        all_names=reference_guide_names(reference),
     )
     control_ids = set(
         updated.loc[updated["temporary_control"].astype(bool), "cell_barcode"].astype(str)
@@ -720,6 +700,7 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
     adata.uns["n_temporary_control_cells"] = int(len(control_ids)) if spec["temporary"] else 0
     adata.uns["qc_thresholds"] = recorded
     adata.uns["cells_per_target"] = targets
+    adata.uns["cells_per_guide_name"] = guide_name_counts
     adata.uns["filter_stage_counts"] = filter_stage_counts(updated)
     adata.uns["cells_per_guide"] = cells_per_guide(updated)
     if spec["temporary"]:
@@ -734,7 +715,14 @@ def _step_assign(folder: Path, config: dict[str, Any], adata):
             flush=True,
         )
     _write_resolved(folder, config)
-    write_qc_figures(folder, config, adata, cell_status=ledger, targets=targets)
+    write_qc_figures(
+        folder,
+        config,
+        adata,
+        cell_status=ledger,
+        targets=targets,
+        guide_names=guide_name_counts,
+    )
     print(
         f"  embedding cells (QC pass): {adata.n_obs:,}; "
         f"analysis_eligible (perturbation): {analysis_n:,}",
@@ -857,7 +845,11 @@ def _validate_guide_reference(folder: Path, config: dict[str, Any]) -> None:
     paths = resolve_input_paths(config)
     reference = read_reference(paths["feature_reference"])
     try:
-        validate_guide_targets(reference, nt_control=config["labels"]["nt_control"])
+        validate_guide_targets(
+            reference,
+            nt_control=config["labels"]["nt_control"],
+            nt_labels=nt_labels_from_config(config),
+        )
     except GuideReferenceError as exc:
         _write_guide_conflicts(folder, exc)
         raise SystemExit(str(exc)) from exc
@@ -969,12 +961,6 @@ def _write_barcode_differences(
     )
 
 
-def _as_bool(values: pd.Series) -> pd.Series:
-    if values.dtype == bool:
-        return values
-    return values.astype(str).str.lower().isin(["true", "1"])
-
-
 def _cell_status(table: pd.DataFrame) -> pd.DataFrame:
     ledger = table.copy()
     ledger["pct_counts_mito"] = ledger["mito_frac"]
@@ -995,7 +981,7 @@ def _require(state: dict[str, Any], previous: str):
     if state["adata"] is not None:
         return state["adata"]
     raise SystemExit(
-        f"缺少上一步「{previous}」的内存结果：请从 io 起连续运行（已不再支持 checkpoints / --resume）。"
+        f"缺少上一步「{previous}」的内存结果：请从 io 起连续运行（不支持 checkpoints / --resume）。"
     )
 
 

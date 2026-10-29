@@ -1,13 +1,12 @@
 # 分析软件默认参数。
-# 步骤：io → assign → preprocess → 分析步。
-# --steps all 按 CRISPR 模式选型：KO → mixscape；i / a → mixscale；other → 仅 io,assign,preprocess（不做 Mixscape / Mixscale）。
-# other 模式下显式 --steps 含 mixscape / mixscale 会拒绝。KO/i/a 显式同写两者时可并发（均只依赖 preprocess）。
+# 步骤：io → assign → preprocess → mixscape ‖ mixscale。
 # 图目录：Mixscape/、mixscale/、qc/、UMAP/。成功结束后磁盘只保留 PNG。
 # 参考：pertpy Mixscape / Mixscale；Seurat Mixscape vignette；satijalab Mixscale。
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
-# 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a / other）由命令行传入。
-# 未给 --nt-control，或给了但数据中无可用 NT 细胞时，assign 解析为临时 zero_guide 对照
-# （control_source=zero_guide_cells；见 docs/analysis.md § 对照）。不宜当作设计 NT 解读。
+# 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a）由命令行传入。
+# --nt-control 默认 NEG_CONTROL/Non-Targeting/NegCtrl：在 feature_barcode_reference 的
+# id/name/target_gene_name/target_gene_id 上精确匹配（忽略大小写）；可自定义；均未匹配则自动 zero_guide。
+# 也可 --nt-control zero_guide。匹配到但无可用 NT 细胞时 assign 回退临时 zero_guide。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
 # 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可存在，实现固定写 PNG。
 input:
@@ -29,7 +28,6 @@ qc:
   max_mito_frac: 0.2
   min_cells_per_target: 20
   min_cells_per_guide: 10
-  min_guide_umi: null
 
 preprocess:
   normalize_target_sum: 10000
@@ -65,9 +63,7 @@ perturb:
   # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致（0.1）。Mixscale 不读此键。
   mixscape_logfc: 0.1
   mixscape_pval: 0.05
-# 簇注释调用 Rscript 里的 SingleR 与 celldex。false 时跳过，不要求安装 R。
-# ScType 不在此文件配置：用命令行 --sctype-tissue / --sctype-db-path /
-# --sctype-low-score-fraction（未传 --sctype-tissue 则跳过）。
+# 簇注释：SingleR（R / celldex；enabled:false 跳过）与 ScType（仅 CLI：--sctype-tissue 等）。
 singler:
   enabled: true
 plotting:

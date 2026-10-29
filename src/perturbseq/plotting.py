@@ -17,6 +17,7 @@ import pandas as pd
 import seaborn as sns
 from anndata import AnnData
 from matplotlib.axes import Axes
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from scipy import sparse
@@ -29,20 +30,25 @@ ZERO_GUIDE_QC_GROUP = "zero-guide"
 TARGETING_QC_GROUP = "targeting"
 _TEMPORARY_SPEC = {"temporary": True, "control_label": ZERO_GUIDE_LABEL}
 
-# mRNA and gRNA statistics. Section "plot" is shared with UMAPs, so routing is by name.
+# Assign-step QC: full ledger / pre gene-mito filter (or descriptive temporary control).
 _QC_FIGURES = frozenset(
     {
         "qc_metrics_panel",
         "qc_scatter_panel",
-        "marker_detection_heatmap",
-        "dotplot_markers",
         TEMPORARY_CONTROL_QC_NAME,
         "guides_per_cell",
         "cells_per_target_bar",
+        "cells_per_guide_name_bar",
         "target_cell_counts",
+    }
+)
+# Preprocess figures on QC-pass cells → UMAP/ (not qc/).
+_UMAP_QC_PASS_FIGURES = frozenset(
+    {
         "variable_features",
         "pca_elbow",
-        "pca_scatter",
+        "marker_detection_heatmap",
+        "dotplot_markers",
     }
 )
 # Library-D / ggplot2-like defaults (figures under xihu/Library-D/figures).
@@ -56,8 +62,16 @@ _QC_PANEL_NAME = "qc_metrics_panel"
 _QC_SCATTER_PANEL_NAME = "qc_scatter_panel"
 _LEGACY_QC_HIST_NAMES = ("hist_ncount", "hist_nfeature", "hist_percent_mt_gex")
 _LEGACY_QC_SCATTER_NAMES = ("qc_scatter", "scatter_ncount_nfeature_gex")
-_MARKER_HEATMAP_CMAP = "Blues"
-_DOTPLOT_CMAP = "Blues"
+# Seurat DoHeatmap-like Expression: purple → black → yellow.
+_MARKER_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
+    "seurat_doheatmap",
+    ["#FF00FF", "#000000", "#FFFF00"],
+)
+# Seurat DotPlot-like Average Expression: lightgrey → blue.
+_DOTPLOT_CMAP = LinearSegmentedColormap.from_list(
+    "seurat_dotplot",
+    ["#D3D3D3", "#9ECAE1", "#3182BD", "#08519C", "#0000FF"],
+)
 # Mixscape DE gate / class / 2x2 panels. Signature UMAPs stay under UMAP/ by name.
 _MIXSCAPE_FIGURES = frozenset(
     {
@@ -73,7 +87,7 @@ _MIXSCALE_FIGURES = frozenset({"mixscale_score_ridge", "mixscale_scatter"})
 
 def _output_bucket(name: str, section: str) -> str:
     # Signature UMAPs may pass section "mixscape"; the image still goes to UMAP/.
-    if name.startswith("umap_"):
+    if name.startswith("umap_") or name in _UMAP_QC_PASS_FIGURES:
         return "umap"
     # Mixscale section / heatmap stems win before shared DE-count names.
     if (
@@ -239,6 +253,17 @@ class FigureStore:
             Path("E-distance") / f"{name}.png",
             Path("E-distance") / "figures" / f"{name}.png",
         ]
+        # QC-pass preprocess plots moved from qc/ → UMAP/.
+        if bucket == "umap" and name in _UMAP_QC_PASS_FIGURES:
+            relatives.extend(
+                (
+                    Path("qc") / f"{name}.png",
+                    Path("qc") / f"{name}.pdf",
+                    Path("qc") / f"{name}.txt",
+                    Path("qc") / "tables" / f"{name}.tsv",
+                    Path("qc") / "tables" / f"{name}.skipped.txt",
+                )
+            )
         keep = {
             self.figure_dir(name, section) / f"{name}.png",
             self.data_dir(name, section) / f"{name}.tsv",
@@ -319,7 +344,13 @@ def open_figure_store(
 
 def retire_removed_umaps(output_dir: Path) -> None:
     """Remove non-current UMAP PNG/TSV names if present under the output root."""
-    names = ("umap_leiden", "umap_assignment", "umap_target", "umap_status")
+    names = (
+        "umap_leiden",
+        "umap_assignment",
+        "umap_target",
+        "umap_status",
+        "pca_scatter",
+    )
     root = Path(output_dir)
     relatives: list[Path] = []
     for name in names:
@@ -440,29 +471,81 @@ def draw_guides_per_cell(store: FigureStore, n_guides: pd.Series) -> None:
 
 
 def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: int) -> None:
-    if targets.empty:
-        store.skip("cells_per_target_bar", "no_targets")
+    """Bars by reference ``target_gene_name`` (ledger ``target_gene``); name under each bar."""
+    _draw_cells_per_label_bar(
+        store,
+        targets,
+        min_cells=min_cells,
+        figure_name="cells_per_target_bar",
+        label_column="target_gene",
+        unit_word="targets",
+        threshold_key="min_cells_per_target",
+        threshold_note=f"eligibility keeps n_cells ≥ {min_cells}",
+        method_prefix=(
+            "cells per target_gene_name for every reference/assigned target "
+            "(incl. zeros; no analysis_eligible / min-cell filter)"
+        ),
+    )
+
+
+def draw_cells_per_guide_name(
+    store: FigureStore, guides: pd.DataFrame, min_cells: int
+) -> None:
+    """Bars by reference ``name`` (ledger ``guide_name``); name under each bar."""
+    _draw_cells_per_label_bar(
+        store,
+        guides,
+        min_cells=min_cells,
+        figure_name="cells_per_guide_name_bar",
+        label_column="guide_name",
+        unit_word="guides",
+        threshold_key="min_cells_per_guide",
+        threshold_note="guide-level count reference only; not a cell exclusion gate",
+        method_prefix=(
+            "cells per feature_barcode_reference name for every reference/assigned "
+            "guide (incl. zeros; no analysis_eligible filter)"
+        ),
+    )
+
+
+def _draw_cells_per_label_bar(
+    store: FigureStore,
+    table: pd.DataFrame,
+    *,
+    min_cells: int,
+    figure_name: str,
+    label_column: str,
+    unit_word: str,
+    threshold_key: str,
+    threshold_note: str,
+    method_prefix: str,
+) -> None:
+    if table.empty or label_column not in table.columns or "n_cells" not in table.columns:
+        store.skip(figure_name, "no_targets" if unit_word == "targets" else "no_guides")
         return
-    shown = targets.sort_values("n_cells", ascending=False, kind="mergesort")
+    shown = table.sort_values("n_cells", ascending=False, kind="mergesort")
+    names = shown[label_column].astype(str).to_numpy()
     n_cells = shown["n_cells"].astype(float)
     values = n_cells.to_numpy()
     min_obs = float(np.min(values))
     median_cells = float(np.median(values))
     max_obs = float(np.max(values))
-    # Match assign: low_cells_target when n_cells < min_cells_per_target → keep ≥.
     ge_mask = values >= float(min_cells)
     n_ge_threshold = int(np.sum(ge_mask))
     n_cells_ge = int(np.sum(values[ge_mask]))
     total_cells = int(np.sum(values))
-    n_targets = int(len(shown))
-    figure, axis = store._figure(width=max(8, min(24, 0.18 * len(shown))))
-    axis.bar(np.arange(len(shown)), n_cells, color=store.palette("targeting"))
+    n_items = int(len(shown))
+    width = max(8.0, min(48.0, 0.16 * n_items + 2.0))
+    height = max(6.0, min(10.0, 4.5 + 0.012 * n_items))
+    figure, axis = store._figure(width=width, height=height)
+    figure.perturbseq_skip_tight_layout = True
+    axis.bar(np.arange(n_items), n_cells, color=store.palette("targeting"))
     axis.axhline(
         min_cells,
         color=store.palette("low_power"),
         linestyle="--",
         linewidth=1.0,
-        label=f"min_cells_per_target = {min_cells} (eligibility keeps n_cells ≥ {min_cells})",
+        label=f"{threshold_key} = {min_cells} ({threshold_note})",
     )
     axis.axhline(
         min_obs,
@@ -486,32 +569,33 @@ def draw_cells_per_target(store: FigureStore, targets: pd.DataFrame, min_cells: 
         label=f"max = {max_obs:g}",
     )
     axis.set_ylabel("cells")
-    if len(shown) <= 40:
-        axis.set_xticks(np.arange(len(shown)), shown["target_gene"].astype(str), rotation=90)
+    tick_fs = 7 if n_items <= 60 else (5 if n_items <= 150 else 4)
+    axis.set_xticks(
+        np.arange(n_items), names, rotation=45, ha="right", rotation_mode="anchor", fontsize=tick_fs
+    )
+    if n_items <= 40:
         _label_count_bars(axis, shown["n_cells"])
-    else:
-        axis.set_xticks([])
-        axis.set_xlabel(f"{len(shown)} targets (incl. zeros); names and counts are in the table")
     handles, labels = axis.get_legend_handles_labels()
     handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
     labels.append(f"total cells = {total_cells}")
     handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
-    labels.append(f"targets with n_cells ≥ {min_cells}: {n_ge_threshold} / {n_targets}")
+    labels.append(f"{unit_word} with n_cells ≥ {min_cells}: {n_ge_threshold} / {n_items}")
     handles.append(Line2D([], [], linestyle="none", marker="", color="none"))
-    labels.append(f"sum n_cells (those targets): {n_cells_ge}")
+    labels.append(f"sum n_cells (those {unit_word}): {n_cells_ge}")
     axis.legend(handles, labels, frameon=False, fontsize=8, loc="upper right")
+    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.28, top=0.92)
     store.save(
         figure,
-        "cells_per_target_bar",
+        figure_name,
         "qc",
-        targets,
-        "cells per target for every reference/assigned target (incl. zeros; "
-        "no analysis_eligible / min-cell filter); dashed = min_cells_per_target "
-        f"(eligibility ≥ {min_cells}); "
+        table,
+        f"{method_prefix}; dashed = {threshold_key} "
+        f"({threshold_note}); "
         f"dotted/solid/dashdot = min/median/max ({min_obs:g}/{median_cells:g}/{max_obs:g}); "
         f"total cells = {total_cells}; "
-        f"n_cells ≥ {min_cells}: {n_ge_threshold}/{n_targets}; "
-        f"sum n_cells on those targets: {n_cells_ge}",
+        f"n_cells ≥ {min_cells}: {n_ge_threshold}/{n_items}; "
+        f"sum n_cells on those {unit_word}: {n_cells_ge}; "
+        f"x tick = {label_column}",
     )
 
 
@@ -1531,7 +1615,7 @@ def draw_qc_scatter_panel(
     *,
     population: str = "qc metrics",
 ) -> None:
-    """1×2 QC scatter panel: nCount vs percent.mt and nCount vs nFeature."""
+    """1×2 QC scatter panel: log10(nCount) vs percent.mt and log10(nCount) vs log10(nFeature)."""
     name = _QC_SCATTER_PANEL_NAME
     _remove_legacy_qc_scatters(store.output_dir)
     mito = _mito_column(metrics)
@@ -1548,26 +1632,47 @@ def draw_qc_scatter_panel(
     ncount = pd.to_numeric(shown["total_counts"], errors="coerce").to_numpy(dtype=float)
     nfeature = pd.to_numeric(shown["n_genes_by_counts"], errors="coerce").to_numpy(dtype=float)
     percent_mt = scaled.to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ncount = np.where(np.isfinite(ncount) & (ncount > 0), np.log10(ncount), np.nan)
+        log_nfeature = np.where(
+            np.isfinite(nfeature) & (nfeature > 0), np.log10(nfeature), np.nan
+        )
     fill = store.palette("hist_fill", _HIST_FILL)
     figure, axes = plt.subplots(1, 2, figsize=(10.8, 5.0))
     axes[0].scatter(
-        ncount, percent_mt, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True, zorder=2
+        log_ncount,
+        percent_mt,
+        s=8,
+        linewidths=0,
+        c=fill,
+        alpha=0.55,
+        rasterized=True,
+        zorder=2,
     )
-    axes[0].set_xlabel("nCount_RNA")
+    axes[0].set_xlabel("log10(nCount_RNA)")
     axes[0].set_ylabel("percent.mt")
-    axes[0].set_title("nCount vs percent.mt", loc="left", fontsize=11)
+    axes[0].set_title("log10(nCount) vs percent.mt", loc="left", fontsize=11)
     axes[1].scatter(
-        ncount, nfeature, s=8, linewidths=0, c=fill, alpha=0.55, rasterized=True, zorder=2
+        log_ncount,
+        log_nfeature,
+        s=8,
+        linewidths=0,
+        c=fill,
+        alpha=0.55,
+        rasterized=True,
+        zorder=2,
     )
-    axes[1].set_xlabel("nCount_RNA")
-    axes[1].set_ylabel("nFeature_RNA")
-    axes[1].set_title("nCount vs nFeature", loc="left", fontsize=11)
+    axes[1].set_xlabel("log10(nCount_RNA)")
+    axes[1].set_ylabel("log10(nFeature_RNA)")
+    axes[1].set_title("log10(nCount) vs log10(nFeature)", loc="left", fontsize=11)
     for axis in axes:
         _style_library_d(axis)
     table = pd.DataFrame(
         {
             "nCount_RNA": ncount,
             "nFeature_RNA": nfeature,
+            "log10_nCount_RNA": log_ncount,
+            "log10_nFeature_RNA": log_nfeature,
             "percent.mt": percent_mt,
         }
     )
@@ -1577,7 +1682,7 @@ def draw_qc_scatter_panel(
         "qc",
         table,
         (
-            "1x2 QC scatter panel; FeatureScatter nCount vs percent.mt / nFeature "
+            "1x2 QC scatter panel; log10(nCount) vs percent.mt / log10(nFeature) "
             f"({note}); {population}; seed={seed}"
         ),
     )
@@ -1692,7 +1797,7 @@ def _marker_by_cluster_table(
 
 
 def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
-    """Fraction detected by cluster; white panel, Blues cmap, annotated row labels."""
+    """Fraction detected by cluster; Seurat DoHeatmap colors on a white panel."""
     name = "marker_detection_heatmap"
     if "leiden" not in adata.obs:
         store.skip(name, "missing_leiden")
@@ -1734,7 +1839,7 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
     axis.set_title(f"{sample} marker detection by cluster", loc="left", fontsize=12, color="black")
     axis.set_xticks(np.arange(-0.5, len(found), 1), minor=True)
     axis.set_yticks(np.arange(-0.5, len(matrix.index), 1), minor=True)
-    axis.grid(which="minor", color="white", linestyle="-", linewidth=1.4, zorder=3)
+    axis.grid(which="minor", color="#E0E0E0", linestyle="-", linewidth=1.0, zorder=3)
     axis.tick_params(which="minor", bottom=False, left=False)
     axis.tick_params(colors="black", length=0)
     for spine in axis.spines.values():
@@ -1744,13 +1849,16 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
     colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
     colorbar.set_label("Fraction detected", color="black")
     colorbar.ax.yaxis.set_tick_params(color="black")
+    colorbar.ax.set_facecolor("white")
+    colorbar.outline.set_edgecolor("black")
     plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="black")
     left = min(0.42, 0.12 + label_width * 0.012)
     figure.subplots_adjust(left=left, right=0.88, bottom=0.18, top=0.90)
     method = (
         f"fraction detected per Leiden cluster; row labels from {annot_col} "
-        f"as 'leiden: annotation' when available; cmap={_MARKER_HEATMAP_CMAP}; "
-        f"white panel + black border; markers={','.join(found)}"
+        "as 'leiden: annotation' when available; "
+        "cmap=Seurat DoHeatmap (purple→black→yellow); white panel; "
+        f"markers={','.join(found)}"
     )
     if missing:
         method += f"; missing={','.join(missing)}"
@@ -1758,7 +1866,7 @@ def draw_marker_detection_heatmap(store: FigureStore, adata: AnnData, markers: l
 
 
 def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str]) -> None:
-    """Seurat-style marker dotplot: white panel; size=% expressed; color=average expression.
+    """Seurat DotPlot-like markers on a white panel; size=% expressed; color=lightgrey→blue.
 
     Cluster rows use the same ``leiden: annotation`` labels as
     ``marker_detection_heatmap`` (SingleR / ScType / cell_type when available).
@@ -1803,8 +1911,8 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
         s=sizes,
         c=table["mean_expression"].to_numpy(dtype=float),
         cmap=_DOTPLOT_CMAP,
-        edgecolors="#333333",
-        linewidths=0.25,
+        edgecolors="none",
+        linewidths=0.0,
         zorder=3,
     )
     axis.set_xticks(np.arange(len(found)))
@@ -1815,8 +1923,7 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
     axis.set_ylim(-0.6, len(clusters) - 0.4)
     axis.invert_yaxis()
     axis.tick_params(colors="black", length=0, pad=3)
-    axis.grid(True, which="major", color=_GRID_MAJOR, linewidth=0.55, zorder=0)
-    axis.set_axisbelow(True)
+    axis.grid(False)
     for spine in axis.spines.values():
         spine.set_visible(True)
         spine.set_color("black")
@@ -1833,9 +1940,8 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
             [0],
             marker="o",
             color="none",
-            markerfacecolor="#6BAED6",
-            markeredgecolor="#333333",
-            markeredgewidth=0.4,
+            markerfacecolor="#9ECAE1",
+            markeredgecolor="none",
             markersize=max(3.0, np.sqrt(8.0 + 220.0 * value) / 2.2),
             label=str(int(value * 100)),
         )
@@ -1858,10 +1964,12 @@ def draw_dotplot_markers(store: FigureStore, adata: AnnData, markers: list[str])
     colorbar = figure.colorbar(points, ax=axis, fraction=0.04, pad=0.12, shrink=0.55, anchor=(0.0, 0.15))
     colorbar.set_label("Average Expression", color="black", fontsize=9)
     colorbar.ax.yaxis.set_tick_params(color="black", labelsize=8)
+    colorbar.ax.set_facecolor("white")
+    colorbar.outline.set_edgecolor("black")
     plt.setp(colorbar.ax.yaxis.get_ticklabels(), color="black")
     method = (
-        "Seurat-style dotplot; white panel; size=Percent Expressed; "
-        f"color=Average Expression ({_DOTPLOT_CMAP}); "
+        "Seurat DotPlot-like; white panel; size=Percent Expressed; "
+        "color=Average Expression (lightgrey→blue); "
         f"row labels from {annot_col} as 'leiden: annotation' when available; "
         f"markers={','.join(found)}"
     )
@@ -1972,116 +2080,6 @@ def draw_pca_elbow(store: FigureStore, adata: AnnData) -> None:
     axis.set_xlabel("PC")
     axis.set_ylabel("variance explained (%)")
     store.save(figure, "pca_elbow", "embedding", table, "ElbowPlot of PCA variance ratio")
-
-
-def _pca_display_limits(
-    x: np.ndarray, y: np.ndarray, *, low: float = 0.5, high: float = 99.5, pad: float = 0.05
-) -> tuple[tuple[float, float], tuple[float, float], int]:
-    """Percentile window for display only; does not alter stored PCA coordinates."""
-    x_lo, x_hi = np.percentile(x, [low, high])
-    y_lo, y_hi = np.percentile(y, [low, high])
-    x_span = max(float(x_hi - x_lo), 1e-9)
-    y_span = max(float(y_hi - y_lo), 1e-9)
-    xlim = (float(x_lo - pad * x_span), float(x_hi + pad * x_span))
-    ylim = (float(y_lo - pad * y_span), float(y_hi + pad * y_span))
-    n_out = int(((x < xlim[0]) | (x > xlim[1]) | (y < ylim[0]) | (y > ylim[1])).sum())
-    return xlim, ylim, n_out
-
-
-def _place_compact_legend(axis: Axes, *, title: str, n_categories: int) -> None:
-    """Put a multi-column legend below the axes so it does not cover ticks or data."""
-    legend = axis.get_legend()
-    if legend is None:
-        return
-    handles, labels = axis.get_legend_handles_labels()
-    legend.remove()
-    ncol = min(8, max(1, n_categories))
-    axis.legend(
-        handles,
-        labels,
-        title=title,
-        frameon=False,
-        fontsize=6,
-        title_fontsize=7,
-        markerscale=0.65,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.12),
-        ncol=ncol,
-        borderaxespad=0.0,
-        columnspacing=0.8,
-        handletextpad=0.3,
-        labelspacing=0.25,
-    )
-
-
-def draw_pca_scatter(store: FigureStore, adata: AnnData) -> None:
-    """PC1 vs PC2. Leiden is used when it exists; cell type is not invented."""
-    if "X_pca" not in adata.obsm or adata.obsm["X_pca"].shape[1] < 2:
-        store.skip("pca_scatter", "missing_fields")
-        return
-    coordinates = np.asarray(adata.obsm["X_pca"][:, :2], dtype=float)
-    if not np.isfinite(coordinates).all():
-        store.skip("pca_scatter", "non_finite_coordinates")
-        return
-    table = pd.DataFrame({"PC1": coordinates[:, 0], "PC2": coordinates[:, 1]})
-    figure, axis = store._figure()
-    figure.perturbseq_manual_layout = True
-    if "leiden" in adata.obs:
-        labels = adata.obs["leiden"].astype(str)
-        table["leiden"] = labels.to_numpy()
-        # Prefer numeric Leiden order when labels are cluster indices.
-        try:
-            hue_order = sorted(labels.unique(), key=lambda value: int(value))
-        except ValueError:
-            hue_order = sorted(labels.unique())
-        sns.scatterplot(
-            data=table,
-            x="PC1",
-            y="PC2",
-            hue="leiden",
-            hue_order=hue_order,
-            s=6,
-            alpha=0.45,
-            linewidth=0,
-            ax=axis,
-            rasterized=True,
-        )
-        _place_compact_legend(axis, title="leiden", n_categories=len(hue_order))
-        note = "colored by Leiden"
-    else:
-        axis.scatter(
-            table["PC1"],
-            table["PC2"],
-            s=6,
-            c="#4C78A8",
-            alpha=0.45,
-            linewidths=0,
-            rasterized=True,
-        )
-        note = "uncolored; no invented cell type"
-    xlim, ylim, n_outliers = _pca_display_limits(table["PC1"].to_numpy(), table["PC2"].to_numpy())
-    axis.set_xlim(*xlim)
-    axis.set_ylim(*ylim)
-    if n_outliers > 0:
-        axis.text(
-            0.02,
-            0.98,
-            f"{n_outliers} points outside 0.5–99.5% display window",
-            transform=axis.transAxes,
-            fontsize=7,
-            va="top",
-            ha="left",
-        )
-    axis.set_xlabel("PC1")
-    axis.set_ylabel("PC2")
-    store.save(
-        figure,
-        "pca_scatter",
-        "embedding",
-        table,
-        f"DimPlot PCA; {note}; display axes 0.5–99.5% (X_pca unchanged); "
-        f"{n_outliers} points outside window",
-    )
 
 
 _GLOBAL_COLORS = {
@@ -2344,8 +2342,11 @@ def _cell_level_volcano(
     result = subset.uns["rank_genes_groups"]
     genes = np.asarray(result["names"][target]).astype(str)
     log_fc = np.asarray(result["logfoldchanges"][target], dtype=float)
+    p_value = np.asarray(result["pvals"][target], dtype=float)
     adj_p = np.asarray(result["pvals_adj"][target], dtype=float)
-    table = pd.DataFrame({"gene": genes, "log_fc": log_fc, "adj_p_value": adj_p})
+    table = pd.DataFrame(
+        {"gene": genes, "log_fc": log_fc, "p_value": p_value, "adj_p_value": adj_p}
+    )
     up = (table["log_fc"] >= lfc_line) & (table["adj_p_value"] < pval_cutoff)
     down = (table["log_fc"] <= -lfc_line) & (table["adj_p_value"] < pval_cutoff)
     table["direction"] = np.where(up, "Up", np.where(down, "Down", "not DE"))
@@ -2354,6 +2355,19 @@ def _cell_level_volcano(
     plotted = table["adj_p_value"].where(table["adj_p_value"] > 0, floor)
     table["neg_log10_adj_p"] = -np.log10(plotted)
     return table
+
+
+def _order_by_mixscape_prob(
+    index: np.ndarray, probability: np.ndarray, cap: int, seed: int
+) -> np.ndarray:
+    """Downsample then order by Mixscape KO posterior (high → low), like order.by.prob."""
+    chosen = _group_index(np.asarray(index, dtype=int), cap, seed)
+    if chosen.size == 0:
+        return chosen
+    finite = np.isfinite(probability[chosen])
+    ordered = chosen[finite][np.argsort(-probability[chosen[finite]], kind="mergesort")]
+    missing = chosen[~finite]
+    return np.concatenate([ordered, missing]) if missing.size else ordered
 
 
 def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label: str) -> None:
@@ -2368,11 +2382,12 @@ def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label:
         "NP": probability[(targets == target) & (status == "non_perturbed")],
         prtb: probability[(targets == target) & (status == "perturbed")],
     }
-    order = list(groups)
+    # Drop empty classes (e.g. no KO) so stripplot still draws NP+NT.
+    order = [name for name, values in groups.items() if len(values) > 0]
     long = pd.DataFrame(
         {
-            "Identity": np.concatenate([[name] * len(values) for name, values in groups.items()]),
-            "probability": np.concatenate([values.to_numpy() for values in groups.values()]),
+            "Identity": np.concatenate([[name] * len(groups[name]) for name in order]),
+            "probability": np.concatenate([groups[name].to_numpy() for name in order]),
         }
     )
     sns.stripplot(
@@ -2386,7 +2401,11 @@ def _draw_posterior(axis: Axes, adata: AnnData, target: str, perturbation_label:
         jitter=0.25,
     )
     axis.set_ylim(-0.05, 1.05)
-    axis.set_title("Posterior probability", fontsize=11, pad=8)
+    missing = [name for name in groups if name not in order]
+    title = "Posterior probability"
+    if missing:
+        title = f"Posterior probability (no {'/'.join(missing)})"
+    axis.set_title(title, fontsize=11, pad=8)
     axis.set_xlabel("")
     axis.set_ylabel("P(perturbed)", fontsize=9, labelpad=10)
     axis.tick_params(axis="x", labelrotation=0, labelsize=9)
@@ -2500,57 +2519,132 @@ def _draw_volcano_axis(
     axis.legend(frameon=False, fontsize=7, loc="lower right")
 
 
+def _resolve_gene_indices(
+    adata: AnnData, gene_names: list[str]
+) -> tuple[np.ndarray, list[str]]:
+    """Map gene symbols / var names to var indices and display labels."""
+    var_names = adata.var_names.astype(str).to_numpy()
+    symbols = (
+        adata.var["gene_symbol"].astype(str).to_numpy()
+        if "gene_symbol" in adata.var.columns
+        else var_names
+    )
+    name_to_index = {name: index for index, name in enumerate(var_names)}
+    symbol_to_index = {symbol: index for index, symbol in enumerate(symbols)}
+    ordered: list[int] = []
+    labels: list[str] = []
+    seen: set[int] = set()
+    for gene_name in gene_names:
+        index = name_to_index.get(gene_name)
+        if index is None:
+            index = symbol_to_index.get(gene_name)
+        if index is None or index in seen:
+            continue
+        seen.add(index)
+        ordered.append(int(index))
+        labels.append(str(symbols[index]))
+    return np.asarray(ordered, dtype=int), labels
+
+
+def _mixscape_heatmap_gene_indices(
+    adata: AnnData,
+    volcano: pd.DataFrame,
+    *,
+    max_genes: int,
+    lfc_line: float,
+    pval_cutoff: float,
+    balanced: bool = False,
+) -> tuple[np.ndarray, list[str]]:
+    """Gene pick aligned to Seurat ``MixscapeHeatmap``.
+
+    Seurat calls ``FindMarkers(ident.1=NT, ident.2=target)`` on RNA, so
+    ``avg_log2FC`` is NT vs target (= ``-volcano.log_fc``). Vignette uses
+    ``balanced=FALSE`` → NT-high genes only (target down), ``p_val < cutoff``,
+    top ``max.genes`` by raw p-value. ``balanced=TRUE`` takes up to
+    ``max.genes`` from each side.
+    """
+    if not isinstance(volcano, pd.DataFrame) or volcano.empty:
+        return np.asarray([], dtype=int), []
+    if "log_fc" not in volcano.columns or "gene" not in volcano.columns:
+        return np.asarray([], dtype=int), []
+    frame = volcano.copy()
+    # Seurat MixscapeHeatmap uses raw p_val; fall back to adj_p if absent.
+    p_col = "p_value" if "p_value" in frame.columns else (
+        "adj_p_value" if "adj_p_value" in frame.columns else None
+    )
+    if p_col is None:
+        return np.asarray([], dtype=int), []
+    frame["_nt_fc"] = -frame["log_fc"].astype(float)
+    frame["_p"] = frame[p_col].astype(float)
+    frame = frame.sort_values("_p", ascending=True, kind="mergesort")
+    pos = frame.loc[
+        (frame["_nt_fc"] > float(lfc_line)) & (frame["_p"] < float(pval_cutoff)), "gene"
+    ].astype(str)
+    neg = frame.loc[
+        (frame["_nt_fc"] < -float(lfc_line)) & (frame["_p"] < float(pval_cutoff)), "gene"
+    ].astype(str)
+    names: list[str] = []
+    if balanced:
+        names.extend(pos.head(int(max_genes)).tolist())
+        names.extend(neg.head(int(max_genes)).tolist())
+    else:
+        # Vignette: balanced=FALSE → only NT-high (KO/KD depleted) genes.
+        names.extend(pos.head(int(max_genes)).tolist())
+    return _resolve_gene_indices(adata, names)
+
+
 def _heatmap_panel(
     axis: Axes,
     adata: AnnData,
     target: str,
     perturbation_label: str,
     *,
+    volcano: pd.DataFrame,
     seed: int,
     max_genes: int,
     max_cells: int,
+    lfc_line: float = 0.25,
+    pval_cutoff: float = 0.05,
 ) -> int:
-    from scipy import sparse
-
+    """Heatmap panel aligned to Seurat MixscapeHeatmap (RNA, order.by.prob)."""
     status = _status_labels(adata.obs["mixscape_status"]).to_numpy()
     targets = adata.obs["target_gene"].astype(str).to_numpy()
+    probability = adata.obs["mixscape_class_p"].to_numpy(dtype=float)
     nt_index = _control_positions(status)
     control_block = "zero-guide cells" if np.any(status == "zero_guide") else "NT"
     ko = np.flatnonzero((targets == target) & (status == "perturbed"))
     np_cells = np.flatnonzero((targets == target) & (status == "non_perturbed"))
-    layer = "X_pert" if "X_pert" in adata.layers else None
-    source = adata.layers[layer] if layer else adata.X
-    ko_block = source[ko]
-    np_block = source[np_cells]
-    if sparse.issparse(ko_block):
-        difference = np.abs(
-            np.asarray(ko_block.mean(axis=0)).ravel() - np.asarray(np_block.mean(axis=0)).ravel()
-        )
-    else:
-        difference = np.abs(
-            np.asarray(ko_block, dtype=float).mean(axis=0)
-            - np.asarray(np_block, dtype=float).mean(axis=0)
-        )
-    genes = np.asarray(
-        [index for index in np.argsort(-difference) if difference[index] > 0][:max_genes]
-    )
-    if genes.size == 0 or min(nt_index.size, np_cells.size, ko.size) == 0:
+    if nt_index.size == 0 or (ko.size == 0 and np_cells.size == 0):
         axis.set_axis_off()
-        axis.set_title(f"{target}: missing NP, {control_block}, or KO")
+        axis.set_title(f"{target}: missing NP/{control_block}/KO")
         return 0
+    genes, display = _mixscape_heatmap_gene_indices(
+        adata,
+        volcano,
+        max_genes=max_genes,
+        lfc_line=lfc_line,
+        pval_cutoff=pval_cutoff,
+        balanced=False,
+    )
+    if genes.size == 0:
+        axis.set_axis_off()
+        axis.set_title(f"{target}: no MixscapeHeatmap genes")
+        return 0
+    # Seurat MixscapeHeatmap: assay=RNA (not PRTB / X_pert); order.by.prob=TRUE.
     columns, group_labels = mixscape_heatmap_cell_order(
-        _group_index(np_cells, max_cells, seed + 1),
-        _group_index(nt_index, max_cells, seed + 2),
-        _group_index(ko, max_cells, seed),
+        _order_by_mixscape_prob(np_cells, probability, max_cells, seed + 1),
+        _order_by_mixscape_prob(nt_index, probability, max_cells, seed + 2),
+        _order_by_mixscape_prob(ko, probability, max_cells, seed),
     )
     if control_block != "NT":
         group_labels = [control_block if label == "NT" else label for label in group_labels]
-    values = _row_matrix(adata, columns, genes, layer).T
+    values = _row_matrix(adata, columns, genes, None).T
     center = values.mean(axis=1, keepdims=True)
     scale = values.std(axis=1, keepdims=True)
     scale[scale == 0] = 1
     scaled = (values - center) / scale
-    largest = max(group_labels.count("NP"), group_labels.count("NT"), group_labels.count("KO"))
+    counts = [group_labels.count(label) for label in ("NP", "NT", "KO") if group_labels.count(label)]
+    largest = max(counts) if counts else 1
     gap = max(6, int(round(0.08 * largest)))
     gapped, spans = gapped_heatmap_matrix(scaled, group_labels, gap=gap)
     axis.imshow(
@@ -2561,13 +2655,8 @@ def _heatmap_panel(
         vmax=2,
         interpolation="none",
     )
-    symbols = (
-        adata.var["gene_symbol"].astype(str).to_numpy()
-        if "gene_symbol" in adata.var.columns
-        else adata.var_names.astype(str).to_numpy()
-    )
     axis.set_yticks(np.arange(genes.size))
-    axis.set_yticklabels(symbols[genes], fontsize=6)
+    axis.set_yticklabels(display, fontsize=6)
     axis.set_xticks([])
     _annotate_heatmap_groups(
         axis,
@@ -2575,7 +2664,10 @@ def _heatmap_panel(
         int(genes.size),
         {"NP": "NP", "NT": "NT", "KO": str(perturbation_label or "KO")},
     )
-    axis.set_title(f"Top {genes.size} genes", fontsize=11, pad=10)
+    title = f"Top {genes.size} DE (RNA, NT-high)"
+    if ko.size == 0:
+        title = f"Top {genes.size} DE (RNA, NT-high; no KO)"
+    axis.set_title(title, fontsize=11, pad=10)
     return int(genes.size)
 
 
@@ -2899,16 +2991,15 @@ def draw_mixscape_target_panels(
     pval_cutoff: float = 0.05,
     lfc_line: float = 0.1,
 ) -> None:
-    """One 2x2 PNG per target: posterior, perturbation score, cell-level volcano, Top 20 heatmap.
+    """One PNG per classified target.
 
-    ``lfc_line`` is Mixscape ``logfc_threshold`` (project default 0.1). The heatmap stays
-    in the bottom-right panel.
+    With Mixscape scores: 2×2 (posterior, score, volcano, heatmap).
+    Without scores (common when every cell is NP): 1×3 (posterior, volcano, heatmap).
+    Heatmap follows Seurat MixscapeHeatmap: RNA expression, NT-high DE genes
+    (balanced=FALSE), raw p cutoff, cells ordered by KO posterior within NP|NT|KO.
     """
     if "mixscape_status" not in adata.obs or "mixscape_class_p" not in adata.obs:
         store.skip("mixscape_target_panels", "mixscape_not_run")
-        return
-    if "mixscape" not in adata.uns:
-        store.skip("mixscape_target_panels", "perturbation_scores_missing")
         return
     status = _status_labels(adata.obs["mixscape_status"]).to_numpy()
     targets = adata.obs["target_gene"].astype(str).to_numpy()
@@ -2919,9 +3010,17 @@ def draw_mixscape_target_panels(
     for target in pd.unique(targets[classified]):
         n_ko = int(((targets == target) & (status == "perturbed")).sum())
         n_np = int(((targets == target) & (status == "non_perturbed")).sum())
-        record = {"target_gene": target, "n_ko": n_ko, "n_np": n_np, "n_nt": n_nt}
-        if min(n_ko, n_np, n_nt) == 0 or _score_frame(adata, str(target)) is None:
-            record.update(status="skipped", reason="missing_ko_np_nt_or_score")
+        has_score = _score_frame(adata, str(target)) is not None
+        record = {
+            "target_gene": target,
+            "n_ko": n_ko,
+            "n_np": n_np,
+            "n_nt": n_nt,
+            "has_score": has_score,
+        }
+        # KO and/or score table may be absent (all-NP targets); still plot with NT+(KO|NP).
+        if n_nt < 1 or (n_ko < 1 and n_np < 1):
+            record.update(status="skipped", reason="missing_nt_or_class")
             rows.append(record)
             continue
         try:
@@ -2934,13 +3033,25 @@ def draw_mixscape_target_panels(
             record.update(status="skipped", reason="volcano_not_estimable")
             rows.append(record)
             continue
-        figure, axes = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=False)
-        # 2x2 needs its own margins; do not use single-panel perturbseq_manual_layout.
-        figure.perturbseq_skip_tight_layout = True
-        _draw_posterior(axes[0, 0], adata, str(target), perturbation_label)
-        _draw_perturb_score(axes[0, 1], adata, str(target), perturbation_label, seed)
+        if has_score:
+            figure, axes = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=False)
+            figure.perturbseq_skip_tight_layout = True
+            posterior_ax, score_ax = axes[0, 0], axes[0, 1]
+            volcano_ax, heat_ax = axes[1, 0], axes[1, 1]
+            _draw_posterior(posterior_ax, adata, str(target), perturbation_label)
+            _draw_perturb_score(score_ax, adata, str(target), perturbation_label, seed)
+            layout = "2x2"
+            adjust = dict(left=0.10, right=0.96, bottom=0.08, top=0.90, wspace=0.42, hspace=0.52)
+        else:
+            # No score table: drop the score panel → 1×3.
+            figure, axes = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=False)
+            figure.perturbseq_skip_tight_layout = True
+            posterior_ax, volcano_ax, heat_ax = axes[0], axes[1], axes[2]
+            _draw_posterior(posterior_ax, adata, str(target), perturbation_label)
+            layout = "1x3"
+            adjust = dict(left=0.06, right=0.98, bottom=0.14, top=0.86, wspace=0.35)
         _draw_volcano_axis(
-            axes[1, 0],
+            volcano_ax,
             volcano,
             lfc_line,
             pval_cutoff,
@@ -2949,19 +3060,34 @@ def draw_mixscape_target_panels(
             max_labels=3,
         )
         n_genes = _heatmap_panel(
-            axes[1, 1],
+            heat_ax,
             adata,
             str(target),
             perturbation_label,
+            volcano=volcano,
             seed=seed,
             max_genes=max_genes,
             max_cells=max_cells,
+            lfc_line=lfc_line,
+            pval_cutoff=pval_cutoff,
         )
         contrast = _contrast_name(str(control))
-        figure.suptitle(f"{target} vs {contrast}", fontsize=14, y=0.98)
-        figure.subplots_adjust(
-            left=0.10, right=0.96, bottom=0.08, top=0.90, wspace=0.42, hspace=0.52
-        )
+        title = f"{target} vs {contrast}"
+        extras = []
+        if n_ko < 1:
+            extras.append("no KO cells")
+        if not has_score:
+            extras.append("no score → 1×3")
+        if extras:
+            title = f"{title} ({'; '.join(extras)})"
+        figure.suptitle(title, fontsize=14, y=0.98)
+        figure.subplots_adjust(**adjust)
+        note_parts = []
+        if n_ko < 1:
+            note_parts.append("no KO cells (NP+NT only)")
+        if not has_score:
+            note_parts.append("no Mixscape score table; layout 1x3")
+        note = f"; {'; '.join(note_parts)}" if note_parts else ""
         store.save(
             figure,
             f"{_safe(str(target))}_mixscape_2x2",
@@ -2969,10 +3095,14 @@ def draw_mixscape_target_panels(
             volcano,
             (
                 f"cell-level Wilcoxon {target} vs {control}; not a biological-replicate test; "
-                f"heatmap genes={n_genes}; lfc={lfc_line}; pval_cutoff={pval_cutoff}"
+                f"layout={layout}; MixscapeHeatmap-aligned RNA heatmap genes={n_genes} "
+                f"(NT-high, raw p, order.by.prob); "
+                f"lfc={lfc_line}; pval_cutoff={pval_cutoff}{note}"
             ),
         )
-        record.update(status="plotted", reason="", n_heatmap_genes=n_genes)
+        record.update(
+            status="plotted", reason="", n_heatmap_genes=n_genes, layout=layout
+        )
         rows.append(record)
     selection = pd.DataFrame(rows)
     if store.plotting.get("save_plot_data", False):
@@ -2982,7 +3112,7 @@ def draw_mixscape_target_panels(
     export_target_in_de(store, adata, control=control)
     if selection.empty or (selection["status"] != "plotted").all():
         if selection.empty or not (selection["status"] == "plotted").any():
-            store.skip("mixscape_target_panels", "no_ko_np_nt_cells")
+            store.skip("mixscape_target_panels", "no_nt_or_classified_cells")
 
 
 def _mixscale_gate_frame(adata: AnnData) -> pd.DataFrame | None:
@@ -3020,11 +3150,11 @@ def _skipped_de_targets(adata: AnnData) -> list[str]:
 def _mixscale_de_gene_indices(
     adata: AnnData, target: str, *, max_genes: int
 ) -> tuple[np.ndarray, list[str]]:
-    """Indices and display symbols for Mixscale_DoHeatmap-style DE features.
+    """Indices / labels aligned to Mixscale_DoHeatmap feature selection.
 
-    Target symbol is placed first when present. Remaining genes follow stored
-    ``mixscale_de_genes`` ordered by logFC descending (tutorial), capped at
-    ``max_genes`` including the target row.
+    Tutorial: top ``max_genes`` DE by p-value, then reorder those by log2FC
+    descending; ``features = c(target, top_DEG)`` so the target row is first
+    and does not consume the DE budget.
     """
     genes = adata.uns.get("mixscale_de_genes")
     if not isinstance(genes, pd.DataFrame) or genes.empty:
@@ -3032,10 +3162,14 @@ def _mixscale_de_gene_indices(
     subset = genes[genes["target_gene"].astype(str) == str(target)].copy()
     if subset.empty:
         return np.asarray([], dtype=int), []
-    if "logfc" in subset.columns:
-        subset = subset.sort_values("logfc", ascending=False, kind="mergesort")
-    elif "rank" in subset.columns:
+    # DE gate stores rank by raw p ascending — same role as tutorial p_weight.
+    if "rank" in subset.columns:
         subset = subset.sort_values("rank", ascending=True, kind="mergesort")
+    elif "adj_p" in subset.columns:
+        subset = subset.sort_values("adj_p", ascending=True, kind="mergesort")
+    top = subset.head(int(max_genes)).copy()
+    if "logfc" in top.columns:
+        top = top.sort_values("logfc", ascending=False, kind="mergesort")
     var_names = adata.var_names.astype(str).to_numpy()
     symbols = (
         adata.var["gene_symbol"].astype(str).to_numpy()
@@ -3060,11 +3194,9 @@ def _mixscale_de_gene_indices(
         target_index = name_to_index.get(str(target))
     if target_index is not None:
         _push(int(target_index), str(target))
-    gene_col = "gene" if "gene" in subset.columns else "gene_symbol"
-    symbol_col = "gene_symbol" if "gene_symbol" in subset.columns else gene_col
-    for record in subset.itertuples(index=False):
-        if len(ordered) >= int(max_genes):
-            break
+    gene_col = "gene" if "gene" in top.columns else "gene_symbol"
+    symbol_col = "gene_symbol" if "gene_symbol" in top.columns else gene_col
+    for record in top.itertuples(index=False):
         gene_name = str(getattr(record, gene_col))
         symbol = str(getattr(record, symbol_col))
         index = name_to_index.get(gene_name)
@@ -3079,7 +3211,7 @@ def _mixscale_de_gene_indices(
 def _mixscale_classified_masks(
     adata: AnnData, target: str, control: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-    """NT / NP / KO index arrays for one target; ``True`` when Mixscape classes exist."""
+    """NT / NP / KO index arrays for ridge/scatter; ``True`` when Mixscape classes exist."""
     labels = adata.obs["target_gene"].astype(str).to_numpy()
     if "mixscape_status" not in adata.obs:
         nt = np.flatnonzero(labels == str(control))
@@ -3092,7 +3224,6 @@ def _mixscale_classified_masks(
     np_cells = np.flatnonzero((labels == str(target)) & (status == "non_perturbed"))
     ko = np.flatnonzero((labels == str(target)) & (status == "perturbed"))
     if np_cells.size == 0 and ko.size == 0:
-        # Mixscape present but this target was not classified → Mixscale_DoHeatmap 2-group.
         ko = np.flatnonzero(labels == str(target))
         return nt, np.asarray([], dtype=int), ko, False
     return nt, np_cells, ko, True
@@ -3118,31 +3249,26 @@ def _mixscale_heatmap_blocks(
     seed: int,
     max_cells: int,
 ) -> tuple[np.ndarray, list[str], str]:
-    """Cell columns and NP/NT/KO labels; within each block order by ``mixscale_score``."""
+    """NT | all target cells (Mixscale_DoHeatmap); within-block by ``mixscale_score``."""
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
-    nt, np_cells, ko, used_mixscape = _mixscale_classified_masks(adata, target, control)
-    nt_ord = _order_by_mixscale_score(nt, scores, max_cells, seed + 2)
-    np_ord = _order_by_mixscale_score(np_cells, scores, max_cells, seed + 1)
-    ko_ord = _order_by_mixscale_score(ko, scores, max_cells, seed)
-    if nt_ord.size == 0 or (ko_ord.size == 0 and np_ord.size == 0):
-        return np.asarray([], dtype=int), [], "missing_nt_or_perturbed"
-    # Mixscale panels: NT | NP | KO (CRISPR-mode label on KO block). Mixscape 2x2 stays NP|NT|KO.
-    pieces: list[np.ndarray] = [nt_ord]
-    group_labels = ["NT"] * int(nt_ord.size)
-    if used_mixscape and np_ord.size:
-        pieces.append(np_ord)
-        group_labels.extend(["NP"] * int(np_ord.size))
-    if ko_ord.size:
-        pieces.append(ko_ord)
-        group_labels.extend(["KO"] * int(ko_ord.size))
-    columns = np.concatenate(pieces)
-    if used_mixscape and np_ord.size and ko_ord.size:
-        mode = "mixscape_nt_np_ko"
-    elif used_mixscape:
-        mode = "mixscape_nt_ko" if ko_ord.size else "mixscape_nt_np"
+    labels = adata.obs["target_gene"].astype(str).to_numpy()
+    if "mixscape_status" in adata.obs:
+        status = _status_labels(adata.obs["mixscape_status"]).to_numpy()
+        nt = _control_positions(status)
+        if nt.size == 0:
+            nt = np.flatnonzero(labels == str(control))
     else:
-        mode = "mixscale_nt_perturbed"
-    return columns, group_labels, mode
+        nt = np.flatnonzero(labels == str(control))
+    # Official Mixscale_DoHeatmap: gene identity, not Mixscape NP/KO.
+    prtb = np.flatnonzero(labels == str(target))
+    nt_ord = _order_by_mixscale_score(nt, scores, max_cells, seed + 2)
+    prtb_ord = _order_by_mixscale_score(prtb, scores, max_cells, seed)
+    if nt_ord.size == 0 or prtb_ord.size == 0:
+        return np.asarray([], dtype=int), [], "missing_nt_or_perturbed"
+    columns = np.concatenate([nt_ord, prtb_ord])
+    control_block = "zero-guide" if str(control) == ZERO_GUIDE_LABEL else "NT"
+    group_labels = [control_block] * int(nt_ord.size) + [str(target)] * int(prtb_ord.size)
+    return columns, group_labels, "mixscale_nt_perturbed"
 
 
 def _draw_mixscale_de_heatmap(
@@ -3156,7 +3282,8 @@ def _draw_mixscale_de_heatmap(
     max_cells: int,
     perturbation_label: str = "KO",
 ) -> int:
-    """Mixscale DE heatmap: NT/NP/KO blocks when Mixscape labels exist, else NT|perturbed."""
+    """Mixscale_DoHeatmap-aligned panel: RNA, NT|target, score-ordered, target+top DE."""
+    del perturbation_label  # grouping is gene identity, not CRISPR KO/NP label
     if "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
         axis.set_axis_off()
         axis.set_title(f"{target}: mixscale_not_run")
@@ -3178,7 +3305,8 @@ def _draw_mixscale_de_heatmap(
     scale = values.std(axis=1, keepdims=True)
     scale[scale == 0] = 1
     scaled = (values - center) / scale
-    counts = [group_labels.count(key) for key in ("NP", "NT", "KO") if group_labels.count(key)]
+    unique_labels = list(dict.fromkeys(group_labels))
+    counts = [group_labels.count(key) for key in unique_labels]
     largest = max(counts) if counts else int(columns.size)
     gap = max(6, int(round(0.08 * largest)))
     gapped, spans = gapped_heatmap_matrix(scaled, group_labels, gap=gap)
@@ -3193,15 +3321,13 @@ def _draw_mixscale_de_heatmap(
     axis.set_yticks(np.arange(genes.size))
     axis.set_yticklabels(gene_labels, fontsize=6)
     axis.set_xticks([])
-    control_block = "zero-guide" if str(control) == ZERO_GUIDE_LABEL else "NT"
-    prtb = str(perturbation_label or "KO")
     _annotate_heatmap_groups(
         axis,
         spans,
         int(genes.size),
-        {"NP": "NP", "NT": control_block, "KO": prtb},
+        {label: label for label in unique_labels},
     )
-    axis.set_title(f"{target} Mixscale DE (n={genes.size}; {mode})")
+    axis.set_title(f"{target} Mixscale_DoHeatmap (n={genes.size})")
     return int(genes.size)
 
 
@@ -3217,9 +3343,9 @@ def draw_mixscale_de_heatmaps(
 ) -> None:
     """One Mixscale DE heatmap per DE-gate target; copy target-in-own-DE to ``target_in_de/``.
 
-    Prefer Mixscape ``mixscape_status`` blocks NP | NT | KO (CRISPR-mode label). Without
-    Mixscape classes, fall back to Mixscale_DoHeatmap: NT | all target cells, ordered by
-    ``mixscale_score``. Features = target gene + Mixscale DE list.
+    Aligned to Mixscale_DoHeatmap: NT | all target cells ordered by
+    ``mixscale_score``; features = target gene + top ``max_genes`` DE (by p, then
+    logFC desc). Ridge/scatter may still use Mixscape NT/NP/KO when available.
     """
     if adata is None or "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
         store.skip("mixscale_de_heatmaps", "mixscale_not_run", section="mixscale")
@@ -3281,10 +3407,11 @@ def draw_mixscale_de_heatmaps(
                 }
             ),
             (
-                f"Mixscale DE {target} vs {_contrast_name(control)}; grouping={mode}; "
-                f"blocks NP/NT/{prtb} when Mixscape labels exist else NT|perturbed; "
-                f"cells ordered by mixscale_score within block; heatmap genes={n_genes}; "
-                "not a biological-replicate test"
+                f"Mixscale_DoHeatmap-aligned {target} vs {_contrast_name(control)}; "
+                f"grouping={mode} (NT|target by gene identity); "
+                f"cells ordered by mixscale_score within block; "
+                f"features=target+top{max_genes} DE by p then logFC desc; "
+                f"heatmap genes={n_genes}; not a biological-replicate test"
             ),
         )
         record["n_heatmap_genes"] = n_genes
