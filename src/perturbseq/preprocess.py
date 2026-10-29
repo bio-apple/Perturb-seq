@@ -23,9 +23,6 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
     PCA is fit on the z-scored HVG slice only; neighbors, Leiden clustering and
     UMAP use that PCA. ``X`` stays sparse and log-normalized. The embedding is
     descriptive. Perturbation statistics do not use the UMAP coordinates.
-    Harmony runs only when ``batch_key`` names a column with more than one
-    level. A missing Harmony install stops that run instead of skipping the
-    correction.
     """
     settings = config["preprocess"]
     seed = int(config["runtime"]["seed"])
@@ -45,26 +42,8 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
     if n_comps < 2:
         raise ValueError("细胞数或高变基因数不足以计算 PCA。")
     _pca_on_scaled_hvg(adata, n_comps, seed)
-    batch_key = settings.get("batch_key")
-    representation = "X_pca"
-    if batch_key:
-        if batch_key not in adata.obs:
-            raise ValueError(f"preprocess.batch_key={batch_key} 不在 obs 中。")
-        labels = adata.obs[batch_key].astype(str)
-        n_levels = int(labels[~labels.isin(["nan", "None", "<NA>", ""])].nunique())
-        if n_levels < 2:
-            adata.uns["batch_correction"] = "not_run_fewer_than_two_batch_levels"
-        else:
-            try:
-                sc.external.pp.harmony_integrate(adata, key=batch_key, random_state=seed)
-            except ImportError as exc:
-                raise RuntimeError(
-                    "配置了批次校正，但当前环境没有 Harmony。安装 harmonypy 后重跑。"
-                ) from exc
-            representation = "X_pca_harmony"
-            adata.uns["batch_correction"] = "harmony"
     n_neighbors = min(int(settings["n_neighbors"]), adata.n_obs - 1)
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=representation, random_state=seed)
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep="X_pca", random_state=seed)
     sc.tl.umap(adata, random_state=seed)
     sc.tl.leiden(
         adata,
@@ -79,7 +58,7 @@ def preprocess(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "n_hvg_used": usable,
         "hvg_flavor": "seurat",
         "pca_on": "scaled_highly_variable_genes",
-        "neighbors_umap_leiden_on": representation,
+        "neighbors_umap_leiden_on": "X_pca",
         "n_pcs": n_comps,
         "n_neighbors": n_neighbors,
         "leiden_resolution": float(settings["leiden_resolution"]),

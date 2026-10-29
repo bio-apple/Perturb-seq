@@ -335,8 +335,6 @@ def _normalize_mixscape(value: str, control: str, label: str) -> str:
         return PERTURBED
     if value.endswith(" NP") or value == "NP":
         return NON_PERTURBED
-    if value == control:
-        return STATUS_NT
     return AMBIGUOUS
 
 

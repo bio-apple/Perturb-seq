@@ -744,7 +744,7 @@ def apply_eligibility(
     # Drop cells with ≤ min_genes or ≥ max_genes expressed genes.
     low_genes = finite & (genes <= float(thresholds["min_genes"]))
     high_genes = finite & (genes >= float(thresholds["max_genes"]))
-    # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.2).
+    # Drop cells with mitochondrial read fraction ≥ max_mito_frac (default 0.15).
     high_mito = finite & (mito >= float(thresholds["max_mito_frac"]))
     low_library = _low_library_no_guide_mask(table, total, low_library_rule)
     qc_pass = finite & ~low_genes & ~high_genes & ~high_mito & ~low_library

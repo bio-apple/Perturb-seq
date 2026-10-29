@@ -165,11 +165,9 @@ def apply_customer_arguments(config: dict[str, Any], customer: dict[str, Any]) -
         qc["max_mito_frac"] = customer["max_mito_frac"]
 
     cell_type_key = _blank_to_none(customer.get("cell_type_key"))
-    batch_key = _blank_to_none(customer.get("batch_key"))
     preprocess = config.setdefault("preprocess", {})
     if isinstance(preprocess, dict):
         preprocess["cell_type_key"] = cell_type_key
-        preprocess["batch_key"] = batch_key
     perturb = config.setdefault("perturb", {})
     if isinstance(perturb, dict):
         perturb["cell_type_key"] = cell_type_key
@@ -268,7 +266,6 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "n_pcs": None,
         "n_neighbors": None,
         "leiden_resolution": None,
-        "batch_key": None,
         "cell_type_key": None,
     },
     "mixscape": {
@@ -864,11 +861,11 @@ def _require_gene_cutoffs(qc: dict[str, Any]) -> None:
 
 
 def _require_mito_cutoff(qc: dict[str, Any]) -> None:
-    """Drop cells with mito_frac ≥ max_mito_frac (default 0.2 = 20%)."""
+    """Drop cells with mito_frac ≥ max_mito_frac (default 0.15 = 15%)."""
     value = qc.get("max_mito_frac")
     if value is None or isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(
-            "qc.max_mito_frac 必须是数值。默认 0.2（排除线粒体 reads ≥ 20% 的细胞）。"
+            "qc.max_mito_frac 必须是数值。默认 0.15（排除线粒体 reads ≥ 15% 的细胞）。"
         )
     if not 0 <= float(value) <= 1:
         raise ConfigError("qc.max_mito_frac 必须在 0 到 1 之间。")

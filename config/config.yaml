@@ -22,7 +22,7 @@ qc:
   # QC 过滤：n_genes（nFeature）、mito_frac（percent.mt）。
   # nCount（total_counts）只计算并画在 QC 图上，不做文库 UMI 绝对阈值过滤。
   # 表达基因数：剔除 n_genes ≤ min_genes 或 n_genes ≥ max_genes。
-  # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.2 = 20%）。
+  # 线粒体：剔除 mito_frac ≥ max_mito_frac（0.15 = 15%）。
   min_genes: 200
   max_genes: 6000
   max_mito_frac: 0.15

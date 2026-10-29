@@ -129,7 +129,6 @@ def main(argv: list[str] | None = None) -> None:
         choices=("KO", "i", "a"),
         help="KO、i 或 a，缺省 KO（映射 CRISPR_KO / CRISPRi / CRISPRa；预期方向 not_required / down / up；图标签 KO / KD / OE）",
     )
-    parser.add_argument("--batch-key", default=None, help="obs 里的批次列。不填则不做 Harmony")
     parser.add_argument(
         "--cell-type-key", default=None, help="obs 里已有的细胞类型列。不填则全程 ALL"
     )
@@ -137,7 +136,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-mito-frac",
         type=float,
         default=None,
-        help="线粒体 reads 比例上限，0 到 1。细胞 ≥ 该值时剔除。默认读配置（0.2 = 20%%）。",
+        help="线粒体 reads 比例上限，0 到 1。细胞 ≥ 该值时剔除。默认读配置（0.15 = 15%%）。",
     )
     parser.add_argument(
         "--min-genes",
@@ -165,8 +164,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--sctype-db-path",
-        default=None,
-        help="ScType marker DB 路径（tsv/csv/xlsx）。默认仓库 data/sctype/ScTypeDB_full.tsv。",
+        default="data/sctype/ScTypeDB_full.tsv",
+        help="ScType marker DB 路径（tsv/csv/xlsx）。默认 data/sctype/ScTypeDB_full.tsv。",
     )
     parser.add_argument(
         "--sctype-low-score-fraction",
@@ -177,7 +176,6 @@ def main(argv: list[str] | None = None) -> None:
             "仅在指定 --sctype-tissue 时生效；默认 0.25。"
         ),
     )
-    parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args(argv)
     config_path = args.config or software_config_path()
     config = read_config(config_path)
@@ -193,7 +191,6 @@ def main(argv: list[str] | None = None) -> None:
             "crispr_mode": args.crispr_mode,
             "crispr_mode_description": None,
             "expected_target_direction": None,
-            "batch_key": args.batch_key,
             "cell_type_key": args.cell_type_key,
             "max_mito_frac": args.max_mito_frac,
             "min_genes": args.min_genes,
@@ -204,14 +201,6 @@ def main(argv: list[str] | None = None) -> None:
         },
     )
     validate_config(config)
-    if args.validate_only:
-        folder = output_dir(config)
-        folder.mkdir(parents=True, exist_ok=True)
-        _record_species(folder, config)
-        _validate_guide_reference(folder, config)
-        _validate_barcodes(folder, config)
-        print(f"Validated {folder}", flush=True)
-        return
     steps = list(DEFAULT_STEPS)
     mode = str(config["experiment"]["crispr_mode"])
     print(
@@ -862,30 +851,6 @@ def _write_guide_conflicts(folder: Path, exc: GuideReferenceError) -> None:
     pd.DataFrame({"guide_id": exc.guide_ids, "reason": exc.reason}).to_csv(
         folder / "tables" / "guide_reference_conflicts.tsv", sep="\t", index=False
     )
-
-
-def _validate_barcodes(folder: Path, config: dict[str, Any]) -> None:
-    from perturbseq.io import read_assignments, read_barcodes
-
-    paths = resolve_input_paths(config)
-    matrix_ids = set(read_barcodes(paths["barcodes"]).astype(str))
-    assigned = set(read_assignments(paths["assignments"])["cell_barcode"].astype(str))
-    only_matrix = sorted(matrix_ids - assigned)
-    only_assignment = sorted(assigned - matrix_ids)
-    _write_barcode_differences(folder, only_matrix, only_assignment)
-    payload = _write_input_validation(
-        folder,
-        config,
-        n_matrix=len(matrix_ids),
-        n_assignment=len(assigned),
-        only_matrix=only_matrix,
-        only_assignment=only_assignment,
-    )
-    if payload["status"] == "failed":
-        raise SystemExit(
-            "矩阵与分配 barcode 集合不一致: "
-            f"仅矩阵 {len(only_matrix)}，仅分配 {len(only_assignment)}。"
-        )
 
 
 def _write_input_validation(
