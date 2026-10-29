@@ -2,19 +2,6 @@
 
 图路径与输出规则见 [outputs.md](outputs.md)。
 
-## 目录
-
-1. [流水线步骤](#流水线步骤)
-2. [命令行与配置](#命令行与配置)
-3. [物种](#物种)
-4. [CRISPR 模式](#crispr-模式)
-5. [对照](#对照)
-6. [QC](#qc)
-7. [分配](#分配)
-8. [Barcode](#barcode)
-9. [Mixscape 与 Mixscale](#mixscape-与-mixscale)
-10. [预处理与簇注释](#预处理与簇注释)
-
 ---
 
 ## 流水线步骤
@@ -44,15 +31,15 @@ Mixscape 与 Mixscale 以进程池并发，各读临时 preprocess 副本，互�
 | 参数 | 说明 |
 | --- | --- |
 | `--sample-id` | 样本名 |
-| `--organism` | 必填 `human` / `mouse` |
+| `--organism` | 必填 `human` / `mouse`。读入后核对基因号与声明物种一致，矛盾时停止。叶绿体等前缀不计入 percent.mt |
 | `--input-dir` / `--output-dir` | 输入 / 输出目录 |
 | `--guide-separator` | guide 分隔符（如 `|`） |
-| `--crispr-mode` | `KO`（默认）/ `i` / `a` |
+| `--crispr-mode` | `KO`（默认）/ `i` / `a`。映射 CRISPR_KO / CRISPRi / CRISPRa；预期方向 not_required / down / up；图标签 KO / KD / OE |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
 | `--max-mito-frac` | 覆盖默认 `0.15` |
 | `--nt-control` | 默认 `NEG_CONTROL/Non-Targeting/NegCtrl`；未匹配 → 自动 `zero_guide`；可显式填 `zero_guide` |
-| `--sctype-tissue` | 启用 ScType；未传则跳过 |
-| `--sctype-db-path` | 自定义 marker DB；默认 `data/sctype/ScTypeDB_full.tsv` |
+| `--sctype-tissue` | 启用 ScType；未传则跳过。choices：`Adrenal`、`Brain`、`Eye`、`Heart`、`Hippocampus`、`Immune system`、`Intestine`、`Kidney`、`Liver`、`Lung`、`Muscle`、`Pancreas`、`Placenta`、`Spleen`、`Stomach`、`Thymus` |
+| `--sctype-db-path` | marker DB 路径；默认 `data/sctype/ScTypeDB_full.tsv` |
 | `--sctype-low-score-fraction` | 低分簇 → `Unknown`（默认 0.25） |
 | `--config` | 默认 YAML；缺省 `config/config.yaml` |
 
@@ -67,29 +54,6 @@ Mixscape 与 Mixscale 以进程池并发，各读临时 preprocess 副本，互�
 | `mixscape.*` / `mixscale.*` | pertpy 参数（`logfc_threshold` 0.1；互不读取） |
 | `singler.enabled` | `false` 跳过 SingleR |
 | `runtime.n_threads` | 默认 `max(1, CPU//3)` |
-
----
-
-## 物种
-
-`--organism` 必填 `human` 或 `mouse`。
-
-| 物种 | 基因号 | 线粒体前缀 |
-| --- | --- | --- |
-| human | `ENSG` | `MT-` |
-| mouse | `ENSMUSG` | `mt-` |
-
-读入后核对基因号与声明物种一致，矛盾时停止。叶绿体等前缀不计入 percent.mt。
-
----
-
-## CRISPR 模式
-
-| CLI | 内部 | 预期方向 | 图标签 |
-| --- | --- | --- | --- |
-| `KO`（默认） | `CRISPR_KO` | `not_required` | KO |
-| `i` | `CRISPRi` | `down` | KD |
-| `a` | `CRISPRa` | `up` | OE |
 
 ---
 
@@ -134,11 +98,7 @@ QC 指标：`nCount`、`nFeature`、`percent.mt`（均画在 `qc/`）。过滤�
 
 过滤顺序：`no_guide → multi_guide → qc_failed → low_cells_target → retained`
 
----
-
-## Barcode
-
-`input.barcode_policy` 为 `strict`：assignment-only barcode 导致失败；matrix-only（无 assignment）记为 `no_guide` 并保留；两侧都有差异时失败。
+Barcode 策略为 `strict`：assignment-only barcode 导致失败；matrix-only（无 assignment）记为 `no_guide` 并保留；两侧都有差异时失败。
 
 ---
 
