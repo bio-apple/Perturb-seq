@@ -287,6 +287,9 @@ _ALLOWED_KEYS: dict[str, Any] = {
         "logfc_threshold": None,
         "pval_cutoff": None,
         "max_de_genes": None,
+        "n_dims": None,
+        "n_control_neighbors": None,
+        "cell_type_key": None,
     },
     "perturb": {
         "mixscape_min_de_genes": None,

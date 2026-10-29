@@ -70,13 +70,13 @@
 | --- | --- |
 | `UMAP/umap_mixscape_class.png` / `umap_mixscape.png` / `umap_mixscape_class_global.png` | Mixscape UMAP |
 | `Mixscape/mixscape_class_global_bar.png` | 分类计数 |
-| `Mixscape/{靶基因}_mixscape_2x2.png`、`target_in_de/...` | 火山（adj-p Up/Down）+ 热图（对齐 Seurat MixscapeHeatmap：RNA、NT-high、raw p、块内后验排序，最多 Top20） |
-| `Mixscape/target_de_counts.png`、`target_in_de_gene_counts.png` | DE 计数 |
+| `Mixscape/{靶基因}_mixscape_2x2.png` | 火山（adj-p Up/Down）+ 热图（对齐 Seurat MixscapeHeatmap：RNA、NT-high、raw p、块内后验排序，最多 Top20） |
+| `Mixscape/target_de_counts.png` | 全部靶 vs 进入 Mixscape GMM 的靶。pertpy 不返回基因名，因此没有 `target_in_de_gene_counts` |
 
 ### mixscale → `mixscale/`
 
 | 路径 | 内容 |
 | --- | --- |
 | `mixscale/mixscale_score_ridge.png`、`mixscale_scatter.png` | 分数山脊 / 分箱散点；有 Mixscape 标签时按 NT/NP/KO（或 KD/OE）分行或分线 |
-| `mixscale/target_de_counts.png`、`target_in_de_gene_counts.png` | Mixscale DE 门计数（对标 Mixscape 同名图） |
-| `mixscale/{靶基因}_mixscale_heatmap.png`、`target_in_de/...` | 对齐 Mixscale_DoHeatmap：列块 **NT \| 靶**（按 score）；行 = 靶基因 + Top20 DE（p→logFC）；`target_in_de/` 为「靶基因在自身 DE 列表」子集 |
+| `mixscale/target_de_counts.png`、`target_in_de_gene_counts.png` | 来自 pertpy `mixscale_de_genes` 的计数（不是 Mixscape 的基因表） |
+| `mixscale/{靶基因}_mixscale_heatmap.png`、`target_in_de/...` | 对齐 Mixscale_DoHeatmap：列块 **NT \| 靶**（按 score）；行 = 靶基因 + pertpy 按原始 p 排序的 DE 基因；`target_in_de/` 为「靶基因在自身 DE 列表」子集 |

@@ -40,7 +40,8 @@ preprocess:
 mixscape:
   enabled: true
   min_de_genes: 5
-  # DE 门槛 |logFC|≥0.1（与 mixscale.logfc_threshold / perturb.mixscape_logfc 一致）。
+  # 传给 pertpy Mixscape.mixscape 的 |logFC|（API 默认 0.25；本项目 0.1）。
+  # 不读取 mixscale.logfc_threshold。pertpy Mixscape 没有 max_de_genes 参数。
   logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
@@ -50,14 +51,17 @@ mixscape:
   n_control_neighbors: 20
   # RunMixscape iter.num。
   iter_num: 10
-# Mixscale DE 门槛：https://satijalab.github.io/Mixscale/
-# |logFC|≥0.1；min_de_genes=5；max_de_genes=100；fine_mode=false；pval_cutoff=0.05。
-# 不读取 mixscape.logfc_threshold。
+# 传给 pertpy Mixscale.mixscale。不读取 mixscape.*。
+# https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html
+# |logFC| 项目值 0.1（API 默认 0.25）；min_de_genes=5；max_de_genes=100；fine_mode=false；pval_cutoff=0.05。
 mixscale:
   min_de_genes: 5
   logfc_threshold: 0.1
   pval_cutoff: 0.05
   max_de_genes: 100
+  # perturbation_signature 维数与近邻。不回退到 mixscape.n_dims。
+  n_dims: 30
+  n_control_neighbors: 20
 perturb:
   mixscape_min_de_genes: 5
   # 仅当 mixscape.logfc_threshold 缺省时回退；须与上面 Mixscape 门槛一致（0.1）。Mixscale 不读此键。

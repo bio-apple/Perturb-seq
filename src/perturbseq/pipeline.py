@@ -398,7 +398,7 @@ def _run_parallel_analysis(
             "mixscale" in batch
             and "mixscape_status" in merged.obs
             and "mixscale_score" in merged.obs
-            and isinstance(merged.uns.get("mixscale_de_gate"), pd.DataFrame)
+            and "mixscale_de_genes" in merged.uns
         ):
             print("  redrawing Mixscale figures with Mixscape NT/NP/KO labels…", flush=True)
             write_mixscale_figures(folder, config, merged)
@@ -760,7 +760,7 @@ def _resolve_species(config: dict[str, Any]) -> None:
 
 
 def _step_mixscape(folder: Path, config: dict[str, Any], adata):
-    """Independent Mixscape step: DE gate, X_pert signature, classification."""
+    """Independent Mixscape step: signature on unscaled log1p, then pertpy mixscape."""
     mixscape_on = config.get("mixscape", {}).get("enabled", True)
     spec = control_spec(config)
     if spec["temporary"]:
@@ -791,7 +791,7 @@ def _step_mixscape(folder: Path, config: dict[str, Any], adata):
 
 
 def _step_mixscale(folder: Path, config: dict[str, Any], adata):
-    """Independent Mixscale step: own CalcPerturbSig + mixscale_score (no Mixscape step)."""
+    """Independent Mixscale step: own signature and mixscale_score. Does not read Mixscape."""
     spec = control_spec(config)
     if spec["temporary"]:
         print(f"  temporary control warning: {spec['note']}", flush=True)

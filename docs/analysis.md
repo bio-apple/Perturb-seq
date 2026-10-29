@@ -55,8 +55,8 @@ flowchart TD
 | `io` | 读入矩阵 / 参考 / 分配（账本在内存） | — |
 | `assign` | QC、资格过滤、对照解析；AnnData 子集为 **QC-pass**（供嵌入）；`analysis_eligible` 写入 obs；写出过滤前 / 描述性 `qc/` 图 | `qc/` |
 | `preprocess` | 归一化、HVG、PCA（30）、UMAP / Leiden / SingleR / ScType（均在 QC-pass 上）；HVG/PCA/marker 与 UMAP 均写 `UMAP/` | `UMAP/` |
-| `mixscape` | 在 `analysis_eligible` ∪ 对照上：DE 门 → 签名 → 分类 | **`Mixscape/`**、`UMAP/` |
-| `mixscale` | 同范围独立 DE 门 → `mixscale_score` | **`mixscale/`** |
+| `mixscape` | 在 `analysis_eligible` ∪ 对照上：签名 → pertpy `mixscape` 分类 | **`Mixscape/`**、`UMAP/` |
+| `mixscale` | 同范围独立签名 → pertpy `mixscale` 分数 | **`mixscale/`** |
 
 图在**对应分析步骤结束时**写出。跑完做 lean cleanup：默认只留 `**/*.png`；同目录输入输出时另保护 `{sample}.scRNA.*` 与已解析 DRAGEN 输入（细节见 [outputs.md](outputs.md)）。本流水线不含独立 Wilcoxon DGE / E-distance / perturb 步骤。
 
@@ -101,7 +101,7 @@ flowchart TD
 | `qc.min_cells_per_target` | 靶向细胞数 **<** 该值 → `low_cells_target`（默认 20）；决定 `analysis_eligible` |
 | `qc.min_cells_per_guide` | 仅用于 `cells_per_target` 表的 `n_guides_passing` 统计（默认 10）；**不**直接排除细胞 |
 | `preprocess.n_hvg` / `n_pcs` / `leiden_resolution` | HVG / PCA / Leiden（`n_pcs` 默认 30，与 `mixscape.n_dims` 一致） |
-| `mixscape.*` / `mixscale.*` | 各自 DE 门与算法参数（`logfc_threshold` 默认 0.1 等） |
+| `mixscape.*` / `mixscale.*` | 各自传给 pertpy 的参数（`logfc_threshold` 项目值 0.1；互不读取） |
 | `singler.enabled` | `false` 跳过 SingleR 与组合注释图 |
 | `runtime.n_threads` | 可选；默认 `max(1, CPU//3)` |
 | `plotting.dpi` / `save_plot_data` | 图 DPI；`save_plot_data` 默认 `false` |
@@ -263,7 +263,7 @@ low_library_no_guide → no_guide → multi_guide → qc_failed → low_cells_ta
 
 两个**互不依赖**的步骤（`perturbseq.mixscape` / `perturbseq.mixscale`），均只依赖 `preprocess`，并以进程池并发执行。细胞范围：更严的 `analysis_eligible` ∪ 对照（见 `perturbation_analysis_mask`）；表达嵌入仍用全部 QC-pass 细胞。
 
-各自内部先跑 Wilcoxon **DE gate**（`perturbseq.de_gate`；`|logFC|` / adj-p / `min_de_genes`），不是独立流水线步骤。实现对齐 pertpy 1.x API：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert` 或分类标签。
+两者都不先跑共享 Wilcoxon 门槛。输入对齐 pertpy 1.x：`pertpy.tools.Mixscape`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)、[`mixscape`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html)）与 `pertpy.tools.Mixscale`（[`perturbation_signature`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)、[`mixscale`](https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscale.html)）。差异基因由各自的 `mixscape()` / `mixscale()` 在未缩放 `log1p` 的 `.X` 上完成（`de_layer=None`）。结果目录分别为 `Mixscape/` 与 `mixscale/`。Mixscale **自行**算 `layers['X_pert_mixscale']`，不读 Mixscape 的 `X_pert`、分类标签或差异基因表。
 
 | | Mixscape | Mixscale |
 | --- | --- | --- |
@@ -275,15 +275,15 @@ low_library_no_guide → no_guide → multi_guide → qc_failed → low_cells_ta
 | `pval_cutoff` | 0.05 | 0.05 |
 | 主要产物 | KO/NP 分类、signature UMAP、2×2、DE 计数 | `mixscale_score`、DE 计数、DE 热图 |
 
-Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`；未过 DE 门槛 → `skipped_no_de_genes`。仅通过对应门槛的靶进入 2×2 / 山脊 / 散点。Mixscape 2×2（`Mixscape/{靶}_mixscape_2x2.png`）为后验 / 扰动分数 / 细胞级火山 / DE 基因热图。热图对齐 Seurat [`MixscapeHeatmap`](https://satijalab.org/seurat/reference/mixscapeheatmap)（vignette：`balanced=FALSE`、`assay=RNA`、`order.by.prob=TRUE`、`max.genes=20`、`max.cells.group=300`）：在 **RNA/`X`（非 `X_pert`）** 上对 NT vs 靶的 Wilcoxon 结果取 **NT-high**（靶下调、`logFC_NT>threshold`）且 **原始 p < cutoff** 的基因，按 p 升序截断至 `plotting.mixscape_heatmap_max_genes`（默认 20；无则空态）；列块 **NP | NT | KO**（CRISPRi/a 时 KO 块显示 KD/OE），**块内按 `mixscape_class_p` 从高到低**。火山仍用 adj-p 标 Up/Down，可与热图基因列表不完全重合。**无 KO 细胞时仍画**（标题标注 no KO）。**无分数表时改画 1×3**（后验 / 火山 / 热图，文件名仍为 `{靶}_mixscape_2x2.png`）。Mixscale 假分数 `1` 置缺失。
+Mixscape 标签：`nt` / `perturbed` / `non_perturbed` / `ambiguous` / `not_evaluated`。DE 基因不足时 pertpy 把该靶标成 NP，不再使用 `skipped_no_de_genes`。已分类的靶进入 2×2。Mixscape 2×2（`Mixscape/{靶}_mixscape_2x2.png`）为后验 / 扰动分数 / 细胞级火山 / DE 基因热图。热图对齐 Seurat [`MixscapeHeatmap`](https://satijalab.org/seurat/reference/mixscapeheatmap)（vignette：`balanced=FALSE`、`assay=RNA`、`order.by.prob=TRUE`、`max.genes=20`、`max.cells.group=300`）：在 **RNA/`X`（非 `X_pert`）** 上对 NT vs 靶的 Wilcoxon 结果取 **NT-high**（靶下调、`logFC_NT>threshold`）且 **原始 p < cutoff** 的基因，按 p 升序截断至 `plotting.mixscape_heatmap_max_genes`（默认 20；无则空态）；列块 **NP | NT | KO**（CRISPRi/a 时 KO 块显示 KD/OE），**块内按 `mixscape_class_p` 从高到低**。火山仍用 adj-p 标 Up/Down，可与热图基因列表不完全重合。**无 KO 细胞时仍画**（标题标注 no KO）。**无分数表时改画 1×3**（后验 / 火山 / 热图，文件名仍为 `{靶}_mixscape_2x2.png`）。pertpy Mixscape 不返回差异基因名，因此不写 `Mixscape/target_in_de/`；`target_de_counts` 只比较全部靶和进入 GMM 的靶。
 
-Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscale_de_genes']`（非 Mixscape）写出与 Mixscape 对称的计数图与热图：`mixscale/target_de_counts.png`、`target_in_de_gene_counts.png`、`{靶}_mixscale_heatmap.png`；「靶基因 symbol 精确出现在自身 DE 列表」的热图再复制到 `mixscale/target_in_de/`（对标 `Mixscape/target_in_de/`）。
+Mixscale 用本步 `uns['mixscale_de_genes']`（pertpy 返回的基因名，不是 Mixscape）写出计数图与热图：`mixscale/target_de_counts.png`、`target_in_de_gene_counts.png`、`{靶}_mixscale_heatmap.png`；「靶基因 symbol 精确出现在自身 DE 列表」的热图再复制到 `mixscale/target_in_de/`。对照细胞分数为 0；DE 基因不足的靶保持 pertpy 的回退分数 1。
 
-**Mixscale 热图**：对齐官方 [Mixscale_DoHeatmap](https://satijalab.github.io/Mixscale/)——列块为 **NT | 全部该靶细胞**（按 gene 身份，**不做** NP/KO），块内按 `mixscale_score` 升序；行为 **靶基因 + Top `max_genes` DE**（先按 p/`rank` 取 Top，再按 logFC 降序展示；默认 20）。RNA/`X` 行 z-score。
+**Mixscale 热图**：对齐官方 [Mixscale_DoHeatmap](https://satijalab.github.io/Mixscale/)——列块为 **NT | 全部该靶细胞**（按 gene 身份，**不做** NP/KO），块内按 `mixscale_score` 升序；行为 **靶基因 + pertpy 按原始 p 排序的 DE 基因**（已由 `max_de_genes` 截断；默认展示 20）。pertpy 不返回 logFC，图上不再按 logFC 重排。RNA/`X` 行 z-score。
 
 **Mixscale ridge / scatter 分组**：同跑且已合并 Mixscape 标签时，优先按 **NT | NP | KO**（CRISPRi→KD、CRISPRa→OE）分行或分线，块内仍按 `mixscale_score`；无 Mixscape 分类时回退为 NT | perturbed。并行步结束后若两者皆有，会重画 `mixscale/` 图（热图仍为 NT|target；ridge/scatter 可带 NP/KO）。
 
-**无 ridge / scatter / DE 热图**：`passed=True` 的靶为 0 时，`mixscale_score_ridge` / `mixscale_scatter` / DE 热图记 `no_targets_passed_de_gate` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶 `n_de_genes=0`。可调 `mixscale.logfc_threshold` / `min_de_genes`。
+**无 ridge / scatter / DE 热图**：pertpy 没有留下任何靶的 DE 基因时，`mixscale_score_ridge` / `mixscale_scatter` / DE 热图记 `no_scored_targets` 并跳过 PNG。临时 `zero_guide`、弱效应或细胞数偏少时可能全部靶得回退分数 1。可调 `mixscale.logfc_threshold` / `min_de_genes`。
 
 > **口径**：计算上两者独立；作图在合并后可对齐 Mixscape 标签。KO/NP 与 Mixscale 分数都不是生物学重复推断。Mixscape 2×2 中的细胞级 Wilcoxon 火山仅服务该靶的可视化，不是全基因组独立 DE 步。
 
@@ -297,8 +297,7 @@ Mixscale 过 DE 门后，用**本步** `uns['mixscale_de_gate']` / `uns['mixscal
 | --- | --- | --- | --- |
 | 预处理 `X` | counts → library-size（默认 1e4）→ `log1p` | 否 | 全基因组；`layers['counts']` 保留原始计数 |
 | 表达 PCA / 邻居 / Leiden / UMAP / SingleR / ScType | HVG 上 `sc.pp.scale`（QC-pass 嵌入细胞）→ PCA | 否 | 表达空间。UMAP/Leiden 不是扰动分类坐标。已有 `X_pca` 会被 pertpy 用作近邻搜索（`use_rep=None`） |
-| Mixscape DE 门槛 | `X`（log1p）上 Wilcoxon vs 对照 | 是（对比组） | 对照 = 设计 NT 或临时 `zero_guide`。只决定哪些靶进入 pertpy |
-| Mixscape `X_pert` | pertpy `perturbation_signature` 读**全部基因**的未 scale `log1p`（`.X`） | 是 | 不先切 HVG，也不在调用前 z-score `X`。近邻用已有 `X_pca`，否则由 pertpy 按默认参数计算 |
+| Mixscape `X_pert` | pertpy `perturbation_signature` 读**全部基因**的未 scale `log1p`（`.X`） | 是 | 不先切 HVG，也不在调用前 z-score `X`。近邻用已有 `X_pca`，否则由 pertpy 按默认参数计算。mask 内每个靶都进入调用 |
 | Mixscape 分类 | `mixscape(layer="X_pert", de_layer=None)` | 是 | DE 在 `.X`；GMM 在 `X_pert`，`scale=True` 只作用在签名里的 DE 基因 |
 | Mixscape signature UMAP | `X_pert` → PCA（`zero_center=True`，不基因 scale）→ UMAP | 是 | 坐标在 `X_umap_mixscape` |
 | Mixscale | 先 `perturbation_signature` 写 `X_pert`，再 `mixscale(layer="X_pert", de_layer=None)` | 是 | DE 在 `.X`，不传 `de_genes_by_target`。分数层随后存成 `X_pert_mixscale` |

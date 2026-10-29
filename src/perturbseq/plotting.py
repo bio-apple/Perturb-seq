@@ -2671,49 +2671,87 @@ def _heatmap_panel(
     return int(genes.size)
 
 
-def _de_gate_keys(source: str) -> tuple[str, str]:
-    """``uns`` keys for Mixscape or Mixscale DE gate / gene tables."""
+_DE_GENE_COLUMNS = ["target_gene", "gene", "gene_symbol", "rank", "logfc", "adj_p"]
+
+
+def _de_gene_frame(adata: AnnData, source: str) -> pd.DataFrame | None:
+    """DE genes stored by one method. ``None`` means that method did not store a list.
+
+    Mixscale keeps pertpy's ``uns['mixscale_de_genes']`` mapping (var names, raw-p
+    order, already capped). Mixscape's pertpy call does not return gene names.
+    """
     if source == "mixscale":
-        return "mixscale_de_gate", "mixscale_de_genes"
-    if source == "mixscape":
-        return "mixscape_de_gate", "mixscape_de_genes"
-    raise ValueError(f"unknown DE source: {source}")
+        raw = adata.uns.get("mixscale_de_genes")
+    elif source == "mixscape":
+        raw = adata.uns.get("mixscape_de_genes")
+    else:
+        raise ValueError(f"unknown DE source: {source}")
+    if raw is None:
+        return None
+    if isinstance(raw, pd.DataFrame):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+    symbols: dict[str, str] = {}
+    if "gene_symbol" in adata.var.columns:
+        for name, symbol in zip(
+            adata.var_names.astype(str), adata.var["gene_symbol"].astype(str), strict=False
+        ):
+            symbols.setdefault(name, symbol)
+    rows = []
+    for target, genes in raw.items():
+        for rank, gene in enumerate(list(genes)):
+            name = str(gene)
+            rows.append(
+                {
+                    "target_gene": str(target),
+                    "gene": name,
+                    "gene_symbol": symbols.get(name, name),
+                    "rank": rank,
+                    "logfc": pd.NA,
+                    "adj_p": pd.NA,
+                }
+            )
+    return pd.DataFrame(rows, columns=_DE_GENE_COLUMNS)
 
 
 def target_in_de_table(
     adata: AnnData, *, control: str, source: str = "mixscape"
 ) -> pd.DataFrame:
-    """Passed targets, and whether each target symbol is exactly in its own DE list."""
+    """Targets with a stored DE list, and whether each symbol is exactly in that list."""
     columns = ["target_gene", "target_in_de", "n_de_genes", "logfc", "adj_p"]
-    gate_key, genes_key = _de_gate_keys(source)
-    gate = adata.uns.get(gate_key)
-    genes = adata.uns.get(genes_key)
-    if not isinstance(gate, pd.DataFrame) or gate.empty or "passed" not in gate.columns:
+    genes = _de_gene_frame(adata, source)
+    if not isinstance(genes, pd.DataFrame) or genes.empty or "target_gene" not in genes.columns:
         return pd.DataFrame(columns=columns)
-    if not isinstance(genes, pd.DataFrame):
-        genes = pd.DataFrame(columns=["target_gene", "gene_symbol", "logfc", "adj_p"])
     symbol_col = "gene_symbol" if "gene_symbol" in genes.columns else "gene"
     rows = []
-    passed = gate[gate["passed"].astype(bool)]
-    for record in passed.itertuples(index=False):
-        target = str(record.target_gene)
+    for target, subset in genes.groupby(genes["target_gene"].astype(str), sort=False):
+        target = str(target)
         if target == control or target == "":
             continue
-        if "target_gene" in genes.columns and symbol_col in genes.columns:
-            subset = genes[genes["target_gene"].astype(str) == target]
-            symbols = subset[symbol_col].astype(str)
-            matched = subset[symbols.eq(target)]
-        else:
-            subset = genes.iloc[0:0]
-            matched = subset
-        hit = not matched.empty
-        logfc = float(matched["logfc"].iloc[0]) if hit and "logfc" in matched.columns else pd.NA
-        adj_p = float(matched["adj_p"].iloc[0]) if hit and "adj_p" in matched.columns else pd.NA
+        names = set(subset[symbol_col].astype(str))
+        if "gene" in subset.columns:
+            names.update(subset["gene"].astype(str))
+        matched = subset[
+            subset[symbol_col].astype(str).eq(target)
+            | subset.get("gene", pd.Series(index=subset.index, dtype=str)).astype(str).eq(target)
+        ]
+        hit = target in names
+        logfc = pd.NA
+        adj_p = pd.NA
+        if hit and not matched.empty and "logfc" in matched.columns:
+            numeric = pd.to_numeric(matched["logfc"], errors="coerce")
+            if numeric.notna().any():
+                logfc = float(numeric.dropna().iloc[0])
+        if hit and not matched.empty and "adj_p" in matched.columns:
+            numeric = pd.to_numeric(matched["adj_p"], errors="coerce")
+            if numeric.notna().any():
+                adj_p = float(numeric.dropna().iloc[0])
         rows.append(
             {
                 "target_gene": target,
                 "target_in_de": hit,
-                "n_de_genes": int(record.n_de_genes),
+                "n_de_genes": int(len(subset)),
                 "logfc": logfc,
                 "adj_p": adj_p,
             }
@@ -2788,34 +2826,51 @@ def analysis_target_genes(adata: AnnData, control: str) -> list[str]:
 def target_de_count_table(
     adata: AnnData, *, control: str, min_de_genes: int = 5, source: str = "mixscape"
 ) -> pd.DataFrame:
-    """Three counts: all targets, targets with enough DE genes, targets inside their DE list."""
+    """Counts of all targets and targets whose own method kept enough DE genes.
+
+    Mixscape does not return the DE gene list, so its table has two rows: every
+    target, and targets present in ``uns['mixscape']`` (pertpy ran the GMM).
+    Mixscale uses ``uns['mixscale_de_genes']``.
+    """
     targets = analysis_target_genes(adata, control)
     target_set = set(targets)
-    gate_key, genes_key = _de_gate_keys(source)
-    gate = adata.uns.get(gate_key)
-    genes = adata.uns.get(genes_key)
     label = "Mixscape" if source == "mixscape" else "Mixscale"
+    genes = _de_gene_frame(adata, source)
+    if source == "mixscape" and genes is None:
+        tested: list[str] = []
+        block = adata.uns.get("mixscape")
+        if isinstance(block, dict):
+            tested = [str(gene) for gene in block if str(gene) in target_set]
+        return pd.DataFrame(
+            {
+                "key": ["n_targets", "n_targets_with_de"],
+                "label": ["all targets", f"{label} tested (enough DE genes)"],
+                "n": [len(targets), len(tested)],
+            }
+        )
     with_de: list[str] = []
-    if isinstance(gate, pd.DataFrame) and not gate.empty and "passed" in gate.columns:
-        enough = gate["passed"].astype(bool) & (gate["n_de_genes"].astype(int) >= int(min_de_genes))
-        with_de = [
-            gene for gene in gate.loc[enough, "target_gene"].astype(str) if gene in target_set
-        ]
-    symbol_col = "gene"
-    if isinstance(genes, pd.DataFrame) and "gene_symbol" in genes.columns:
-        symbol_col = "gene_symbol"
     in_own_list: list[str] = []
     if isinstance(genes, pd.DataFrame) and not genes.empty and "target_gene" in genes.columns:
+        counts = genes.groupby(genes["target_gene"].astype(str)).size()
+        with_de = [
+            str(gene)
+            for gene, count in counts.items()
+            if int(count) >= int(min_de_genes) and str(gene) in target_set
+        ]
+        symbol_col = "gene_symbol" if "gene_symbol" in genes.columns else "gene"
         for gene in with_de:
-            symbols = genes.loc[genes["target_gene"].astype(str).eq(gene), symbol_col].astype(str)
-            if gene in set(symbols):
+            subset = genes.loc[genes["target_gene"].astype(str).eq(gene)]
+            names = set(subset[symbol_col].astype(str))
+            if "gene" in subset.columns:
+                names.update(subset["gene"].astype(str))
+            if gene in names:
                 in_own_list.append(gene)
     return pd.DataFrame(
         {
             "key": ["n_targets", "n_targets_with_de", "n_targets_in_own_de"],
             "label": [
                 "all targets",
-                f"passed {label} DE gate",
+                f"{label} scored DE genes",
                 "target in own DE list",
             ],
             "n": [len(targets), len(with_de), len(in_own_list)],
@@ -2844,7 +2899,7 @@ def target_de_count_bars(
         )
     axis.set_ylabel("n targets")
     axis.set_title(
-        f"{label} DE-gate counts (cell-level Wilcoxon; not a biological-replicate test)"
+        f"{label} DE-gene counts (cell-level; not a biological-replicate test)"
     )
     return figure, frame
 
@@ -2860,12 +2915,14 @@ def draw_target_de_counts(
     name = "target_de_counts"
     section = "mixscale" if source == "mixscale" else "plot"
     label = "Mixscape" if source == "mixscape" else "Mixscale"
-    gate_key, _ = _de_gate_keys(source)
     if adata is None or "target_gene" not in adata.obs:
         store.skip(name, "missing_fields", section=section)
         return
-    if not isinstance(adata.uns.get(gate_key), pd.DataFrame):
-        store.skip(name, "de_gate_not_run", section=section)
+    if source == "mixscale" and "mixscale_score" not in adata.obs:
+        store.skip(name, "mixscale_not_run", section=section)
+        return
+    if source == "mixscape" and "mixscape_class" not in adata.obs:
+        store.skip(name, "mixscape_not_run", section=section)
         return
     frame = target_de_count_table(
         adata, control=control, min_de_genes=min_de_genes, source=source
@@ -2876,18 +2933,18 @@ def draw_target_de_counts(
         name,
         section,
         frame,
-        f"{label} DE-gate target counts (cell-level Wilcoxon); not a biological-replicate test; "
-        "integer labels; blue bars",
+        f"{label} target counts from that method's own DE result; "
+        "not a biological-replicate test; integer labels; blue bars",
     )
 
 
 def target_in_de_gene_count_table(
     adata: AnnData, *, control: str, min_de_genes: int = 5, source: str = "mixscape"
 ) -> pd.DataFrame:
-    """Targets that passed the DE gate and contain their own symbol in the stored DE list.
+    """Targets whose stored DE list contains their own symbol.
 
-    ``n_de_genes`` is the full gate count. Membership uses that stored list, which
-    is capped at ``max_de_genes`` and ranked by raw p. The match is exact.
+    Mixscale lists come from pertpy and are already capped at ``max_de_genes``.
+    Mixscape does not return gene names, so this table is empty for that source.
     """
     columns = ["target_gene", "n_de_genes"]
     table = target_in_de_table(adata, control=control, source=source)
@@ -2928,7 +2985,7 @@ def target_in_de_gene_count_bars(
             va="bottom",
             fontsize=10,
         )
-    axis.set_ylabel(f"n DE genes ({label} gate list)")
+    axis.set_ylabel(f"n DE genes ({label} list)")
     axis.set_title(
         f"Targets with own gene in {label} DE list (not a between-group inference)"
     )
@@ -2955,12 +3012,12 @@ def draw_target_in_de_gene_counts(
     name = "target_in_de_gene_counts"
     section = "mixscale" if source == "mixscale" else "plot"
     label = "Mixscape" if source == "mixscape" else "Mixscale"
-    gate_key, _ = _de_gate_keys(source)
     if adata is None or "target_gene" not in adata.obs:
         store.skip(name, "missing_fields", section=section)
         return
-    if not isinstance(adata.uns.get(gate_key), pd.DataFrame):
-        store.skip(name, "de_gate_not_run", section=section)
+    if _de_gene_frame(adata, source) is None:
+        reason = "de_genes_not_returned" if source == "mixscape" else "mixscale_not_run"
+        store.skip(name, reason, section=section)
         return
     frame = target_in_de_gene_count_table(
         adata, control=control, min_de_genes=min_de_genes, source=source
@@ -2974,8 +3031,8 @@ def draw_target_in_de_gene_counts(
         name,
         section,
         frame,
-        f"{label} DE-gate targets whose stored DE list contains their own symbol; "
-        "bar height is full n_de_genes; not a biological-replicate test",
+        f"{label} targets whose stored DE list contains their own symbol; "
+        "bar height is the stored list length; not a biological-replicate test",
     )
 
 
@@ -3115,36 +3172,24 @@ def draw_mixscape_target_panels(
             store.skip("mixscape_target_panels", "no_nt_or_classified_cells")
 
 
-def _mixscale_gate_frame(adata: AnnData) -> pd.DataFrame | None:
-    """Prefer the Mixscale gate. Fall back only when Mixscale has not stored one."""
-    for key in ("mixscale_de_gate", "mixscape_de_gate"):
-        gate = adata.uns.get(key)
-        if (
-            isinstance(gate, pd.DataFrame)
-            and "passed" in gate.columns
-            and "target_gene" in gate.columns
-        ):
-            return gate
-    return None
-
-
 def _passed_de_targets(adata: AnnData, control: str) -> set[str] | None:
-    """Targets that cleared the Mixscale DE gate. None means the gate was not run."""
-    gate = _mixscale_gate_frame(adata)
-    if gate is None:
+    """Targets pertpy Mixscale kept a DE list for. None means Mixscale did not run."""
+    if "mixscale_score" not in adata.obs and adata.uns.get("mixscale_de_genes") is None:
         return None
-    passed = set(gate.loc[gate["passed"].astype(bool), "target_gene"].astype(str))
+    frame = _de_gene_frame(adata, "mixscale")
+    if frame is None:
+        return None
+    if frame.empty or "target_gene" not in frame.columns:
+        return set()
+    passed = set(frame["target_gene"].astype(str))
     passed.discard(str(control))
     passed.discard("")
     return passed
 
 
 def _skipped_de_targets(adata: AnnData) -> list[str]:
-    gate = _mixscale_gate_frame(adata)
-    if gate is not None:
-        skipped = gate.loc[~gate["passed"].astype(bool), "target_gene"].astype(str)
-        return skipped.tolist()
-    return [str(gene) for gene in adata.uns.get("mixscale_unscored_targets", [])]
+    stored = adata.uns.get("mixscale_unscored_targets", [])
+    return [str(gene) for gene in stored]
 
 
 def _mixscale_de_gene_indices(
@@ -3156,19 +3201,19 @@ def _mixscale_de_gene_indices(
     descending; ``features = c(target, top_DEG)`` so the target row is first
     and does not consume the DE budget.
     """
-    genes = adata.uns.get("mixscale_de_genes")
+    genes = _de_gene_frame(adata, "mixscale")
     if not isinstance(genes, pd.DataFrame) or genes.empty:
         return np.asarray([], dtype=int), []
     subset = genes[genes["target_gene"].astype(str) == str(target)].copy()
     if subset.empty:
         return np.asarray([], dtype=int), []
-    # DE gate stores rank by raw p ascending — same role as tutorial p_weight.
+    # pertpy orders Mixscale DE genes by raw p. Reorder by logFC only when stored.
     if "rank" in subset.columns:
         subset = subset.sort_values("rank", ascending=True, kind="mergesort")
-    elif "adj_p" in subset.columns:
+    elif "adj_p" in subset.columns and pd.to_numeric(subset["adj_p"], errors="coerce").notna().any():
         subset = subset.sort_values("adj_p", ascending=True, kind="mergesort")
     top = subset.head(int(max_genes)).copy()
-    if "logfc" in top.columns:
+    if "logfc" in top.columns and pd.to_numeric(top["logfc"], errors="coerce").notna().any():
         top = top.sort_values("logfc", ascending=False, kind="mergesort")
     var_names = adata.var_names.astype(str).to_numpy()
     symbols = (
@@ -3341,7 +3386,7 @@ def draw_mixscale_de_heatmaps(
     max_cells: int = 300,
     perturbation_label: str = "KO",
 ) -> None:
-    """One Mixscale DE heatmap per DE-gate target; copy target-in-own-DE to ``target_in_de/``.
+    """One Mixscale DE heatmap per target pertpy scored; copy target-in-own-DE.
 
     Aligned to Mixscale_DoHeatmap: NT | all target cells ordered by
     ``mixscale_score``; features = target gene + top ``max_genes`` DE (by p, then
@@ -3350,18 +3395,15 @@ def draw_mixscale_de_heatmaps(
     if adata is None or "mixscale_score" not in adata.obs or "target_gene" not in adata.obs:
         store.skip("mixscale_de_heatmaps", "mixscale_not_run", section="mixscale")
         return
-    if not isinstance(adata.uns.get("mixscale_de_gate"), pd.DataFrame):
-        store.skip("mixscale_de_heatmaps", "de_gate_not_run", section="mixscale")
-        return
-    if not isinstance(adata.uns.get("mixscale_de_genes"), pd.DataFrame):
-        store.skip("mixscale_de_heatmaps", "de_genes_missing", section="mixscale")
+    if adata.uns.get("mixscale_de_genes") is None:
+        store.skip("mixscale_de_heatmaps", "mixscale_not_run", section="mixscale")
         return
     passed = _passed_de_targets(adata, control)
     if passed is None:
-        store.skip("mixscale_de_heatmaps", "de_gate_not_run", section="mixscale")
+        store.skip("mixscale_de_heatmaps", "mixscale_not_run", section="mixscale")
         return
     if not passed:
-        store.skip("mixscale_de_heatmaps", "no_targets_passed_de_gate", section="mixscale")
+        store.skip("mixscale_de_heatmaps", "no_scored_targets", section="mixscale")
         return
     prtb = str(perturbation_label or "KO")
     rows = []
@@ -3410,7 +3452,7 @@ def draw_mixscale_de_heatmaps(
                 f"Mixscale_DoHeatmap-aligned {target} vs {_contrast_name(control)}; "
                 f"grouping={mode} (NT|target by gene identity); "
                 f"cells ordered by mixscale_score within block; "
-                f"features=target+top{max_genes} DE by p then logFC desc; "
+                f"features=target+top{max_genes} DE in pertpy raw-p order; "
                 f"heatmap genes={n_genes}; not a biological-replicate test"
             ),
         )
@@ -3475,7 +3517,7 @@ def draw_mixscale_ridge(
 ) -> None:
     """Ridge of mixscale_score; NT/NP/KO rows when Mixscape labels exist.
 
-    Missing PNGs are expected when the Mixscale DE gate passes zero targets
+    Missing PNGs are expected when pertpy scores no target
     (common with a temporary ``zero_guide`` control and weak/noisy effects).
     """
     name = "mixscale_score_ridge"
@@ -3486,10 +3528,10 @@ def draw_mixscale_ridge(
 
     passed = _passed_de_targets(adata, control)
     if passed is None:
-        store.skip(name, "de_gate_not_run")
+        store.skip(name, "mixscale_not_run")
         return
     if not passed:
-        store.skip(name, "no_targets_passed_de_gate")
+        store.skip(name, "no_scored_targets")
         return
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)
     identities, masks, mode = _mixscale_ridge_identities(
@@ -3631,7 +3673,7 @@ def draw_mixscale_scatter(
 ) -> None:
     """Connected scatter of target-gene expression across mixscale score bins.
 
-    One facet per DE-gate target. When Mixscape NP/KO labels exist, each facet
+    One facet per target pertpy Mixscale scored. When Mixscape NP/KO labels exist, each facet
     draws separate NP and KO curves (NT mean as a dashed reference). Without
     Mixscape, one curve per target (Mixscale_ScatterPlot). Fallback score ``1``
     targets are omitted. ``nbin`` defaults to 10.
@@ -3646,10 +3688,10 @@ def draw_mixscale_scatter(
         return
     passed = _passed_de_targets(adata, control)
     if passed is None:
-        store.skip(name, "de_gate_not_run")
+        store.skip(name, "mixscale_not_run")
         return
     if not passed:
-        store.skip(name, "no_targets_passed_de_gate")
+        store.skip(name, "no_scored_targets")
         return
     labels = adata.obs["target_gene"].astype(str).to_numpy()
     scores = pd.to_numeric(adata.obs["mixscale_score"], errors="coerce").to_numpy(dtype=float)

@@ -19,10 +19,9 @@ NOT_EVALUATED = "not_evaluated"
 
 # Seurat Mixscape vignette used CalcPerturbSig ndims=40; this pipeline keeps
 # preprocess PCA and signature width aligned at DEFAULT_SIGNATURE_NDIMS (30).
-# num.neighbors=20. Project |logFC| gate is 0.1 (Seurat function default was 0.25).
+# num.neighbors=20. logfc_threshold passed to pertpy is 0.1 (API default is 0.25).
+# https://pertpy.scverse.org/en/latest/api/tools/pertpy.tools.Mixscape.html
 # https://satijalab.org/seurat/articles/mixscape_vignette
-# https://satijalab.org/seurat/reference/runmixscape
-# DEFAULT_SIGNATURE_NDIMS is imported from config (re-exported for default checks).
 VIGNETTE_CONTROL_NEIGHBORS = 20
 
 
@@ -31,11 +30,11 @@ def perturbation_type(config: dict[str, Any]) -> str:
     return {"CRISPR_KO": "KO", "CRISPRi": "KD", "CRISPRa": "OE"}[mode]
 
 
-def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
-    """Mixscape classification thresholds.
+def mixscape_call_parameters(config: dict[str, Any]) -> dict[str, Any]:
+    """Arguments for ``pertpy.tools.Mixscape.mixscape``.
 
-    ``logfc_threshold`` project default is 0.1 (|logFC|≥0.1). Mixscale's
-    cutoff is not read here. ``fine_mode`` stays off.
+    Reads ``mixscape.*`` only. Mixscale thresholds are not used. pertpy's
+    ``mixscape`` has no ``max_de_genes`` argument.
     """
     mix = config.get("mixscape", {})
     perturb = config.get("perturb", {})
@@ -47,9 +46,14 @@ def mixscape_gate_parameters(config: dict[str, Any]) -> dict[str, Any]:
         "min_de_genes": int(mix.get("min_de_genes", perturb.get("mixscape_min_de_genes", 5))),
         "logfc_threshold": float(mix.get("logfc_threshold", perturb.get("mixscape_logfc", 0.1))),
         "pval_cutoff": float(mix.get("pval_cutoff", perturb.get("mixscape_pval", 0.05))),
-        "max_de_genes": int(mix.get("max_de_genes", 100)),
-        "fine_mode": False,
     }
+
+
+def _stamp_control_label(obs, mask: np.ndarray, column: str, label: str) -> None:
+    """Write the control category onto ``pert_key`` before the pertpy call."""
+    values = obs[column].astype(str).to_numpy(copy=True)
+    values[np.asarray(mask)] = label
+    obs[column] = values
 
 
 def signature_n_dims(n_obs: int, n_vars: int, requested: int = DEFAULT_SIGNATURE_NDIMS) -> int:
@@ -85,17 +89,15 @@ def require_unscaled_log1p(adata: AnnData, step: str) -> None:
 
 
 def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
-    """Gate on DE genes, then perturbation_signature and Mixscape for passing targets.
+    """``perturbation_signature`` then ``mixscape`` on analysis-eligible cells ∪ control.
 
-    No replicate column is invented. A real cell-type column with more than one
-    label is the only optional split. Targets below ``min_de_genes`` stay
-    ``skipped_no_de_genes`` and are not forced to NP. Posterior probability
-    above 0.5 is the software's perturbed class. The signature UMAP is stored
-    separately from the expression UMAP.
+    Input follows pertpy: unscaled log1p ``.X`` for the signature and for DE
+    (``de_layer=None``), ``layer="X_pert"`` for the GMM. Every target in the
+    mask is passed through. pertpy labels a target NP when it has fewer than
+    ``min_de_genes`` DE genes. Posterior probability above 0.5 is the perturbed
+    class. The signature UMAP is stored separately from the expression UMAP.
     """
     from pertpy.tools import Mixscape
-
-    from perturbseq.de_gate import SKIPPED_NO_DE, differential_gene_gate, stamp_control_label
 
     spec = control_spec(config)
     control = spec["control_label"]
@@ -114,56 +116,60 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         adata.uns["mixscape_skip_reason"] = "no_zero_guide_cells"
         return adata
     if spec["temporary"]:
-        stamp_control_label(adata.obs, control_cells, "target_gene", control)
+        _stamp_control_label(adata.obs, control_cells, "target_gene", control)
     # Embedding may include all QC-pass cells; scoring stays on analysis_eligible ∪ control.
     pert_mask = perturbation_analysis_mask(adata.obs, spec)
     mixscape_settings = config.get("mixscape", {})
     seed = int(config["runtime"]["seed"])
     require_unscaled_log1p(adata, "Mixscape")
-    params = mixscape_gate_parameters(config)
-    gate_adata = adata[pert_mask] if not bool(np.all(pert_mask)) else adata
-    gate, gene_table = differential_gene_gate(
-        gate_adata,
-        control=control,
-        min_de_genes=int(params["min_de_genes"]),
-        logfc_threshold=float(params["logfc_threshold"]),
-        pval_cutoff=float(params["pval_cutoff"]),
-        max_de_genes=int(params["max_de_genes"]),
-    )
-    adata.uns["mixscape_de_gate"] = gate
-    adata.uns["mixscape_de_genes"] = gene_table
+    params = mixscape_call_parameters(config)
     labels = adata.obs["target_gene"].astype(str)
     adata.obs["mixscape_class"] = NOT_EVALUATED
     adata.obs["mixscape_class_global"] = NOT_EVALUATED
     adata.obs["mixscape_class_p"] = np.nan
     adata.obs["mixscape_status"] = NOT_EVALUATED
-    skipped_genes = set(gate.loc[~gate["passed"].astype(bool), "target_gene"].astype(str))
-    skipped = labels.isin(skipped_genes).to_numpy() & pert_mask
-    adata.obs.loc[skipped, "mixscape_class"] = SKIPPED_NO_DE
-    adata.obs.loc[skipped, "mixscape_status"] = SKIPPED_NO_DE
-    passed = set(gate.loc[gate["passed"].astype(bool), "target_gene"].astype(str))
     label = perturbation_type(config)
-    if not passed:
+    if not bool(np.any(pert_mask)):
+        adata.uns["mixscape_scope"] = "unstratified"
+        adata.uns["mixscape_umap_status"] = "no_analysis_cells"
+        adata.uns["mixscape_parameters"] = {
+            "pert_key": "target_gene",
+            "control": control,
+            "split_by": "",
+            "layer": "X_pert",
+            "de_layer": None,
+            "posterior_cutoff": 0.5,
+            "perturbation_type": label,
+            "random_state": seed,
+            **params,
+        }
+        return adata
+    targets = {
+        str(gene)
+        for gene in labels[pert_mask].unique()
+        if str(gene) != control
+    }
+    if not targets:
         nt = (labels == control).to_numpy() & pert_mask
         adata.obs.loc[nt, "mixscape_class"] = control
         adata.obs.loc[nt, "mixscape_status"] = (
             ZERO_GUIDE_LABEL if control == ZERO_GUIDE_LABEL else STATUS_NT
         )
         adata.uns["mixscape_scope"] = "unstratified"
-        adata.uns["mixscape_umap_status"] = "no_targets_passed_de_gate"
+        adata.uns["mixscape_umap_status"] = "no_target_cells"
         adata.uns["mixscape_parameters"] = {
             "pert_key": "target_gene",
             "control": control,
             "split_by": "",
             "layer": "X_pert",
+            "de_layer": None,
             "posterior_cutoff": 0.5,
             "perturbation_type": label,
             "random_state": seed,
-            "fine_mode": False,
             **params,
         }
         return adata
-    keep = labels.isin(passed | {control}).to_numpy() & pert_mask
+    keep = pert_mask
     # Full unscaled log1p matrix. pertpy reads X for the signature and for DE,
     # and X_pert for the GMM. Do not subset to HVGs or scale X first.
     work = adata[keep].copy()
@@ -247,8 +253,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
         "umap_key": "X_umap_mixscape",
         "iter_num": int(mixscape_settings.get("iter_num", 10)),
         # Recorded for provenance; call omits test_method so pertpy default applies.
-        "test_method": "pertpy_default",
-        "fine_mode": False,
+        "test_method": "wilcoxon",
         "scale": True,
         "control_relative": (
             "perturbation_signature on unscaled log1p X (all genes); "
@@ -263,7 +268,7 @@ def run_mixscape(adata: AnnData, config: dict[str, Any]) -> AnnData:
 def real_cell_type_split(adata: AnnData, config: dict[str, Any]) -> str | None:
     """Return a real cell-type column. Never invent a replicate split."""
     key = None
-    for section in ("preprocess", "perturb", "mixscape", "mixscale"):
+    for section in ("preprocess", "perturb", "mixscape"):
         candidate = config.get(section, {}).get("cell_type_key")
         if candidate:
             key = str(candidate)
