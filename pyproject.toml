@@ -16,7 +16,7 @@ perturbseq-tertiary = "perturbseq.cli:main"
 where = ["src"]
 
 [tool.setuptools.dynamic]
-dependencies = { file = ["requirements.lock"] }
+dependencies = { file = ["requirements.txt"] }
 
 [tool.ruff]
 line-length = 100
