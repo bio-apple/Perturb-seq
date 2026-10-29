@@ -5,7 +5,7 @@
 # 样本、物种（--organism → experiment.organism）、输入输出目录、guide 分隔符、
 # 非靶向对照（--nt-control）和 CRISPR 模式（--crispr-mode：KO / i / a）由命令行传入。
 # --nt-control 默认 NEG_CONTROL/Non-Targeting/NegCtrl：在 feature_barcode_reference 的
-# id/name/target_gene_name/target_gene_id 上精确匹配（忽略大小写）；可自定义；均未匹配则自动 zero_guide。
+# id/name/target_gene_name/target_gene_id 上 re.search（忽略大小写）；可自定义正则；均未匹配则自动 zero_guide。
 # 也可 --nt-control zero_guide。匹配到但无可用 NT 细胞时 assign 回退临时 zero_guide。
 # 本文件里的样本名、路径和 QC 绝对阈值会被命令行覆盖。
 # 图只写 PNG（dpi 见 plotting.dpi）；plotting.formats 可存在，实现固定写 PNG。

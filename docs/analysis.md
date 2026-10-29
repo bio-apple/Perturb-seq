@@ -87,7 +87,7 @@ flowchart TD
 | `--batch-key` / `--cell-type-key` | 空则不做 Harmony；`cell_type` 保持 `ALL` |
 | `--min-genes` / `--max-genes` | 覆盖默认 200 / 6000 |
 | `--max-mito-frac` | 覆盖默认 `0.2` |
-| `--nt-control` | 默认 `NEG_CONTROL/Non-Targeting/NegCtrl`（忽略大小写精确匹配参考表四列；`/` 或 `,` 可自定义）；默认或自定义均未匹配 → 自动 `zero_guide`；可显式填 `zero_guide`；匹配到但无可用 NT 细胞 → 回退临时 `zero_guide` |
+| `--nt-control` | 默认 `NEG_CONTROL/Non-Targeting/NegCtrl`（参考表四列上忽略大小写的 `re.search`；`/` 或 `,` 可自定义正则）；默认或自定义均未匹配 → 自动 `zero_guide`；可显式填 `zero_guide`；匹配到但无可用 NT 细胞 → 回退临时 `zero_guide` |
 | `--sctype-tissue` | 启用 ScType；argparse choices 来自离线 DB（如 `Adrenal`、`Immune system`、`Lung`…）；未传则跳过 |
 | `--sctype-db-path` | 可选 marker DB 路径（tsv/csv/xlsx）；默认 `data/sctype/ScTypeDB_full.tsv` |
 | `--sctype-low-score-fraction` | 可选；簇顶分 `< n_cells * fraction` → `Unknown`（默认 0.25） |
@@ -155,7 +155,7 @@ flowchart TD
 
 ### 设计 NT
 
-`--nt-control` 默认关键词为 `NEG_CONTROL/Non-Targeting/NegCtrl`。非显式 `zero_guide` 时，在 `*.scRNA.feature_barcode_reference.csv` 的 `id` / `name` / `target_gene_name` / `target_gene_id` 上对关键词做**精确匹配**（忽略大小写）；可用 `/` 或 `,` 自定义。匹配到的 guide 计入设计 NT；**且** QC 通过后账本里确有对应 NT 细胞时，对照就是这组；zero-guide 不并入。
+`--nt-control` 默认模式为 `NEG_CONTROL/Non-Targeting/NegCtrl`。非显式 `zero_guide` 时，在 `*.scRNA.feature_barcode_reference.csv` 的 `id` / `name` / `target_gene_name` / `target_gene_id` 上对每个模式做 `re.search`（忽略大小写）；可用 `/` 或 `,` 自定义。匹配到的 guide 计入设计 NT；**且** QC 通过后账本里确有对应 NT 细胞时，对照就是这组；zero-guide 不并入。
 
 ### 临时对照 `zero_guide`
 

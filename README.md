@@ -38,7 +38,7 @@ python -m perturbseq \
 | --- | --- |
 | `--organism` | 必填 `human` / `mouse` → `experiment.organism` |
 | `--crispr-mode` | `KO` / `i` / `a`（默认 `KO`）。写入预期方向元数据与图标签（KO / KD / OE）：KO→`not_required`，i→`down`，a→`up`。步骤固定跑 Mixscape 与 Mixscale |
-| `--nt-control` | 默认 `NEG_CONTROL/Non-Targeting/NegCtrl`：在参考表 `id` / `name` / `target_gene_name` / `target_gene_id` 上**精确匹配**（忽略大小写）；可用 `/` 或 `,` 自定义。未匹配 → 自动 `zero_guide`；也可填 `zero_guide`。匹配到但 QC 后无可用 NT 细胞 → 回退临时 `zero_guide` |
+| `--nt-control` | 默认 `NEG_CONTROL/Non-Targeting/NegCtrl`：在参考表 `id` / `name` / `target_gene_name` / `target_gene_id` 上做忽略大小写的 `re.search`；可用 `/` 或 `,` 自定义正则。未匹配 → 自动 `zero_guide`；也可填 `zero_guide`。匹配到但 QC 后无可用 NT 细胞 → 回退临时 `zero_guide` |
 | `--sctype-tissue` | 启用 ScType；未传则跳过。choices：`Adrenal`、`Brain`、`Eye`、`Heart`、`Hippocampus`、`Immune system`、`Intestine`、`Kidney`、`Liver`、`Lung`、`Muscle`、`Pancreas`、`Placenta`、`Spleen`、`Stomach`、`Thymus`（来自 `data/sctype/ScTypeDB_full.tsv`，GPL-3.0；[上游](https://github.com/IanevskiAleksandr/sc-type)）。产物：`obs['sctype_classification']`、`UMAP/umap_sctype.png` |
 | `--sctype-db-path` | 可选自定义 marker DB（tsv/csv/xlsx）；须含列 `tissueType`、`cellName`、`geneSymbolmore1`、`geneSymbolmore2` |
 | `--sctype-low-score-fraction` | 可选；低分簇 → `Unknown`（默认 0.25） |

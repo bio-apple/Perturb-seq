@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> None:
         default=DEFAULT_NT_CONTROL_ARG,
         help=(
             "在 *.scRNA.feature_barcode_reference.csv 的 "
-            "id/name/target_gene_name/target_gene_id 上按关键词精确匹配设计 NT"
+            "id/name/target_gene_name/target_gene_id 上按正则 re.search 匹配设计 NT（忽略大小写）"
             f"（默认 {DEFAULT_NT_CONTROL_ARG}，忽略大小写；可用 / 或 , 自定义）。"
             "默认或自定义关键词均未匹配到时自动用 zero_guide；也可显式填 zero_guide"
         ),

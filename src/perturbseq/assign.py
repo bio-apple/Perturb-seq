@@ -13,7 +13,7 @@ import pandas as pd
 from anndata import AnnData
 from scipy import sparse
 
-# Default --nt-control keywords (exact, case-insensitive) matched on reference columns.
+# Default --nt-control patterns. Each is a case-insensitive re.search against reference columns.
 DEFAULT_NT_KEYWORDS = ("NEG_CONTROL", "Non-Targeting", "NegCtrl")
 DEFAULT_NT_CONTROL_ARG = "/".join(DEFAULT_NT_KEYWORDS)
 NT_REFERENCE_COLUMNS = ("id", "name", "target_gene_name", "target_gene_id")
@@ -153,15 +153,21 @@ def _normalize_nt_labels(nt_labels: Collection[str] | str | None) -> set[str]:
 
 
 def _field_matches_nt_keyword(field: str, keyword: str) -> bool:
-    left = field.strip().casefold()
-    right = keyword.strip().casefold()
-    return bool(left) and bool(right) and left == right
+    """True when ``keyword`` matches ``field`` as a case-insensitive regular expression."""
+    text = field.strip()
+    pattern = keyword.strip()
+    if not text or not pattern or text.casefold() in {"nan", "none", "<na>"}:
+        return False
+    try:
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+    except re.error as exc:
+        raise ValueError(f"--nt-control 不是合法正则: {pattern}") from exc
 
 
 def match_nt_reference_rows(
     reference: pd.DataFrame, keywords: Iterable[str]
 ) -> pd.DataFrame:
-    """Rows whose id/name/target_gene_name/target_gene_id equals a keyword."""
+    """Rows whose id/name/target_gene_name/target_gene_id matches a keyword regex."""
     keys = tuple(str(item).strip() for item in keywords if str(item).strip())
     if not keys or reference.empty:
         return reference.iloc[0:0].copy()
